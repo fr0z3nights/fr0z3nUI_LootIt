@@ -537,22 +537,12 @@ local function IsLikelyMoneyMessage(msg)
     return true
   end
 
-  -- Fallback: money words/symbols (best-effort, localized when possible).
   local lower = msg:lower()
-  local function hasToken(token)
-    if type(token) ~= "string" or token == "" then return false end
-    return lower:find(token:lower(), 1, true) ~= nil
-  end
-  if hasToken((_G and rawget(_G, "GOLD")) or "gold") or hasToken((_G and rawget(_G, "SILVER")) or "silver") or hasToken((_G and rawget(_G, "COPPER")) or "copper") then
-    return true
-  end
-  if hasToken((_G and rawget(_G, "GOLD_AMOUNT_SYMBOL")) or "g") and hasToken((_G and rawget(_G, "SILVER_AMOUNT_SYMBOL")) or "s") then
-    return true
-  end
 
+  -- Prefer matching the full localized string (LOOT_MONEY / LOOT_MONEY_SPLIT),
+  -- but keep additional heuristics for edge cases.
   if not MONEY_PATTERNS then BuildMoneyPatterns() end
 
-  -- Prefer matching the full localized string, but keep prefix fallback too.
   for _, pat in ipairs(MONEY_PATTERNS or {}) do
     if msg:match(pat) then
       return true
@@ -563,6 +553,27 @@ local function IsLikelyMoneyMessage(msg)
     if msg:sub(1, #prefix) == prefix then
       return true
     end
+  end
+
+  -- Fallback: explicit money words (localized when possible).
+  local function hasToken(token)
+    if type(token) ~= "string" or token == "" then return false end
+    return lower:find(token:lower(), 1, true) ~= nil
+  end
+  if hasToken((_G and rawget(_G, "GOLD")) or "gold") or hasToken((_G and rawget(_G, "SILVER")) or "silver") or hasToken((_G and rawget(_G, "COPPER")) or "copper") then
+    return true
+  end
+
+  -- Fallback: symbol forms, but only when a number precedes the symbol.
+  -- (Important: don't treat plain 'g'/'s'/'c' letters as money; that would match normal loot lines.)
+  local function hasNumberBeforeToken(token)
+    if type(token) ~= "string" or token == "" then return false end
+    return lower:match("[%d,]+%s*" .. EscapeLuaPattern(token:lower())) ~= nil
+  end
+  if hasNumberBeforeToken((_G and rawget(_G, "GOLD_AMOUNT_SYMBOL")) or "g")
+    or hasNumberBeforeToken((_G and rawget(_G, "SILVER_AMOUNT_SYMBOL")) or "s")
+    or hasNumberBeforeToken((_G and rawget(_G, "COPPER_AMOUNT_SYMBOL")) or "c") then
+    return true
   end
 
   return false
