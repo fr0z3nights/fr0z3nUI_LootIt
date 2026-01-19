@@ -4,5 +4,7 @@
 ## Author: fr0z3nights
 ## Version: 0.1.0
 ## SavedVariables: fr0z3nUI_LootItDB
+## SavedVariablesPerCharacter: fr0z3nUI_LootItCharDB
 
+fr0z3nUI_LootIt_ADB.lua
 fr0z3nUI_LootIt.lua
