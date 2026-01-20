@@ -1278,7 +1278,41 @@ local function CreateConfigUI()
   otherOutputDD:SetPoint("LEFT", otherOutputLabel, "RIGHT", -6, -2)
   UIDropDownMenu_SetWidth(otherOutputDD, 140)
 
-  UIDropDownMenu_Initialize(otherOutputDD, function(_, level)
+  do
+    local mu = _G and rawget(_G, "MenuUtil")
+    if type(mu) == "table" and type(mu.CreateContextMenu) == "function" then
+      local anchor = otherOutputDD.Button or otherOutputDD
+      if anchor and anchor.SetScript then
+        anchor:SetScript("OnClick", function(btn)
+          mu.CreateContextMenu(btn, function(_, root)
+            if root and root.CreateTitle then root:CreateTitle("Output") end
+            EnsureDB()
+            DB.other = (type(DB.other) == "table") and DB.other or {}
+            for i = 1, (NUM_CHAT_WINDOWS or 1) do
+              local name = GetChatWindowInfo and GetChatWindowInfo(i)
+              if not name or name == "" then name = "Chat " .. i end
+              local label = string.format("%d: %s", i, name)
+              if root and root.CreateRadio then
+                root:CreateRadio(label, function() return (DB.other.outputChatFrame == i) end, function()
+                  EnsureDB()
+                  DB.other = (type(DB.other) == "table") and DB.other or {}
+                  DB.other.outputChatFrame = i
+                  if UIDropDownMenu_SetSelectedID then UIDropDownMenu_SetSelectedID(otherOutputDD, i) end
+                end)
+              elseif root and root.CreateButton then
+                root:CreateButton(label, function()
+                  EnsureDB()
+                  DB.other = (type(DB.other) == "table") and DB.other or {}
+                  DB.other.outputChatFrame = i
+                  if UIDropDownMenu_SetSelectedID then UIDropDownMenu_SetSelectedID(otherOutputDD, i) end
+                end)
+              end
+            end
+          end)
+        end)
+      end
+    else
+      UIDropDownMenu_Initialize(otherOutputDD, function(_, level)
     level = level or 1
     if level ~= 1 then return end
     EnsureDB()
@@ -1302,7 +1336,9 @@ local function CreateConfigUI()
       end
       UIDropDownMenu_AddButton(info, level)
     end
-  end)
+      end)
+    end
+  end
 
   local exampleTitle = otherPanel:CreateFontString(nil, "OVERLAY", "GameFontNormal")
   exampleTitle:SetPoint("TOPLEFT", achCB, "BOTTOMLEFT", 0, -14)
@@ -1591,7 +1627,38 @@ local function CreateConfigUI()
   outputDD:SetPoint("LEFT", outputLabel, "RIGHT", -6, -2)
   UIDropDownMenu_SetWidth(outputDD, 100)
 
-  UIDropDownMenu_Initialize(outputDD, function(_, level)
+  do
+    local mu = _G and rawget(_G, "MenuUtil")
+    if type(mu) == "table" and type(mu.CreateContextMenu) == "function" then
+      local anchor = outputDD.Button or outputDD
+      if anchor and anchor.SetScript then
+        anchor:SetScript("OnClick", function(btn)
+          mu.CreateContextMenu(btn, function(_, root)
+            if root and root.CreateTitle then root:CreateTitle("Output") end
+            EnsureDB()
+            for i = 1, (NUM_CHAT_WINDOWS or 1) do
+              local name = GetChatWindowInfo and GetChatWindowInfo(i)
+              if not name or name == "" then name = "Chat " .. i end
+              local label = string.format("%d: %s", i, name)
+              if root and root.CreateRadio then
+                root:CreateRadio(label, function() return (DB.outputChatFrame == i) end, function()
+                  EnsureDB()
+                  DB.outputChatFrame = i
+                  if UIDropDownMenu_SetSelectedID then UIDropDownMenu_SetSelectedID(outputDD, i) end
+                end)
+              elseif root and root.CreateButton then
+                root:CreateButton(label, function()
+                  EnsureDB()
+                  DB.outputChatFrame = i
+                  if UIDropDownMenu_SetSelectedID then UIDropDownMenu_SetSelectedID(outputDD, i) end
+                end)
+              end
+            end
+          end)
+        end)
+      end
+    else
+      UIDropDownMenu_Initialize(outputDD, function(_, level)
     level = level or 1
     if level ~= 1 then return end
     EnsureDB()
@@ -1613,7 +1680,9 @@ local function CreateConfigUI()
       end
       UIDropDownMenu_AddButton(info, level)
     end
-  end)
+      end)
+    end
+  end
 
   local prefixLabel = lootPanel:CreateFontString(nil, "OVERLAY", "GameFontNormal")
   prefixLabel:SetPoint("LEFT", outputDD, "RIGHT", 6, 2)
@@ -2771,23 +2840,64 @@ local function CreateConfigUI()
     { key = "TOOLTIP", text = "Tooltip" },
   }
 
-  UIDropDownMenu_Initialize(strataDD, function(_, level)
-    if level ~= 1 then return end
-    for i, s in ipairs(STRATA) do
-      local info = UIDropDownMenu_CreateInfo()
-      info.text = s.text
-      info.func = function()
-        EnsureDB()
-        DB.mailNotify = DB.mailNotify or {}
-        DB.mailNotify.ui = DB.mailNotify.ui or {}
-        DB.mailNotify.ui.strata = s.key
-        UIDropDownMenu_SetSelectedID(strataDD, i)
-        ApplyNotifierSizingAndAlpha()
-        UpdateMailNotifier()
+  do
+    local mu = _G and rawget(_G, "MenuUtil")
+    if type(mu) == "table" and type(mu.CreateContextMenu) == "function" then
+      local anchor = strataDD.Button or strataDD
+      if anchor and anchor.SetScript then
+        anchor:SetScript("OnClick", function(btn)
+          mu.CreateContextMenu(btn, function(_, root)
+            if root and root.CreateTitle then root:CreateTitle("Layer") end
+            EnsureDB()
+            DB.mailNotify = DB.mailNotify or {}
+            DB.mailNotify.ui = DB.mailNotify.ui or {}
+            local selected = tostring(DB.mailNotify.ui.strata or "")
+            for i, s in ipairs(STRATA) do
+              if root and root.CreateRadio then
+                root:CreateRadio(s.text, function() return selected == s.key end, function()
+                  EnsureDB()
+                  DB.mailNotify = DB.mailNotify or {}
+                  DB.mailNotify.ui = DB.mailNotify.ui or {}
+                  DB.mailNotify.ui.strata = s.key
+                  if UIDropDownMenu_SetSelectedID then UIDropDownMenu_SetSelectedID(strataDD, i) end
+                  ApplyNotifierSizingAndAlpha()
+                  UpdateMailNotifier()
+                end)
+              elseif root and root.CreateButton then
+                root:CreateButton(s.text, function()
+                  EnsureDB()
+                  DB.mailNotify = DB.mailNotify or {}
+                  DB.mailNotify.ui = DB.mailNotify.ui or {}
+                  DB.mailNotify.ui.strata = s.key
+                  if UIDropDownMenu_SetSelectedID then UIDropDownMenu_SetSelectedID(strataDD, i) end
+                  ApplyNotifierSizingAndAlpha()
+                  UpdateMailNotifier()
+                end)
+              end
+            end
+          end)
+        end)
       end
-      UIDropDownMenu_AddButton(info, level)
+    else
+      UIDropDownMenu_Initialize(strataDD, function(_, level)
+        if level ~= 1 then return end
+        for i, s in ipairs(STRATA) do
+          local info = UIDropDownMenu_CreateInfo()
+          info.text = s.text
+          info.func = function()
+            EnsureDB()
+            DB.mailNotify = DB.mailNotify or {}
+            DB.mailNotify.ui = DB.mailNotify.ui or {}
+            DB.mailNotify.ui.strata = s.key
+            UIDropDownMenu_SetSelectedID(strataDD, i)
+            ApplyNotifierSizingAndAlpha()
+            UpdateMailNotifier()
+          end
+          UIDropDownMenu_AddButton(info, level)
+        end
+      end)
     end
-  end)
+  end
 
   local zoomLabel = viewContent:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
   zoomLabel:SetPoint("TOPLEFT", strataLabel, "BOTTOMLEFT", 0, -18)
