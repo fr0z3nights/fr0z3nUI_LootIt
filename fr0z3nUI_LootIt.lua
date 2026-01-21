@@ -1148,13 +1148,18 @@ local function CreateConfigUI()
     end
   end)
 
-  frame.TitleText:SetText("fr0z3nUI LootIt")
+  local titleFS = frame.TitleText
+  if not (titleFS and titleFS.SetText and titleFS.SetPoint) then
+    titleFS = frame:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+  end
+  frame._titleFS = titleFS
 
-  frame.TitleText:ClearAllPoints()
-  frame.TitleText:SetPoint("TOPLEFT", frame, "TOPLEFT", 12, -6)
+  titleFS:SetText("|cff00ccff[FLI]|r LootIt")
+  titleFS:ClearAllPoints()
+  titleFS:SetPoint("TOPLEFT", frame, "TOPLEFT", 12, -6)
 
   local enabled = CreateFrame("CheckButton", nil, frame, "UICheckButtonTemplate")
-  enabled:SetPoint("LEFT", frame.TitleText, "RIGHT", 8, 0)
+  enabled:SetPoint("LEFT", titleFS, "RIGHT", 8, 0)
   enabled:SetScale(0.85)
   SetCheckBoxText(enabled, "")
   if enabled.Text then enabled.Text:Hide() end
@@ -1173,7 +1178,7 @@ local function CreateConfigUI()
   -- Tabs
   local tabLoot = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
   tabLoot:SetSize(80, 22)
-  tabLoot:SetPoint("LEFT", frame.TitleText, "RIGHT", 40, 0)
+  tabLoot:SetPoint("LEFT", enabled, "RIGHT", 10, 0)
   tabLoot:SetText("Loot")
 
   local tabAlias = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
@@ -4420,6 +4425,7 @@ SlashCmdList.FR0Z3NUI_LOOTIT = function(msg)
 
   if cmd == "off" or cmd == "disable" then
     DB.enabled = false
+    ApplyFilters()
     Status()
     return
   end
