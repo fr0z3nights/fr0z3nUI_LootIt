@@ -2,6 +2,36 @@ local ADDON = ...
 
 local PREFIX = "|cff00ccff[LI]|r "
 
+-- WoW globals (shadowed to locals so diagnostics stay clean)
+local UISpecialFrames = _G and rawget(_G, "UISpecialFrames")
+local NUM_CHAT_WINDOWS = _G and rawget(_G, "NUM_CHAT_WINDOWS")
+local RAID_CLASS_COLORS = _G and rawget(_G, "RAID_CLASS_COLORS")
+
+local ChatFrame_AddMessageEventFilter = _G and rawget(_G, "ChatFrame_AddMessageEventFilter")
+local ChatFrame_RemoveMessageEventFilter = _G and rawget(_G, "ChatFrame_RemoveMessageEventFilter")
+
+local UIDropDownMenu_Initialize = _G and rawget(_G, "UIDropDownMenu_Initialize")
+local UIDropDownMenu_CreateInfo = _G and rawget(_G, "UIDropDownMenu_CreateInfo")
+local UIDropDownMenu_AddButton = _G and rawget(_G, "UIDropDownMenu_AddButton")
+local UIDropDownMenu_SetWidth = _G and rawget(_G, "UIDropDownMenu_SetWidth")
+local UIDropDownMenu_SetText = _G and rawget(_G, "UIDropDownMenu_SetText")
+local UIDropDownMenu_SetSelectedID = _G and rawget(_G, "UIDropDownMenu_SetSelectedID")
+local ToggleDropDownMenu = _G and rawget(_G, "ToggleDropDownMenu")
+local CloseDropDownMenus = _G and rawget(_G, "CloseDropDownMenus")
+
+local Clamp = _G and rawget(_G, "Clamp")
+if not Clamp then
+  Clamp = function(v, mn, mx)
+    v = tonumber(v)
+    mn = tonumber(mn)
+    mx = tonumber(mx)
+    if not v then return mn end
+    if mn and v < mn then return mn end
+    if mx and v > mx then return mx end
+    return v
+  end
+end
+
 -- Built-in aliases shipped with the addon (account aliases override these).
 -- Keyed by itemID; values are display-only text (link remains the original item).
 local ADDON_LINK_ALIASES = (type(rawget(_G, "fr0z3nUI_LootIt_AddonAliases")) == "table") and rawget(_G, "fr0z3nUI_LootIt_AddonAliases") or {}
@@ -1337,7 +1367,7 @@ local function CreateConfigUI()
         DB.other = (type(DB.other) == "table") and DB.other or {}
         DB.other.outputChatFrame = i
         UIDropDownMenu_SetSelectedID(otherOutputDD, i)
-        if CloseDropDownMenus then CloseDropDownMenus() end
+        do local cdm = _G and rawget(_G, "CloseDropDownMenus"); if cdm then cdm() end end
       end
       UIDropDownMenu_AddButton(info, level)
     end
@@ -1681,7 +1711,7 @@ local function CreateConfigUI()
         EnsureDB()
         DB.outputChatFrame = i
         UIDropDownMenu_SetSelectedID(outputDD, i)
-        if CloseDropDownMenus then CloseDropDownMenus() end
+        do local cdm = _G and rawget(_G, "CloseDropDownMenus"); if cdm then cdm() end end
       end
       UIDropDownMenu_AddButton(info, level)
     end
