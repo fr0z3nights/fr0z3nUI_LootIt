@@ -40,7 +40,7 @@ local ADDON_LINK_ALIASES = (type(rawget(_G, "fr0z3nUI_LootIt_AddonAliases")) == 
 local ADDON_CURRENCY_ALIASES = (type(rawget(_G, "fr0z3nUI_LootIt_AddonCurrencyAliases")) == "table") and rawget(_G, "fr0z3nUI_LootIt_AddonCurrencyAliases") or {}
 
 local DEFAULTS = {
-  enabled = false,
+  enabled = true,
   hideLootText = true, -- suppress the default "You receive loot:" chat line
   echoItem = true, -- re-print a simplified line with just the item link
   showItemLevel = true, -- append (ilvl N) for equippable items
@@ -53,18 +53,18 @@ local DEFAULTS = {
   aliasInputMode = "item", -- item | currency
   echoPrefix = "", -- optional; leave blank for no prefix
   outputChatFrame = 1,
-  showSelfNameInGroup = true,
+  showSelfNameAlways = true,
   lootCombineCount = 1, -- 1 = normal (one item per line); >1 buffers items briefly and prints as "A, B, C"
   lootCombineIncludeCurrency = false, -- when combining, include currency in the combined line
   lootCombineIncludeGold = false, -- when combining, include money (gold/silver/copper per toggles) in the combined line
   lootCombineIncludeMoneyCurrency = false, -- legacy (kept for migration)
   lootCombineMode = "loot", -- loot | timer
   mailNotify = {
-    enabled = false,
+    enabled = true,
     showInCombat = true,
     model = {
-      kind = "player", -- player | display | file
-      id = nil,
+      kind = "npc", -- player | display | file
+      id = 104230,
       rotation = 0.15,
       zoom = 0.9,
       anim = 0,
@@ -76,6 +76,8 @@ local DEFAULTS = {
       point = "TOPRIGHT",
       x = -260,
       y = -220,
+      w = 200,
+      h = 220,
     },
   },
   money = {
@@ -92,7 +94,7 @@ local DEFAULTS = {
   other = {
     outputChatFrame = 1,
     achievement = {
-      enabled = false,
+      enabled = true,
     },
   },
 }
@@ -101,6 +103,13 @@ fr0z3nUI_LootItDB = fr0z3nUI_LootItDB or nil
 fr0z3nUI_LootItCharDB = fr0z3nUI_LootItCharDB or nil
 local DB
 local CHARDB
+
+local function IsEnabled()
+  if CHARDB and CHARDB.enabledOverride ~= nil then
+    return (CHARDB.enabledOverride == true)
+  end
+  return (DB and DB.enabled) and true or false
+end
 
 local function CopyDefaults(dst, src)
   if type(dst) ~= "table" then dst = {} end
@@ -146,6 +155,12 @@ local function EnsureDB()
     fr0z3nUI_LootItDB.lootCombineIncludeGold = true
     DB.lootCombineIncludeCurrency = true
     DB.lootCombineIncludeGold = true
+  end
+
+  -- Migration: old versions used showSelfNameInGroup; new is showSelfNameAlways.
+  if DB and DB.showSelfNameAlways == nil and fr0z3nUI_LootItDB.showSelfNameInGroup ~= nil then
+    DB.showSelfNameAlways = (fr0z3nUI_LootItDB.showSelfNameInGroup == true)
+    fr0z3nUI_LootItDB.showSelfNameAlways = DB.showSelfNameAlways
   end
 end
 
@@ -390,8 +405,20 @@ local function GetClassColoredName(fullOrShortName)
 end
 
 local function IsInAnyGroup()
-  if IsInRaid and IsInRaid() then return true end
-  if IsInGroup and IsInGroup() then return true end
+  -- Some edge cases can report "in group" while effectively solo.
+  -- Require evidence of other members.
+  if IsInRaid and IsInRaid() then
+    local n = (GetNumGroupMembers and GetNumGroupMembers()) or 0
+    return (tonumber(n) or 0) > 1
+  end
+  if IsInGroup and IsInGroup() then
+    local sub = (GetNumSubgroupMembers and GetNumSubgroupMembers())
+    if (tonumber(sub) or 0) > 0 then
+      return true
+    end
+    local n = (GetNumGroupMembers and GetNumGroupMembers()) or 0
+    return (tonumber(n) or 0) > 1
+  end
   return false
 end
 
@@ -529,13 +556,42 @@ local function GetEquippableItemLevelSuffix(link)
     return nil
   end
 
-  local ilvl
-  if C_Item and C_Item.GetDetailedItemLevelInfo then
-    ilvl = C_Item.GetDetailedItemLevelInfo(link)
-  end
+  -- Fallback: parse the localized tooltip "Item Level" line.
+  -- This can be more reliable than link-based APIs for some upgraded/scaled items.
+  if _G and CreateFrame and UIParent then
+    if not (_G and rawget(_G, "fr0z3nUI_LootItScanTooltip")) then
+      local tt = CreateFrame("GameTooltip", "fr0z3nUI_LootItScanTooltip", UIParent, "GameTooltipTemplate")
+      tt:SetOwner(UIParent, "ANCHOR_NONE")
+      tt:Hide()
+    end
 
-  if type(ilvl) == "number" and ilvl > 0 then
-    return ilvl
+    local tt = _G and rawget(_G, "fr0z3nUI_LootItScanTooltip")
+    if tt and tt.SetOwner and tt.SetHyperlink and tt.NumLines then
+      tt:ClearLines()
+      tt:SetOwner(UIParent, "ANCHOR_NONE")
+      tt:SetHyperlink(link)
+
+      local pat = GlobalStringToPattern((_G and rawget(_G, "ITEM_LEVEL")) or "")
+      local nLines = tt:NumLines() or 0
+      for i = 2, nLines do
+        local fs = _G["fr0z3nUI_LootItScanTooltipTextLeft" .. i]
+        local text = fs and fs.GetText and fs:GetText()
+        if type(text) == "string" and text ~= "" then
+          local lvl
+          if pat then
+            lvl = tonumber((text:match(pat)))
+          end
+          if not lvl then
+            lvl = tonumber(text:match("(%d+)$"))
+          end
+          if lvl and lvl > 0 then
+            tt:Hide()
+            return lvl
+          end
+        end
+      end
+      tt:Hide()
+    end
   end
 
   return nil
@@ -554,7 +610,8 @@ local function ExtractAchievementLinkFallback(msg)
 end
 
 local function FormatSelfLine(text)
-  if DB and DB.showSelfNameInGroup and IsInAnyGroup() then
+  -- Always show your name in groups; the toggle only affects solo output.
+  if IsInAnyGroup() or (DB and DB.showSelfNameAlways) then
     local me = GetClassColoredName(UnitName and UnitName("player"))
     if me and me ~= "" then
       return string.format("%s: %s", me, text)
@@ -699,30 +756,33 @@ local function BuildCurrencyPatterns()
 end
 
 local function OnCurrencyChat(_, _, msg, ...)
-  if not (DB and DB.enabled) then return false end
+  if not IsEnabled() then return false end
   if type(msg) ~= "string" or msg == "" then return false end
 
   if not CURRENCY_PATTERNS then BuildCurrencyPatterns() end
-
-  local isSelf = false
-  if CURRENCY_PREFIXES and #CURRENCY_PREFIXES > 0 then
-    for _, prefix in ipairs(CURRENCY_PREFIXES) do
-      if msg:sub(1, #prefix) == prefix then
-        isSelf = true
-        break
-      end
-    end
-  end
-  if not isSelf then
-    return false
-  end
 
   local link, qty
   for _, pat in ipairs(CURRENCY_PATTERNS or {}) do
     local a, b = msg:match(pat)
     if a then
       if b then
-        link, qty = a, b
+        local aIsLink = type(a) == "string" and a:find("|Hcurrency:", 1, true) ~= nil
+        local bIsLink = type(b) == "string" and b:find("|Hcurrency:", 1, true) ~= nil
+
+        -- Some locales/globalstrings put %d before %s, so captures can be swapped.
+        if aIsLink and not bIsLink then
+          link, qty = a, b
+        elseif bIsLink and not aIsLink then
+          link, qty = b, a
+        else
+          -- Fallback: pick the one that looks numeric as qty.
+          if tonumber(a) and not tonumber(b) then
+            qty = a
+          elseif tonumber(b) and not tonumber(a) then
+            qty = b
+          end
+          link = ExtractCurrencyLinkFallback(msg) or a
+        end
       else
         link = a
       end
@@ -737,22 +797,46 @@ local function OnCurrencyChat(_, _, msg, ...)
     return false
   end
 
+  -- Quantity fallback: some clients/locales don't expose a %d token for currency gain.
+  -- Try to parse a trailing multiplier near the currency token.
+  if not qty then
+    local escaped = EscapeLuaPattern(link)
+    qty = msg:match(escaped .. "%s*[x×]%s*(%d+)")
+      or msg:match(escaped .. "[\r\n ]*[x×]%s*(%d+)")
+      or msg:match("%s*[x×]%s*(%d+)%s*%.?$")
+  end
+
+  -- Prefer constructing a canonical currency hyperlink so color/clickability is consistent.
+  local n = tonumber(qty)
+  local currencyID = GetCurrencyIDFromLink(link)
+  if currencyID and C_CurrencyInfo and C_CurrencyInfo.GetCurrencyLink then
+    local built = C_CurrencyInfo.GetCurrencyLink(currencyID, (n and n > 0) and n or 0)
+    if type(built) == "string" and built ~= "" then
+      link = built
+    end
+  end
+
+  local handled = false
   if DB.echoItem then
     local out = ApplyCurrencyLinkAlias(link)
-    local n = tonumber(qty)
+    out = StripDisplayedLinkBrackets(out)
     if n and n > 1 then
       out = string.format("%s x%d", out, n)
     end
     if LootCombineEnabled() then
       if DB and DB.lootCombineIncludeCurrency then
         LootCombineAdd(out)
+        handled = true
       end
     else
       Print(FormatSelfLine(out))
+      handled = true
     end
   end
 
-  return DB.hideLootText and true or false
+  -- Only suppress the original system line when we actually output (or buffer) a replacement.
+  -- This avoids "missing" currency lines when loot-combine is enabled but currency is excluded.
+  return (handled and DB.hideLootText) and true or false
 end
 
 local MONEY_PATTERNS
@@ -900,11 +984,12 @@ local function IsLikelyMoneyMessage(msg)
 end
 
 local function OnMoneyChat(_, _, msg, ...)
-  if not (DB and DB.enabled) then return false end
+  if not IsEnabled() then return false end
   if type(msg) ~= "string" or msg == "" then return false end
 
   if not IsLikelyMoneyMessage(msg) then return false end
 
+  local handled = false
   if DB.echoItem then
     local coins = ParseCoinsFromMoneyMessage(msg)
     local out = FormatMoney(coins)
@@ -912,67 +997,134 @@ local function OnMoneyChat(_, _, msg, ...)
       if LootCombineEnabled() then
         if DB and DB.lootCombineIncludeGold then
           LootCombineAdd(out)
+          handled = true
         end
       else
         Print(FormatSelfLine(out))
+        handled = true
       end
     end
   end
 
-  -- Hide the original even if we can't parse/reprint it.
-  return DB.hideLootText and true or false
+  -- Only suppress the original system line when we actually output (or buffer) a replacement.
+  -- This avoids "missing" money lines when loot-combine is enabled but gold is excluded.
+  return (handled and DB.hideLootText) and true or false
 end
 
 local function OnLootChat(_, _, msg, author, ...)
-  if not (DB and DB.enabled) then return false end
+  if not IsEnabled() then return false end
   if type(msg) ~= "string" or msg == "" then return false end
 
   if not LOOT_PATTERNS then BuildLootPatterns() end
 
+  -- Some rewards (e.g. end-of-dungeon) can arrive as CHAT_MSG_LOOT but contain currency links.
+  -- Rewrite them using the same path as CHAT_MSG_CURRENCY so we don't leak default loot text.
+  if msg:find("|Hcurrency:", 1, true) then
+    local handled = false
+
+    local link = (ExtractCurrencyLinkFallback and ExtractCurrencyLinkFallback(msg))
+      or msg:match("(|Hcurrency:%d+.-|h.-|h)")
+      or msg:match("(|c%x%x%x%x%x%x%x%x|Hcurrency:%d+.-|h.-|h|r)")
+
+    if link and DB and DB.echoItem then
+      local qty
+      local escaped = EscapeLuaPattern(link)
+      qty = msg:match(escaped .. "%s*[x×]%s*(%d+)")
+        or msg:match(escaped .. "[\r\n ]*[x×]%s*(%d+)")
+        or msg:match("%s*[x×]%s*(%d+)%s*%.?$")
+
+      local n = tonumber(qty)
+      local currencyID = (GetCurrencyIDFromLink and GetCurrencyIDFromLink(link)) or nil
+      if currencyID and C_CurrencyInfo and C_CurrencyInfo.GetCurrencyLink then
+        local built = C_CurrencyInfo.GetCurrencyLink(currencyID, (n and n > 0) and n or 0)
+        if type(built) == "string" and built ~= "" then
+          link = built
+        end
+      end
+
+      local out = (ApplyCurrencyLinkAlias and ApplyCurrencyLinkAlias(link)) or link
+      out = StripDisplayedLinkBrackets(out)
+      if n and n > 1 then
+        out = string.format("%s x%d", out, n)
+      end
+
+      if LootCombineEnabled() then
+        if DB and DB.lootCombineIncludeCurrency then
+          LootCombineAdd(out)
+          handled = true
+        end
+      else
+        Print(FormatSelfLine(out))
+        handled = true
+      end
+    end
+
+    return (handled and DB and DB.hideLootText) and true or false
+  end
+
+  -- Some loot sources emit a standalone header line like "You receive loot:" with no link,
+  -- followed by separate item lines. Hiding it avoids the brief "addon turned off" look.
+  if (DB and DB.hideLootText) and (LOOT_PREFIXES and #LOOT_PREFIXES > 0) then
+    local hasItem = msg:find("|Hitem:", 1, true) ~= nil
+    local hasCurrency = msg:find("|Hcurrency:", 1, true) ~= nil
+    if (not hasItem) and (not hasCurrency) and (not IsLikelyMoneyMessage(msg)) then
+      local function Trim(s)
+        if type(s) ~= "string" then return "" end
+        s = s:gsub("^%s+", "")
+        s = s:gsub("%s+$", "")
+        return s
+      end
+
+      local tmsg = Trim(msg)
+      for _, prefix in ipairs(LOOT_PREFIXES) do
+        if tmsg == Trim(prefix) then
+          return true
+        end
+      end
+    end
+  end
+
   -- Some clients/sources emit coin loot via CHAT_MSG_LOOT instead of CHAT_MSG_MONEY.
   -- Catch and filter it here so "You loot X gold/silver/copper" doesn't leak through.
   if IsLikelyMoneyMessage(msg) then
+    local handled = false
     if DB.echoItem then
       local coins = ParseCoinsFromMoneyMessage(msg)
       local out = FormatMoney(coins)
       if out then
         if LootCombineEnabled() and (DB and DB.lootCombineIncludeGold) then
           LootCombineAdd(out)
+          handled = true
         else
           Print(FormatSelfLine(out))
+          handled = true
         end
       end
     end
-    return DB.hideLootText and true or false
+    return (handled and DB.hideLootText) and true or false
   end
 
   local isSelfLoot = false
   local playerName
   local link, qty
 
-  -- Detect self loot via localized prefixes.
-  if LOOT_PREFIXES and #LOOT_PREFIXES > 0 then
-    for _, prefix in ipairs(LOOT_PREFIXES) do
-      if msg:sub(1, #prefix) == prefix then
-        isSelfLoot = true
-        break
+  -- Prefer matching the self-loot patterns directly. Relying on extracted localized
+  -- prefixes is fragile across client versions/locales.
+  for _, pat in ipairs(LOOT_PATTERNS or {}) do
+    local a, b = msg:match(pat)
+    if a then
+      isSelfLoot = true
+      if b then
+        link, qty = a, b
+      else
+        link = a
       end
+      break
     end
   end
 
-  if isSelfLoot then
-    for _, pat in ipairs(LOOT_PATTERNS or {}) do
-      local a, b = msg:match(pat)
-      if a then
-        if b then
-          link, qty = a, b
-        else
-          link = a
-        end
-        break
-      end
-    end
-  else
+  -- If it wasn't a self-loot line, try group/other-player patterns.
+  if not link then
     for _, pat in ipairs(LOOT_GROUP_PATTERNS or {}) do
       local a, b, c = msg:match(pat)
       if a and b then
@@ -1064,13 +1216,22 @@ local function OnAchievementChat(_, _, msg, author, ...)
 end
 
 local function ApplyFilters()
-  if not ChatFrame_AddMessageEventFilter then return end
+  -- These globals can be nil at addon load time depending on UI load order.
+  -- Resolve them lazily here so the addon still works reliably.
+  if not ChatFrame_AddMessageEventFilter then
+    ChatFrame_AddMessageEventFilter = _G and rawget(_G, "ChatFrame_AddMessageEventFilter")
+  end
+  if not ChatFrame_RemoveMessageEventFilter then
+    ChatFrame_RemoveMessageEventFilter = _G and rawget(_G, "ChatFrame_RemoveMessageEventFilter")
+  end
+  if not (ChatFrame_AddMessageEventFilter and ChatFrame_RemoveMessageEventFilter) then return end
+
   ChatFrame_RemoveMessageEventFilter("CHAT_MSG_LOOT", OnLootChat)
   ChatFrame_RemoveMessageEventFilter("CHAT_MSG_CURRENCY", OnCurrencyChat)
   ChatFrame_RemoveMessageEventFilter("CHAT_MSG_MONEY", OnMoneyChat)
   ChatFrame_RemoveMessageEventFilter("CHAT_MSG_ACHIEVEMENT", OnAchievementChat)
   ChatFrame_RemoveMessageEventFilter("CHAT_MSG_GUILD_ACHIEVEMENT", OnAchievementChat)
-  if DB and DB.enabled then
+  if IsEnabled() then
     ChatFrame_AddMessageEventFilter("CHAT_MSG_LOOT", OnLootChat)
     ChatFrame_AddMessageEventFilter("CHAT_MSG_CURRENCY", OnCurrencyChat)
     ChatFrame_AddMessageEventFilter("CHAT_MSG_MONEY", OnMoneyChat)
@@ -1079,6 +1240,16 @@ local function ApplyFilters()
     ChatFrame_AddMessageEventFilter("CHAT_MSG_ACHIEVEMENT", OnAchievementChat)
     ChatFrame_AddMessageEventFilter("CHAT_MSG_GUILD_ACHIEVEMENT", OnAchievementChat)
   end
+end
+
+local function ApplyFiltersSoon(delaySeconds)
+  if not (C_Timer and C_Timer.After) then return end
+  local d = tonumber(delaySeconds) or 0
+  if d < 0 then d = 0 end
+  C_Timer.After(d, function()
+    EnsureDB()
+    ApplyFilters()
+  end)
 end
 
 local function GetSupportedMessageLines()
@@ -1188,16 +1359,38 @@ local function CreateConfigUI()
   titleFS:ClearAllPoints()
   titleFS:SetPoint("TOPLEFT", frame, "TOPLEFT", 12, -6)
 
-  local enabled = CreateFrame("CheckButton", nil, frame, "UICheckButtonTemplate")
-  enabled:SetPoint("LEFT", titleFS, "RIGHT", 8, 0)
-  enabled:SetScale(0.85)
-  SetCheckBoxText(enabled, "")
-  if enabled.Text then enabled.Text:Hide() end
-  if enabled.text then enabled.text:Hide() end
-  enabled:SetScript("OnClick", function(self)
+  local function GetEnableMode()
     EnsureDB()
-    DB.enabled = self:GetChecked() and true or false
+    if CHARDB and CHARDB.enabledOverride == true then return "on" end
+    if CHARDB and CHARDB.enabledOverride == false then return "off" end
+    if DB and DB.enabled then return "acc" end
+    return "off"
+  end
+
+  local function SetEnableMode(mode)
+    EnsureDB()
+    mode = tostring(mode or ""):lower()
+    if mode == "on" then
+      CHARDB.enabledOverride = true
+    elseif mode == "acc" then
+      CHARDB.enabledOverride = nil
+      DB.enabled = true
+    else -- off
+      CHARDB.enabledOverride = false
+    end
     ApplyFilters()
+  end
+
+  local enableModeBtn = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
+  enableModeBtn:SetSize(90, 20)
+  enableModeBtn:SetPoint("TOPLEFT", titleFS, "BOTTOMLEFT", 0, -6)
+  enableModeBtn:SetScript("OnClick", function()
+    local cur = GetEnableMode()
+    local nextMode = (cur == "off") and "on" or ((cur == "on") and "acc" or "off")
+    SetEnableMode(nextMode)
+    -- Refresh text immediately.
+    local m = GetEnableMode()
+    enableModeBtn:SetText((m == "on") and "On" or ((m == "acc") and "On Acc" or "Off"))
   end)
 
   local sub = frame:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
@@ -1208,7 +1401,7 @@ local function CreateConfigUI()
   -- Tabs
   local tabLoot = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
   tabLoot:SetSize(80, 22)
-  tabLoot:SetPoint("LEFT", enabled, "RIGHT", 10, 0)
+  tabLoot:SetPoint("LEFT", enableModeBtn, "RIGHT", 10, 0)
   tabLoot:SetText("Loot")
 
   local tabAlias = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
@@ -1227,19 +1420,19 @@ local function CreateConfigUI()
   tabMail:SetText("Mail")
 
   local lootPanel = CreateFrame("Frame", nil, frame)
-  lootPanel:SetPoint("TOPLEFT", frame.InsetBg, "TOPLEFT", 0, -14)
+  lootPanel:SetPoint("TOPLEFT", frame.InsetBg, "TOPLEFT", 0, -24)
   lootPanel:SetPoint("BOTTOMRIGHT", frame.InsetBg, "BOTTOMRIGHT", 0, 0)
 
   local mailPanel = CreateFrame("Frame", nil, frame)
-  mailPanel:SetPoint("TOPLEFT", frame.InsetBg, "TOPLEFT", 0, -14)
+  mailPanel:SetPoint("TOPLEFT", frame.InsetBg, "TOPLEFT", 0, -24)
   mailPanel:SetPoint("BOTTOMRIGHT", frame.InsetBg, "BOTTOMRIGHT", 0, 0)
 
   local aliasPanel = CreateFrame("Frame", nil, frame)
-  aliasPanel:SetPoint("TOPLEFT", frame.InsetBg, "TOPLEFT", 0, -14)
+  aliasPanel:SetPoint("TOPLEFT", frame.InsetBg, "TOPLEFT", 0, -24)
   aliasPanel:SetPoint("BOTTOMRIGHT", frame.InsetBg, "BOTTOMRIGHT", 0, 0)
 
   local otherPanel = CreateFrame("Frame", nil, frame)
-  otherPanel:SetPoint("TOPLEFT", frame.InsetBg, "TOPLEFT", 0, -14)
+  otherPanel:SetPoint("TOPLEFT", frame.InsetBg, "TOPLEFT", 0, -24)
   otherPanel:SetPoint("BOTTOMRIGHT", frame.InsetBg, "BOTTOMRIGHT", 0, 0)
 
   local function SelectTab(which)
@@ -1646,10 +1839,10 @@ local function CreateConfigUI()
   end)
 
   local selfName = CreateFrame("CheckButton", nil, lootPanel, "UICheckButtonTemplate")
-  SetCheckBoxText(selfName, "Show My Name in Groups")
+  SetCheckBoxText(selfName, "Show My Name Always")
   selfName:SetScript("OnClick", function(self)
     EnsureDB()
-    DB.showSelfNameInGroup = self:GetChecked() and true or false
+    DB.showSelfNameAlways = self:GetChecked() and true or false
   end)
 
   TightenCheckBoxLabel(selfName)
@@ -1856,10 +2049,22 @@ local function CreateConfigUI()
     EnsureDB()
     ApplyFilters()
     UpdateMailNotifier()
-    SetCheckBoxChecked(enabled, DB.enabled)
+    do
+      local mode
+      if CHARDB and CHARDB.enabledOverride == true then
+        mode = "on"
+      elseif CHARDB and CHARDB.enabledOverride == false then
+        mode = "off"
+      elseif DB and DB.enabled then
+        mode = "acc"
+      else
+        mode = "off"
+      end
+      enableModeBtn:SetText((mode == "on") and "On" or ((mode == "acc") and "On Acc" or "Off"))
+    end
     SetCheckBoxChecked(hide, DB.hideLootText)
     SetCheckBoxChecked(echo, DB.echoItem)
-    SetCheckBoxChecked(selfName, DB.showSelfNameInGroup)
+    SetCheckBoxChecked(selfName, DB.showSelfNameAlways)
     SetCheckBoxChecked(mailNotify, DB.mailNotify and DB.mailNotify.enabled)
     SetCheckBoxChecked(mailCombat, DB.mailNotify and DB.mailNotify.showInCombat ~= false)
     combineBox:SetText(tostring(DB.lootCombineCount or 1))
@@ -3255,10 +3460,22 @@ local function CreateConfigUI()
 
   frame:SetScript("OnShow", function(self)
     EnsureDB()
-    SetCheckBoxChecked(enabled, DB.enabled)
+    do
+      local mode
+      if CHARDB and CHARDB.enabledOverride == true then
+        mode = "on"
+      elseif CHARDB and CHARDB.enabledOverride == false then
+        mode = "off"
+      elseif DB and DB.enabled then
+        mode = "acc"
+      else
+        mode = "off"
+      end
+      enableModeBtn:SetText((mode == "on") and "On" or ((mode == "acc") and "On Acc" or "Off"))
+    end
     SetCheckBoxChecked(hide, DB.hideLootText)
     SetCheckBoxChecked(echo, DB.echoItem)
-    SetCheckBoxChecked(selfName, DB.showSelfNameInGroup)
+    SetCheckBoxChecked(selfName, DB.showSelfNameAlways)
     RefreshIlvlButtons()
     combineBox:SetText(tostring(DB.lootCombineCount or 1))
     combineCur:SetOn(DB.lootCombineIncludeCurrency)
@@ -4311,10 +4528,20 @@ SlashCmdList.FR0Z3NUI_LOOTIT = function(msg)
   cmd = (cmd and cmd:lower()) or ""
 
   local function Status()
-    local e = (DB.enabled and "on" or "off")
+    local mode
+    if CHARDB and CHARDB.enabledOverride == true then
+      mode = "on"
+    elseif CHARDB and CHARDB.enabledOverride == false then
+      mode = "off"
+    elseif DB and DB.enabled then
+      mode = "acc"
+    else
+      mode = "off"
+    end
+    local e = (IsEnabled() and "on" or "off")
     local h = (DB.hideLootText and "on" or "off")
     local x = (DB.echoItem and "on" or "off")
-    Print(string.format("enabled=%s, hide=%s, echo=%s", e, h, x))
+    Print(string.format("enabled=%s (%s), hide=%s, echo=%s", e, (mode == "acc") and "acc" or "char", h, x))
   end
 
   if cmd == "" then
@@ -4441,12 +4668,30 @@ SlashCmdList.FR0Z3NUI_LOOTIT = function(msg)
     return
   end
 
+  if cmd == "repair" or cmd == "reapply" then
+    ApplyFilters()
+    Print(string.format("reapplied filters (enabled=%s, hide=%s, echo=%s, combine=%s)", IsEnabled() and "on" or "off", (DB and DB.hideLootText) and "on" or "off", (DB and DB.echoItem) and "on" or "off", LootCombineEnabled() and "on" or "off"))
+    return
+  end
+
+  if cmd == "debugfilters" or cmd == "debug" then
+    local add = _G and rawget(_G, "ChatFrame_AddMessageEventFilter")
+    local rem = _G and rawget(_G, "ChatFrame_RemoveMessageEventFilter")
+    Print(string.format("enabled=%s, hide=%s, echo=%s, combine=%s", IsEnabled() and "on" or "off", (DB and DB.hideLootText) and "on" or "off", (DB and DB.echoItem) and "on" or "off", LootCombineEnabled() and "on" or "off"))
+    Print(string.format("ChatFrame_AddMessageEventFilter=%s", type(add)))
+    Print(string.format("ChatFrame_RemoveMessageEventFilter=%s", type(rem)))
+    Print("(If those are nil, chat filters cannot install yet.)")
+    return
+  end
+
   if cmd == "ui" or cmd == "config" or cmd == "options" then
     ToggleConfigUI()
     return
   end
 
   if cmd == "on" or cmd == "enable" then
+    -- Keep slash commands account-wide (matches old behavior).
+    CHARDB.enabledOverride = nil
     DB.enabled = true
     ApplyFilters()
     Status()
@@ -4454,6 +4699,7 @@ SlashCmdList.FR0Z3NUI_LOOTIT = function(msg)
   end
 
   if cmd == "off" or cmd == "disable" then
+    CHARDB.enabledOverride = nil
     DB.enabled = false
     ApplyFilters()
     Status()
@@ -4461,6 +4707,7 @@ SlashCmdList.FR0Z3NUI_LOOTIT = function(msg)
   end
 
   if cmd == "toggle" then
+    CHARDB.enabledOverride = nil
     DB.enabled = not DB.enabled
     ApplyFilters()
     Status()
@@ -4483,7 +4730,7 @@ SlashCmdList.FR0Z3NUI_LOOTIT = function(msg)
 
   if cmd == "selfname" then
     local v = (rest or ""):lower()
-    DB.showSelfNameInGroup = (v ~= "off" and v ~= "0" and v ~= "false")
+    DB.showSelfNameAlways = (v ~= "off" and v ~= "0" and v ~= "false")
     Status()
     return
   end
@@ -4641,14 +4888,18 @@ f:SetScript("OnEvent", function(_, event)
   EnsureDB()
   if event == "PLAYER_LOGIN" then
     ApplyFilters()
+    ApplyFiltersSoon(1)
     C_Timer.After(1, UpdateMailNotifier)
   elseif event == "PLAYER_ENTERING_WORLD" then
+    ApplyFiltersSoon(0.5)
     C_Timer.After(1, UpdateMailNotifier)
   elseif event == "UPDATE_PENDING_MAIL" then
     C_Timer.After(0.5, UpdateMailNotifier)
   elseif event == "PLAYER_REGEN_DISABLED" or event == "PLAYER_REGEN_ENABLED" then
     UpdateMailNotifier()
   elseif event == "LOOT_OPENED" or event == "LOOT_READY" then
+    -- Other addons can remove chat filters at runtime; re-apply here so loot lines are still rewritten.
+    ApplyFilters()
     LootCombineWindowStart()
   elseif event == "LOOT_CLOSED" then
     LootCombineWindowEnd()
