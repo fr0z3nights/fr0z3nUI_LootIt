@@ -246,6 +246,7 @@ end
 local LOOT_PATTERNS = nil
 local LOOT_PREFIXES = nil
 local LOOT_GROUP_PATTERNS = nil
+local RECEIVE_ITEM_PATTERNS = nil
 
 local LOOT_PATTERN_KEYS
 local LOOT_GROUP_PATTERN_KEYS
@@ -254,6 +255,7 @@ local function BuildLootPatterns()
   local patterns = {}
   local prefixes = {}
   local groupPatterns = {}
+  local receiveItemPatterns = {}
 
   local keys = {
     "LOOT_ITEM_SELF",
@@ -262,6 +264,9 @@ local function BuildLootPatterns()
     "LOOT_ITEM_PUSHED_SELF_MULTIPLE",
     "LOOT_ITEM_CREATED_SELF",
     "LOOT_ITEM_CREATED_SELF_MULTIPLE",
+    -- Purchases/rewards can use "You receive item: ..." strings instead of "You receive loot: ...".
+    "YOU_RECEIVE_ITEM",
+    "YOU_RECEIVE_ITEM_MULTIPLE",
     "LOOT_ITEM_BONUS_ROLL_SELF",
     "LOOT_ITEM_BONUS_ROLL_SELF_MULTIPLE",
   }
@@ -271,6 +276,24 @@ local function BuildLootPatterns()
     local pat = GlobalStringToPattern(gs)
     if pat then
       patterns[#patterns + 1] = pat
+
+      if k == "YOU_RECEIVE_ITEM" or k == "YOU_RECEIVE_ITEM_MULTIPLE" then
+        receiveItemPatterns[#receiveItemPatterns + 1] = pat
+      end
+
+      -- Some sources omit trailing punctuation (notably the final '.'), which can
+      -- cause anchored GlobalString patterns to miss lines like:
+      --   "You receive item: [Chest of Gold]"
+      -- Keep this relaxation narrowly scoped to the receive-item strings.
+      if k == "YOU_RECEIVE_ITEM" or k == "YOU_RECEIVE_ITEM_MULTIPLE" then
+        -- Convert a trailing "%." right before the end-anchor into an optional dot.
+        -- Example: "^You receive item: (.-)%.$" -> "^You receive item: (.-)%.?$"
+        local alt = pat:gsub("%%%.%$", "%%.?$")
+        if alt ~= pat then
+          patterns[#patterns + 1] = alt
+          receiveItemPatterns[#receiveItemPatterns + 1] = alt
+        end
+      end
     end
 
     if type(gs) == "string" and gs ~= "" then
@@ -293,6 +316,7 @@ local function BuildLootPatterns()
   LOOT_PATTERNS = patterns
   LOOT_PREFIXES = prefixes
   LOOT_GROUP_PATTERNS = groupPatterns
+  RECEIVE_ITEM_PATTERNS = receiveItemPatterns
 end
 
 LOOT_PATTERN_KEYS = {
@@ -302,6 +326,8 @@ LOOT_PATTERN_KEYS = {
   "LOOT_ITEM_PUSHED_SELF_MULTIPLE",
   "LOOT_ITEM_CREATED_SELF",
   "LOOT_ITEM_CREATED_SELF_MULTIPLE",
+  "YOU_RECEIVE_ITEM",
+  "YOU_RECEIVE_ITEM_MULTIPLE",
   "LOOT_ITEM_BONUS_ROLL_SELF",
   "LOOT_ITEM_BONUS_ROLL_SELF_MULTIPLE",
 }
@@ -609,12 +635,26 @@ local function ExtractAchievementLinkFallback(msg)
     or msg:match("(|Hachievement:.-|h%[.-%]|h)")
 end
 
+local function AppendSuffixInsideColorReset(text, suffix)
+  if type(text) ~= "string" then
+    text = tostring(text or "")
+  end
+  suffix = tostring(suffix or "")
+  if suffix == "" then
+    return text
+  end
+  if text:sub(-2) == "|r" then
+    return text:sub(1, -3) .. suffix .. "|r"
+  end
+  return text .. suffix
+end
+
 local function FormatSelfLine(text)
   -- Always show your name in groups; the toggle only affects solo output.
   if IsInAnyGroup() or (DB and DB.showSelfNameAlways) then
     local me = GetClassColoredName(UnitName and UnitName("player"))
     if me and me ~= "" then
-      return string.format("%s: %s", me, text)
+      return string.format("%s %s", AppendSuffixInsideColorReset(me, ":"), text)
     end
   end
   return text
@@ -716,7 +756,7 @@ end
 local function FormatOtherLine(name, text)
   local colored = GetClassColoredName(name or "")
   if colored and colored ~= "" then
-    return string.format("%s: %s", colored, text)
+    return string.format("%s %s", AppendSuffixInsideColorReset(colored, ":"), text)
   end
   return text
 end
@@ -1011,6 +1051,59 @@ local function OnMoneyChat(_, _, msg, ...)
   return (handled and DB.hideLootText) and true or false
 end
 
+local function OnSystemChat(_, _, msg, ...)
+  if not IsEnabled() then return false end
+  if type(msg) ~= "string" or msg == "" then return false end
+
+  if not LOOT_PATTERNS then BuildLootPatterns() end
+
+  local link, qty
+  for _, pat in ipairs(RECEIVE_ITEM_PATTERNS or {}) do
+    local a, b = msg:match(pat)
+    if a then
+      link = a
+      qty = b
+      break
+    end
+  end
+
+  if not link then
+    link = ExtractLinkFallback(msg)
+  end
+  if not link then
+    return false
+  end
+
+  if DB and DB.echoItem then
+    link = NormalizeItemLink(link)
+    link = ApplyItemLinkAlias(link)
+    local displayLink = StripDisplayedLinkBrackets(link)
+    local out = displayLink
+    local n = tonumber(qty)
+    if n and n > 1 then
+      out = string.format("%s x%d", displayLink, n)
+    end
+
+    if IsItemLevelEnabled() then
+      local ilvl = GetEquippableItemLevelSuffix(link)
+      if ilvl then
+        local color = link:match("^(|c%x%x%x%x%x%x%x%x)")
+        local ilvlText
+        if color then
+          ilvlText = color .. tostring(ilvl) .. "|r"
+        else
+          ilvlText = tostring(ilvl)
+        end
+        out = out .. " " .. ilvlText
+      end
+    end
+
+    LootCombineAdd(out)
+  end
+
+  return (DB and DB.hideLootText) and true or false
+end
+
 local function OnLootChat(_, _, msg, author, ...)
   if not IsEnabled() then return false end
   if type(msg) ~= "string" or msg == "" then return false end
@@ -1229,12 +1322,14 @@ local function ApplyFilters()
   ChatFrame_RemoveMessageEventFilter("CHAT_MSG_LOOT", OnLootChat)
   ChatFrame_RemoveMessageEventFilter("CHAT_MSG_CURRENCY", OnCurrencyChat)
   ChatFrame_RemoveMessageEventFilter("CHAT_MSG_MONEY", OnMoneyChat)
+  ChatFrame_RemoveMessageEventFilter("CHAT_MSG_SYSTEM", OnSystemChat)
   ChatFrame_RemoveMessageEventFilter("CHAT_MSG_ACHIEVEMENT", OnAchievementChat)
   ChatFrame_RemoveMessageEventFilter("CHAT_MSG_GUILD_ACHIEVEMENT", OnAchievementChat)
   if IsEnabled() then
     ChatFrame_AddMessageEventFilter("CHAT_MSG_LOOT", OnLootChat)
     ChatFrame_AddMessageEventFilter("CHAT_MSG_CURRENCY", OnCurrencyChat)
     ChatFrame_AddMessageEventFilter("CHAT_MSG_MONEY", OnMoneyChat)
+    ChatFrame_AddMessageEventFilter("CHAT_MSG_SYSTEM", OnSystemChat)
   end
   if DB and DB.other and DB.other.achievement and DB.other.achievement.enabled then
     ChatFrame_AddMessageEventFilter("CHAT_MSG_ACHIEVEMENT", OnAchievementChat)
@@ -1293,6 +1388,13 @@ local function GetSupportedMessageLines()
   for _, k in ipairs(MONEY_PATTERN_KEYS) do
     lines[#lines + 1] = "    - " .. k
   end
+
+  lines[#lines + 1] = ""
+  lines[#lines + 1] = "CHAT_MSG_SYSTEM"
+  lines[#lines + 1] = "  - Filters 'You receive item: ...' reward lines when they show up as system messages"
+  lines[#lines + 1] = "  - GlobalString keys:"
+  lines[#lines + 1] = "    - YOU_RECEIVE_ITEM"
+  lines[#lines + 1] = "    - YOU_RECEIVE_ITEM_MULTIPLE"
   return lines
 end
 
