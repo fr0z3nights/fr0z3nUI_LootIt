@@ -61,24 +61,6 @@ local DEFAULTS = {
   lootCombineMode = "loot", -- loot | timer
   mailNotify = {
     enabled = true,
-    showInCombat = true,
-    model = {
-      kind = "npc", -- player | display | file
-      id = 104230,
-      rotation = 0.15,
-      zoom = 0.9,
-      anim = 0,
-      animRandom = false,
-      animRepeat = false,
-      animRepeatSec = 10,
-    },
-    ui = {
-      point = "TOPRIGHT",
-      x = -260,
-      y = -220,
-      w = 200,
-      h = 220,
-    },
   },
   money = {
     gold = true,
@@ -162,6 +144,51 @@ local function EnsureDB()
     DB.showSelfNameAlways = (fr0z3nUI_LootItDB.showSelfNameInGroup == true)
     fr0z3nUI_LootItDB.showSelfNameAlways = DB.showSelfNameAlways
   end
+
+  -- Mail notifier config is per-character (enabled remains account-wide + char override).
+  do
+    if type(CHARDB.mailNotify) ~= "table" then
+      CHARDB.mailNotify = {}
+    end
+
+    -- Migration: older versions stored mail notifier config account-wide.
+    if type(fr0z3nUI_LootItDB.mailNotify) == "table" and not CHARDB.mailNotify._migratedFromAcc then
+      local acc = fr0z3nUI_LootItDB.mailNotify
+      local ch = CHARDB.mailNotify
+      if ch.showInCombat == nil and acc.showInCombat ~= nil then
+        ch.showInCombat = (acc.showInCombat ~= false)
+      end
+      if type(ch.model) ~= "table" and type(acc.model) == "table" then
+        ch.model = CopyDefaults({}, acc.model)
+      end
+      if type(ch.ui) ~= "table" and type(acc.ui) == "table" then
+        ch.ui = CopyDefaults({}, acc.ui)
+      end
+      ch._migratedFromAcc = true
+    end
+
+    local mn = CHARDB.mailNotify
+    if mn.showInCombat == nil then mn.showInCombat = true end
+
+    if type(mn.model) ~= "table" then mn.model = {} end
+    if mn.model.kind == nil then mn.model.kind = "npc" end
+    if mn.model.id == nil then mn.model.id = 104230 end -- Dalaran Mailemental
+    if mn.model.rotation == nil then mn.model.rotation = 0.15 end
+    if mn.model.zoom == nil then mn.model.zoom = 0.9 end
+    if mn.model.anim == nil then mn.model.anim = 0 end
+    if mn.model.animRandom == nil then mn.model.animRandom = false end
+    if mn.model.animRepeat == nil then mn.model.animRepeat = false end
+    if mn.model.animRepeatSec == nil then mn.model.animRepeatSec = 10 end
+
+    if type(mn.ui) ~= "table" then mn.ui = {} end
+    if mn.ui.point == nil then mn.ui.point = "TOPRIGHT" end
+    if mn.ui.x == nil then mn.ui.x = -260 end
+    if mn.ui.y == nil then mn.ui.y = -220 end
+    if mn.ui.w == nil then mn.ui.w = 200 end
+    if mn.ui.h == nil then mn.ui.h = 220 end
+    if mn.ui.alpha == nil then mn.ui.alpha = 0.5 end
+    if mn.ui.strata == nil then mn.ui.strata = "BACKGROUND" end
+  end
 end
 
 local function IsItemLevelEnabled()
@@ -169,6 +196,22 @@ local function IsItemLevelEnabled()
     return (CHARDB.showItemLevel == true)
   end
   return (DB and DB.showItemLevel ~= false) and true or false
+end
+
+local function IsMailNotifierEnabled()
+  -- Tri-state:
+  --   CHAR override true  -> On
+  --   CHAR override false -> Off
+  --   nil                 -> use account (DB.mailNotify.enabled)
+  if CHARDB and CHARDB.mailNotifyEnabledOverride ~= nil then
+    return (CHARDB.mailNotifyEnabledOverride == true)
+  end
+  return (DB and DB.mailNotify and DB.mailNotify.enabled) and true or false
+end
+
+local function MailNotifyCfg()
+  EnsureDB()
+  return (CHARDB and type(CHARDB.mailNotify) == "table") and CHARDB.mailNotify or nil
 end
 
 local function Print(msg)
@@ -1460,6 +1503,7 @@ local function CreateConfigUI()
   titleFS:SetText("|cff00ccff[FLI]|r LootIt")
   titleFS:ClearAllPoints()
   titleFS:SetPoint("TOPLEFT", frame, "TOPLEFT", 12, -6)
+  if titleFS.Hide then titleFS:Hide() end
 
   local function GetEnableMode()
     EnsureDB()
@@ -1483,9 +1527,59 @@ local function CreateConfigUI()
     ApplyFilters()
   end
 
+  local mailNotifyLabel
+  local mailNotifyModeBtn
+  local mailCombat
+
+  local function GetMailNotifyMode()
+    EnsureDB()
+    if CHARDB and CHARDB.mailNotifyEnabledOverride == true then return "on" end
+    if CHARDB and CHARDB.mailNotifyEnabledOverride == false then return "off" end
+    if DB and DB.mailNotify and DB.mailNotify.enabled then return "acc" end
+    return "off"
+  end
+
+  local function SetMailNotifyMode(mode)
+    EnsureDB()
+    DB.mailNotify = DB.mailNotify or {}
+    mode = tostring(mode or ""):lower()
+    if mode == "on" then
+      CHARDB.mailNotifyEnabledOverride = true
+    elseif mode == "acc" then
+      CHARDB.mailNotifyEnabledOverride = nil
+      DB.mailNotify.enabled = true
+    else -- off
+      CHARDB.mailNotifyEnabledOverride = false
+    end
+    UpdateMailNotifier()
+  end
+
+  local function RefreshMailNotifyModeButton()
+    if not (mailNotifyModeBtn and mailNotifyModeBtn.SetText) then return end
+    local m = GetMailNotifyMode()
+    mailNotifyModeBtn:SetText((m == "on") and "On" or ((m == "acc") and "On Acc" or "Off"))
+  end
+
+  local function IsMailCombatOn()
+    local mn = MailNotifyCfg()
+    return (mn and mn.showInCombat ~= false) and true or false
+  end
+
+  local function RefreshMailCombatButton()
+    if not (mailCombatBtn and mailCombatBtn.GetFontString) then return end
+    local fs = mailCombatBtn:GetFontString()
+    if fs and fs.SetText then
+      fs:SetText("Combat")
+      if IsMailCombatOn() then
+        fs:SetTextColor(1.0, 0.82, 0.0, 1)
+      else
+        fs:SetTextColor(0.55, 0.55, 0.55, 1)
+      end
+    end
+  end
+
   local enableModeBtn = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
   enableModeBtn:SetSize(90, 20)
-  enableModeBtn:SetPoint("TOPLEFT", titleFS, "BOTTOMLEFT", 0, -6)
   enableModeBtn:SetScript("OnClick", function()
     local cur = GetEnableMode()
     local nextMode = (cur == "off") and "on" or ((cur == "on") and "acc" or "off")
@@ -1502,9 +1596,9 @@ local function CreateConfigUI()
 
   -- Tabs
   local tabLoot = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
-  tabLoot:SetSize(80, 22)
-  tabLoot:SetPoint("LEFT", enableModeBtn, "RIGHT", 10, 0)
-  tabLoot:SetText("Loot")
+  tabLoot:SetSize(130, 22)
+  tabLoot:SetPoint("TOPLEFT", frame, "TOPLEFT", 12, -6)
+  tabLoot:SetText("|cff00ccff[FLI]|r LootIt")
 
   local tabAlias = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
   tabAlias:SetSize(80, 22)
@@ -1524,6 +1618,15 @@ local function CreateConfigUI()
   local lootPanel = CreateFrame("Frame", nil, frame)
   lootPanel:SetPoint("TOPLEFT", frame.InsetBg, "TOPLEFT", 0, -24)
   lootPanel:SetPoint("BOTTOMRIGHT", frame.InsetBg, "BOTTOMRIGHT", 0, 0)
+
+  -- Show the global enable-mode control only on the Loot tab.
+  enableModeBtn:SetParent(lootPanel)
+  enableModeBtn:ClearAllPoints()
+  enableModeBtn:SetPoint("TOPRIGHT", lootPanel, "TOPRIGHT", -10, -6)
+  do
+    local m = GetEnableMode()
+    enableModeBtn:SetText((m == "on") and "On" or ((m == "acc") and "On Acc" or "Off"))
+  end
 
   local mailPanel = CreateFrame("Frame", nil, frame)
   mailPanel:SetPoint("TOPLEFT", frame.InsetBg, "TOPLEFT", 0, -24)
@@ -1549,10 +1652,27 @@ local function CreateConfigUI()
     otherPanel:SetShown(isOther)
     mailPanel:SetShown(isMail)
 
-    tabLoot:SetEnabled(not isLoot)
-    tabAlias:SetEnabled(not isAlias)
-    tabOther:SetEnabled(not isOther)
-    tabMail:SetEnabled(not isMail)
+    if enableModeBtn and enableModeBtn.SetShown then
+      enableModeBtn:SetShown(isLoot)
+    end
+
+    local function StyleTab(btn, active)
+      if not (btn and btn.GetFontString and btn.IsEnabled and btn.SetEnabled) then return end
+      btn:SetEnabled(true)
+      local fs = btn:GetFontString()
+      if fs and fs.SetTextColor then
+        if active then
+          fs:SetTextColor(1.0, 0.82, 0.0, 1)
+        else
+          fs:SetTextColor(0.70, 0.70, 0.70, 1)
+        end
+      end
+    end
+
+    StyleTab(tabLoot, isLoot)
+    StyleTab(tabAlias, isAlias)
+    StyleTab(tabOther, isOther)
+    StyleTab(tabMail, isMail)
 
     frame._activeTab = isLoot and "loot" or (isAlias and "alias" or (isOther and "other" or "mail"))
 
@@ -2131,7 +2251,7 @@ local function CreateConfigUI()
 
   RefreshIlvlButtons()
 
-  local mailNotify, mailCombat
+  -- mailNotifyModeBtn/mailCombat are created in the Mail tab.
 
   local reset = CreateFrame("Button", nil, lootPanel, "UIPanelButtonTemplate")
   reset:SetSize(120, 22)
@@ -2167,8 +2287,8 @@ local function CreateConfigUI()
     SetCheckBoxChecked(hide, DB.hideLootText)
     SetCheckBoxChecked(echo, DB.echoItem)
     SetCheckBoxChecked(selfName, DB.showSelfNameAlways)
-    SetCheckBoxChecked(mailNotify, DB.mailNotify and DB.mailNotify.enabled)
-    SetCheckBoxChecked(mailCombat, DB.mailNotify and DB.mailNotify.showInCombat ~= false)
+    RefreshMailNotifyModeButton()
+    RefreshMailCombatButton()
     combineBox:SetText(tostring(DB.lootCombineCount or 1))
     combineCur:SetOn(DB.lootCombineIncludeCurrency)
     combineGold:SetOn(DB.lootCombineIncludeGold)
@@ -2879,29 +2999,39 @@ local function CreateConfigUI()
   end
 
   -- Mail tab controls
-  mailNotify = CreateFrame("CheckButton", nil, mailPanel, "UICheckButtonTemplate")
-  mailNotify:SetPoint("TOPLEFT", mailPanel, "TOPLEFT", 8, -6)
-  SetCheckBoxText(mailNotify, "Notifier")
-  mailNotify:SetScript("OnClick", function(self)
-    EnsureDB()
-    DB.mailNotify = DB.mailNotify or {}
-    DB.mailNotify.enabled = self:GetChecked() and true or false
-    UpdateMailNotifier()
-  end)
+  mailNotifyLabel = mailPanel:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+  mailNotifyLabel:SetPoint("TOPLEFT", mailPanel, "TOPLEFT", 10, -10)
+  mailNotifyLabel:SetText("")
+  if mailNotifyLabel.Hide then mailNotifyLabel:Hide() end
 
-  mailCombat = CreateFrame("CheckButton", nil, mailPanel, "UICheckButtonTemplate")
-  mailCombat:SetPoint("LEFT", mailNotify, "RIGHT", 90, 0)
-  SetCheckBoxText(mailCombat, "In combat")
-  mailCombat:SetScript("OnClick", function(self)
-    EnsureDB()
-    DB.mailNotify = DB.mailNotify or {}
-    DB.mailNotify.showInCombat = self:GetChecked() and true or false
-    UpdateMailNotifier()
+  mailNotifyModeBtn = CreateFrame("Button", nil, mailPanel, "UIPanelButtonTemplate")
+  mailNotifyModeBtn:SetSize(90, 20)
+  mailNotifyModeBtn:SetPoint("TOPRIGHT", mailPanel, "TOPRIGHT", -10, -6)
+  mailNotifyModeBtn:SetScript("OnClick", function()
+    local cur = GetMailNotifyMode()
+    local nextMode = (cur == "off") and "on" or ((cur == "on") and "acc" or "off")
+    SetMailNotifyMode(nextMode)
+    RefreshMailNotifyModeButton()
   end)
+  RefreshMailNotifyModeButton()
+
+  mailCombatBtn = CreateFrame("Button", nil, mailPanel, "UIPanelButtonTemplate")
+  mailCombatBtn:SetSize(90, 20)
+  mailCombatBtn:SetPoint("RIGHT", mailNotifyModeBtn, "LEFT", -10, 0)
+  mailCombatBtn:SetScript("OnClick", function()
+    EnsureDB()
+    local mn = MailNotifyCfg()
+    if not mn then return end
+    local on = (mn.showInCombat ~= false)
+    mn.showInCombat = on and false or true
+    UpdateMailNotifier()
+    RefreshMailCombatButton()
+  end)
+  RefreshMailCombatButton()
 
   -- Embedded mail model editor (replaces the old pop-out window).
   local modelUI = CreateFrame("Frame", nil, mailPanel)
-  modelUI:SetPoint("TOPLEFT", mailPanel, "TOPLEFT", 8, -6)
+  modelUI:SetPoint("TOPLEFT", mailPanel, "TOPLEFT", 8, -32)
   modelUI:SetPoint("BOTTOMRIGHT", mailPanel, "BOTTOMRIGHT", -12, 8)
   mailPanel.modelUI = modelUI
 
@@ -2915,8 +3045,9 @@ local function CreateConfigUI()
   modelUI._repeatElapsed = 0
   modelUI:SetScript("OnUpdate", function(self, elapsed)
     EnsureDB()
-    if not (DB and DB.mailNotify and DB.mailNotify.model) then return end
-    local spec = DB.mailNotify.model
+    local mnc = MailNotifyCfg()
+    if not (mnc and mnc.model) then return end
+    local spec = mnc.model
     if not spec.animRepeat then return end
 
     local interval = tonumber(spec.animRepeatSec) or 10
@@ -2939,19 +3070,20 @@ local function CreateConfigUI()
   preview:EnableMouseWheel(true)
   preview:SetScript("OnMouseWheel", function(self, delta)
     EnsureDB()
-    DB.mailNotify = DB.mailNotify or {}
-    DB.mailNotify.model = DB.mailNotify.model or {}
+    local mnc = MailNotifyCfg()
+    if not mnc then return end
+    mnc.model = mnc.model or {}
 
     if IsShiftKeyDown and IsShiftKeyDown() then
-      local r = tonumber(DB.mailNotify.model.rotation) or ModelGetRotation(self) or 0
+      local r = tonumber(mnc.model.rotation) or ModelGetRotation(self) or 0
       r = r + (delta * 0.20)
-      DB.mailNotify.model.rotation = r
+      mnc.model.rotation = r
       ModelSetRotation(self, r)
     else
-      local z = tonumber(DB.mailNotify.model.zoom)
+      local z = tonumber(mnc.model.zoom)
       if not z then z = 1.0 end
       z = Clamp(z + (delta * 0.08), 0.20, 3.00)
-      DB.mailNotify.model.zoom = z
+      mnc.model.zoom = z
       ModelApplyZoom(self, z)
     end
   end)
@@ -2962,10 +3094,11 @@ local function CreateConfigUI()
     b:SetText(text)
     b:SetScript("OnClick", function()
       EnsureDB()
-      DB.mailNotify = DB.mailNotify or {}
-      DB.mailNotify.model = DB.mailNotify.model or {}
-      DB.mailNotify.model.kind = "npc"
-      DB.mailNotify.model.id = npcID
+      local mnc = MailNotifyCfg()
+      if not mnc then return end
+      mnc.model = mnc.model or {}
+      mnc.model.kind = "npc"
+      mnc.model.id = npcID
       modelUI.rPlayer:SetChecked(false)
       modelUI.rNPC:SetChecked(true)
       modelUI.rDisplay:SetChecked(false)
@@ -3037,24 +3170,27 @@ local function CreateConfigUI()
 
   local function PreviewSpec()
     EnsureDB()
-    local spec = DB.mailNotify and DB.mailNotify.model or {}
+    local mnc = MailNotifyCfg()
+    if not mnc then return end
+    local spec = mnc.model or {}
     local kind = GetKind()
     local id = tonumber(idBox:GetText() or "")
     spec.kind = kind
     spec.id = (kind == "player") and nil or id
-    DB.mailNotify.model = spec
+    mnc.model = spec
     ApplyMailModelToFrame(preview)
   end
 
   local function ApplyNotifierSizingAndAlpha()
     EnsureDB()
-    DB.mailNotify = DB.mailNotify or {}
-    DB.mailNotify.ui = DB.mailNotify.ui or {}
+    local mnc = MailNotifyCfg()
+    if not mnc then return end
+    mnc.ui = mnc.ui or {}
 
-    local w = Clamp(DB.mailNotify.ui.w or 140, 40, 600)
-    local h = Clamp(DB.mailNotify.ui.h or 140, 40, 600)
-    local a = Clamp(DB.mailNotify.ui.alpha or 1, 0.10, 1.00)
-    DB.mailNotify.ui.w, DB.mailNotify.ui.h, DB.mailNotify.ui.alpha = w, h, a
+    local w = Clamp(mnc.ui.w or 200, 40, 600)
+    local h = Clamp(mnc.ui.h or 220, 40, 600)
+    local a = Clamp(mnc.ui.alpha or 0.5, 0.10, 1.00)
+    mnc.ui.w, mnc.ui.h, mnc.ui.alpha = w, h, a
 
     local mn = MailNotifier or CreateMailNotifier()
     if mn then
@@ -3062,8 +3198,8 @@ local function CreateConfigUI()
       if mn.model and mn.model.SetAlpha then
         mn.model:SetAlpha(a)
       end
-      if DB.mailNotify.ui and DB.mailNotify.ui.strata and mn.SetFrameStrata then
-        mn:SetFrameStrata(DB.mailNotify.ui.strata)
+      if mnc.ui and mnc.ui.strata and mn.SetFrameStrata then
+        mn:SetFrameStrata(mnc.ui.strata)
       end
     end
   end
@@ -3101,24 +3237,37 @@ local function CreateConfigUI()
   reset:SetText("Reset")
   reset:SetScript("OnClick", function()
     EnsureDB()
-    DB.mailNotify = DB.mailNotify or {}
-    DB.mailNotify.model = DB.mailNotify.model or {}
-    DB.mailNotify.model.kind = "player"
-    DB.mailNotify.model.id = nil
-    DB.mailNotify.model.anim = nil
-    DB.mailNotify.model.rotation = 0
-    DB.mailNotify.model.zoom = 1.0
-    SetKind("player")
+    local mn = MailNotifyCfg()
+    if not mn then return end
+
+    -- Model defaults
+    mn.model = mn.model or {}
+    mn.model.kind = "npc"
+    mn.model.id = 104230
+    mn.model.anim = 0
+    mn.model.rotation = 0.15
+    mn.model.zoom = 0.9
+
+    -- View defaults
+    mn.ui = mn.ui or {}
+    mn.ui.w = 200
+    mn.ui.h = 220
+    mn.ui.alpha = 0.5
+    mn.ui.strata = "BACKGROUND"
+
+    mn.showInCombat = true
+
+    SetKind("npc")
+    if idBox and idBox.SetText then
+      idBox:SetText("104230")
+    end
     ApplyMailModelToFrame(preview)
+    ApplyNotifierSizingAndAlpha()
     UpdateMailNotifier()
     if RefreshViewControls then RefreshViewControls() end
   end)
 
-  -- Move Notifier + In combat under Apply/Reset.
-  mailNotify:ClearAllPoints()
-  mailNotify:SetPoint("TOPLEFT", apply, "BOTTOMLEFT", -2, -2)
-  mailCombat:ClearAllPoints()
-  mailCombat:SetPoint("TOPLEFT", reset, "BOTTOMLEFT", -2, -2)
+  -- Mail notifier mode + combat buttons are anchored at the top of the tab.
 
   local viewContent = CreateFrame("Frame", nil, modelUI)
   viewContent:SetPoint("TOPLEFT", rFile, "BOTTOMLEFT", -2, -10)
@@ -3191,16 +3340,18 @@ local function CreateConfigUI()
           mu.CreateContextMenu(btn, function(_, root)
             if root and root.CreateTitle then root:CreateTitle("Layer") end
             EnsureDB()
-            DB.mailNotify = DB.mailNotify or {}
-            DB.mailNotify.ui = DB.mailNotify.ui or {}
-            local selected = tostring(DB.mailNotify.ui.strata or "")
+            local mnc = MailNotifyCfg()
+            if not mnc then return end
+            mnc.ui = mnc.ui or {}
+            local selected = tostring(mnc.ui.strata or "")
             for i, s in ipairs(STRATA) do
               if root and root.CreateRadio then
                 root:CreateRadio(s.text, function() return selected == s.key end, function()
                   EnsureDB()
-                  DB.mailNotify = DB.mailNotify or {}
-                  DB.mailNotify.ui = DB.mailNotify.ui or {}
-                  DB.mailNotify.ui.strata = s.key
+                  local mnc2 = MailNotifyCfg()
+                  if not mnc2 then return end
+                  mnc2.ui = mnc2.ui or {}
+                  mnc2.ui.strata = s.key
                   if UIDropDownMenu_SetSelectedID then UIDropDownMenu_SetSelectedID(strataDD, i) end
                   ApplyNotifierSizingAndAlpha()
                   UpdateMailNotifier()
@@ -3208,9 +3359,10 @@ local function CreateConfigUI()
               elseif root and root.CreateButton then
                 root:CreateButton(s.text, function()
                   EnsureDB()
-                  DB.mailNotify = DB.mailNotify or {}
-                  DB.mailNotify.ui = DB.mailNotify.ui or {}
-                  DB.mailNotify.ui.strata = s.key
+                  local mnc2 = MailNotifyCfg()
+                  if not mnc2 then return end
+                  mnc2.ui = mnc2.ui or {}
+                  mnc2.ui.strata = s.key
                   if UIDropDownMenu_SetSelectedID then UIDropDownMenu_SetSelectedID(strataDD, i) end
                   ApplyNotifierSizingAndAlpha()
                   UpdateMailNotifier()
@@ -3228,9 +3380,10 @@ local function CreateConfigUI()
           info.text = s.text
           info.func = function()
             EnsureDB()
-            DB.mailNotify = DB.mailNotify or {}
-            DB.mailNotify.ui = DB.mailNotify.ui or {}
-            DB.mailNotify.ui.strata = s.key
+            local mnc = MailNotifyCfg()
+            if not mnc then return end
+            mnc.ui = mnc.ui or {}
+            mnc.ui.strata = s.key
             UIDropDownMenu_SetSelectedID(strataDD, i)
             ApplyNotifierSizingAndAlpha()
             UpdateMailNotifier()
@@ -3333,14 +3486,14 @@ local function CreateConfigUI()
   mailTest:SetText("Test")
   mailTest:SetScript("OnClick", function()
     EnsureDB()
-    DB.mailNotify = DB.mailNotify or {}
-    DB.mailNotify.enabled = true
     local mf = CreateMailNotifier()
-    if DB.mailNotify and DB.mailNotify.ui then
+    local mnc = MailNotifyCfg()
+    if not (mf and mnc and mnc.ui) then return end
+    if mnc.ui then
       mf:ClearAllPoints()
-      mf:SetPoint(DB.mailNotify.ui.point or "TOPRIGHT", UIParent, DB.mailNotify.ui.point or "TOPRIGHT", DB.mailNotify.ui.x or 0, DB.mailNotify.ui.y or 0)
+      mf:SetPoint(mnc.ui.point or "TOPRIGHT", UIParent, mnc.ui.point or "TOPRIGHT", mnc.ui.x or 0, mnc.ui.y or 0)
     end
-    if (DB.mailNotify.showInCombat == false) and InCombatLockdown and InCombatLockdown() then
+    if (mnc.showInCombat == false) and InCombatLockdown and InCombatLockdown() then
       mf:Hide()
       Print("Mail notifier: hidden in combat.")
       return
@@ -3352,40 +3505,41 @@ local function CreateConfigUI()
 
   RefreshViewControls = function()
     EnsureDB()
-    DB.mailNotify = DB.mailNotify or {}
-    DB.mailNotify.ui = DB.mailNotify.ui or {}
-    DB.mailNotify.model = DB.mailNotify.model or {}
+    local mnc = MailNotifyCfg()
+    if not mnc then return end
+    mnc.ui = mnc.ui or {}
+    mnc.model = mnc.model or {}
 
-    local w = Clamp(DB.mailNotify.ui.w or 140, 40, 600)
-    local h = Clamp(DB.mailNotify.ui.h or 140, 40, 600)
-    local a = Clamp(DB.mailNotify.ui.alpha or 1, 0.10, 1.00)
+    local w = Clamp(mnc.ui.w or 200, 40, 600)
+    local h = Clamp(mnc.ui.h or 220, 40, 600)
+    local a = Clamp(mnc.ui.alpha or 0.5, 0.10, 1.00)
     wBox:SetText(tostring(math.floor(w + 0.5)))
     hBox:SetText(tostring(math.floor(h + 0.5)))
     alphaSlider:SetValue(a)
 
-    local want = tostring(DB.mailNotify.ui.strata or "HIGH")
-    local selected = 4
+    local want = tostring(mnc.ui.strata or "BACKGROUND")
+    local selected = 1
     for i, s in ipairs(STRATA) do
       if s.key == want then selected = i break end
     end
     UIDropDownMenu_SetSelectedID(strataDD, selected)
 
-    local z = Clamp(DB.mailNotify.model.zoom or 1.0, 0.20, 3.00)
+    local z = Clamp(mnc.model.zoom or 0.9, 0.20, 3.00)
     zoomSlider:SetValue(z)
 
-    local anim = tonumber(DB.mailNotify.model.anim) or 0
+    local anim = tonumber(mnc.model.anim) or 0
     actionBox:SetText(tostring(anim))
-    SetCheckBoxChecked(actionRandom, DB.mailNotify.model.animRandom)
+    SetCheckBoxChecked(actionRandom, mnc.model.animRandom)
 
-    local repeatOn = (DB.mailNotify.model.animRepeat == true)
-    local sec = tonumber(DB.mailNotify.model.animRepeatSec) or 10
+    local repeatOn = (mnc.model.animRepeat == true)
+    local sec = tonumber(mnc.model.animRepeatSec) or 10
     if sec < 1 then sec = 1 end
     if sec > 3600 then sec = 3600 end
     repeatSecBox:SetText(tostring(math.floor(sec + 0.5)))
     SetCheckBoxChecked(repeatCB, repeatOn)
     repeatSecBox:SetEnabled(repeatOn)
 
-    local randomOn = (DB.mailNotify.model.animRandom == true)
+    local randomOn = (mnc.model.animRandom == true)
     local allowManual = (not randomOn)
     actionBox:SetEnabled(allowManual)
     actionPrev:SetEnabled(allowManual)
@@ -3394,11 +3548,12 @@ local function CreateConfigUI()
 
   applyWH:SetScript("OnClick", function()
     EnsureDB()
-    DB.mailNotify = DB.mailNotify or {}
-    DB.mailNotify.ui = DB.mailNotify.ui or {}
+    local mnc = MailNotifyCfg()
+    if not mnc then return end
+    mnc.ui = mnc.ui or {}
 
-    DB.mailNotify.ui.w = tonumber(wBox:GetText() or "") or DB.mailNotify.ui.w or 140
-    DB.mailNotify.ui.h = tonumber(hBox:GetText() or "") or DB.mailNotify.ui.h or 140
+    mnc.ui.w = tonumber(wBox:GetText() or "") or mnc.ui.w or 200
+    mnc.ui.h = tonumber(hBox:GetText() or "") or mnc.ui.h or 220
     ApplyNotifierSizingAndAlpha()
     UpdateMailNotifier()
     RefreshViewControls()
@@ -3415,32 +3570,35 @@ local function CreateConfigUI()
 
   alphaSlider:SetScript("OnValueChanged", function(_, v)
     EnsureDB()
-    DB.mailNotify = DB.mailNotify or {}
-    DB.mailNotify.ui = DB.mailNotify.ui or {}
-    DB.mailNotify.ui.alpha = Clamp(v, 0.10, 1.00)
+    local mnc = MailNotifyCfg()
+    if not mnc then return end
+    mnc.ui = mnc.ui or {}
+    mnc.ui.alpha = Clamp(v, 0.10, 1.00)
     ApplyNotifierSizingAndAlpha()
     if preview and preview.SetAlpha then
-      preview:SetAlpha(DB.mailNotify.ui.alpha)
+      preview:SetAlpha(mnc.ui.alpha)
     end
     UpdateMailNotifier()
   end)
 
   zoomSlider:SetScript("OnValueChanged", function(_, v)
     EnsureDB()
-    DB.mailNotify = DB.mailNotify or {}
-    DB.mailNotify.model = DB.mailNotify.model or {}
-    DB.mailNotify.model.zoom = Clamp(v, 0.20, 3.00)
+    local mnc = MailNotifyCfg()
+    if not mnc then return end
+    mnc.model = mnc.model or {}
+    mnc.model.zoom = Clamp(v, 0.20, 3.00)
     ApplyMailModelToFrame(preview)
     UpdateMailNotifier()
   end)
 
   local function NudgeRotation(dir)
     EnsureDB()
-    DB.mailNotify = DB.mailNotify or {}
-    DB.mailNotify.model = DB.mailNotify.model or {}
-    local r = tonumber(DB.mailNotify.model.rotation) or ModelGetRotation(preview) or 0
+    local mnc = MailNotifyCfg()
+    if not mnc then return end
+    mnc.model = mnc.model or {}
+    local r = tonumber(mnc.model.rotation) or ModelGetRotation(preview) or 0
     r = r + (dir * 0.20)
-    DB.mailNotify.model.rotation = r
+    mnc.model.rotation = r
     ModelSetRotation(preview, r)
     UpdateMailNotifier()
   end
@@ -3449,22 +3607,24 @@ local function CreateConfigUI()
   rotRight:SetScript("OnClick", function() NudgeRotation(1) end)
   rotReset:SetScript("OnClick", function()
     EnsureDB()
-    DB.mailNotify = DB.mailNotify or {}
-    DB.mailNotify.model = DB.mailNotify.model or {}
-    DB.mailNotify.model.rotation = 0
+    local mnc = MailNotifyCfg()
+    if not mnc then return end
+    mnc.model = mnc.model or {}
+    mnc.model.rotation = 0
     ModelSetRotation(preview, 0)
     UpdateMailNotifier()
   end)
 
   local function SetAction(anim)
     EnsureDB()
-    DB.mailNotify = DB.mailNotify or {}
-    DB.mailNotify.model = DB.mailNotify.model or {}
+    local mnc = MailNotifyCfg()
+    if not mnc then return end
+    mnc.model = mnc.model or {}
     anim = tonumber(anim) or 0
     if anim < 0 then anim = 0 end
     if anim > 150 then anim = 0 end
-    DB.mailNotify.model.animRandom = false
-    DB.mailNotify.model.anim = anim
+    mnc.model.animRandom = false
+    mnc.model.anim = anim
     actionBox:SetText(tostring(anim))
     SetCheckBoxChecked(actionRandom, false)
     actionBox:SetEnabled(true)
@@ -3476,13 +3636,15 @@ local function CreateConfigUI()
 
   actionPrev:SetScript("OnClick", function()
     EnsureDB()
-    local anim = tonumber(DB.mailNotify and DB.mailNotify.model and DB.mailNotify.model.anim) or 0
+    local mnc = MailNotifyCfg()
+    local anim = tonumber(mnc and mnc.model and mnc.model.anim) or 0
     SetAction(anim - 1)
   end)
 
   actionNext:SetScript("OnClick", function()
     EnsureDB()
-    local anim = tonumber(DB.mailNotify and DB.mailNotify.model and DB.mailNotify.model.anim) or 0
+    local mnc = MailNotifyCfg()
+    local anim = tonumber(mnc and mnc.model and mnc.model.anim) or 0
     SetAction(anim + 1)
   end)
 
@@ -3493,19 +3655,20 @@ local function CreateConfigUI()
 
   actionRandom:SetScript("OnClick", function(self)
     EnsureDB()
-    DB.mailNotify = DB.mailNotify or {}
-    DB.mailNotify.model = DB.mailNotify.model or {}
+    local mnc = MailNotifyCfg()
+    if not mnc then return end
+    mnc.model = mnc.model or {}
 
     local on = self:GetChecked() and true or false
-    DB.mailNotify.model.animRandom = on
+    mnc.model.animRandom = on
 
     if on then
-      DB.mailNotify.model.anim = math.random(0, 150)
+      mnc.model.anim = math.random(0, 150)
       actionBox:SetEnabled(false)
       actionPrev:SetEnabled(false)
       actionNext:SetEnabled(false)
     else
-      local repeatOn = (DB.mailNotify.model.animRepeat == true)
+      local repeatOn = (mnc.model.animRepeat == true)
       actionBox:SetEnabled(not repeatOn)
       actionPrev:SetEnabled(not repeatOn)
       actionNext:SetEnabled(not repeatOn)
@@ -3518,13 +3681,14 @@ local function CreateConfigUI()
 
   repeatCB:SetScript("OnClick", function(self)
     EnsureDB()
-    DB.mailNotify = DB.mailNotify or {}
-    DB.mailNotify.model = DB.mailNotify.model or {}
+    local mnc = MailNotifyCfg()
+    if not mnc then return end
+    mnc.model = mnc.model or {}
 
     local on = self:GetChecked() and true or false
-    DB.mailNotify.model.animRepeat = on
-    if DB.mailNotify.model.animRepeatSec == nil then
-      DB.mailNotify.model.animRepeatSec = 10
+    mnc.model.animRepeat = on
+    if mnc.model.animRepeatSec == nil then
+      mnc.model.animRepeatSec = 10
     end
 
     repeatSecBox:SetEnabled(on)
@@ -3534,13 +3698,14 @@ local function CreateConfigUI()
   repeatSecBox:SetScript("OnEnterPressed", function(self)
     self:ClearFocus()
     EnsureDB()
-    DB.mailNotify = DB.mailNotify or {}
-    DB.mailNotify.model = DB.mailNotify.model or {}
+    local mnc = MailNotifyCfg()
+    if not mnc then return end
+    mnc.model = mnc.model or {}
 
     local sec = tonumber(self:GetText() or "") or 10
     if sec < 1 then sec = 1 end
     if sec > 3600 then sec = 3600 end
-    DB.mailNotify.model.animRepeatSec = sec
+    mnc.model.animRepeatSec = sec
     RefreshViewControls()
   end)
 
@@ -3552,7 +3717,8 @@ local function CreateConfigUI()
 
   modelUI.Refresh = function()
     EnsureDB()
-    local spec = DB.mailNotify and DB.mailNotify.model or {}
+    local mnc = MailNotifyCfg()
+    local spec = (mnc and mnc.model) or {}
     SetKind(spec.kind or "player")
     if spec.id then idBox:SetText(tostring(spec.id)) end
     ApplyMailModelToFrame(preview)
@@ -3583,8 +3749,8 @@ local function CreateConfigUI()
     combineCur:SetOn(DB.lootCombineIncludeCurrency)
     combineGold:SetOn(DB.lootCombineIncludeGold)
     RefreshCombineModeButtons()
-    SetCheckBoxChecked(mailNotify, DB.mailNotify and DB.mailNotify.enabled)
-    SetCheckBoxChecked(mailCombat, DB.mailNotify and DB.mailNotify.showInCombat ~= false)
+    RefreshMailNotifyModeButton()
+    RefreshMailCombatButton()
     RefreshMoneyButtons()
     UIDropDownMenu_SetSelectedID(outputDD, DB.outputChatFrame or 1)
     prefixBox:SetText(DB.echoPrefix or "")
@@ -3776,9 +3942,10 @@ end
 ApplyMailModelToFrame = function(modelFrame)
   if not modelFrame then return end
   EnsureDB()
-  local spec = DB and DB.mailNotify and DB.mailNotify.model or nil
-  local kind = spec and tostring(spec.kind or "player"):lower() or "player"
-  local id = spec and spec.id or nil
+  local mnc = MailNotifyCfg()
+  local spec = mnc and mnc.model or nil
+  local kind = tostring((spec and spec.kind) or "npc"):lower()
+  local id = (spec and spec.id) or ((kind == "npc" or kind == "creature") and 104230) or nil
 
   if modelFrame.ClearModel then modelFrame:ClearModel() end
 
@@ -3817,7 +3984,7 @@ ApplyMailModelToFrame = function(modelFrame)
     ModelApplyAnimation(modelFrame, anim)
   end
 
-  local a = DB and DB.mailNotify and DB.mailNotify.ui and tonumber(DB.mailNotify.ui.alpha)
+  local a = mnc and mnc.ui and tonumber(mnc.ui.alpha)
   if a and modelFrame.SetAlpha then
     modelFrame:SetAlpha(Clamp(a, 0.10, 1.00))
   end
@@ -3827,17 +3994,18 @@ CreateMailNotifier = function()
   if MailNotifier then return MailNotifier end
 
   EnsureDB()
-  DB.mailNotify = DB.mailNotify or {}
-  DB.mailNotify.ui = DB.mailNotify.ui or {}
-  local w = Clamp(DB.mailNotify.ui.w or 140, 40, 600)
-  local h = Clamp(DB.mailNotify.ui.h or 140, 40, 600)
-  local a = Clamp(DB.mailNotify.ui.alpha or 1, 0.10, 1.00)
-  DB.mailNotify.ui.w, DB.mailNotify.ui.h, DB.mailNotify.ui.alpha = w, h, a
+  local mnc = MailNotifyCfg()
+  if not mnc then return end
+  mnc.ui = mnc.ui or {}
+  local w = Clamp(mnc.ui.w or 200, 40, 600)
+  local h = Clamp(mnc.ui.h or 220, 40, 600)
+  local a = Clamp(mnc.ui.alpha or 0.5, 0.10, 1.00)
+  mnc.ui.w, mnc.ui.h, mnc.ui.alpha = w, h, a
 
   -- Minimal notifier: just the model.
   local frame = CreateFrame("Frame", "fr0z3nUI_LootIt_MailNotifier", UIParent)
   frame:SetSize(w, h)
-  frame:SetFrameStrata(DB.mailNotify.ui.strata or "HIGH")
+  frame:SetFrameStrata(mnc.ui.strata or "BACKGROUND")
   if frame.SetAlpha then frame:SetAlpha(1) end
   frame:SetClampedToScreen(true)
   frame:SetMovable(true)
@@ -3851,12 +4019,13 @@ CreateMailNotifier = function()
   frame:SetScript("OnDragStop", function(self)
     self:StopMovingOrSizing()
     EnsureDB()
-    DB.mailNotify = DB.mailNotify or {}
-    DB.mailNotify.ui = DB.mailNotify.ui or {}
+    local mnc = MailNotifyCfg()
+    if not mnc then return end
+    mnc.ui = mnc.ui or {}
     local point, _, _, x, y = self:GetPoint(1)
-    DB.mailNotify.ui.point = point or "TOPRIGHT"
-    DB.mailNotify.ui.x = x or 0
-    DB.mailNotify.ui.y = y or 0
+    mnc.ui.point = point or "TOPRIGHT"
+    mnc.ui.x = x or 0
+    mnc.ui.y = y or 0
   end)
 
   local model = CreateFrame("DressUpModel", nil, frame)
@@ -3879,8 +4048,9 @@ CreateMailNotifier = function()
 
   frame:HookScript("OnShow", function(self)
     EnsureDB()
-    if not (DB and DB.mailNotify) then return end
-    if (DB.mailNotify.showInCombat == false) and InCombatLockdown and InCombatLockdown() then
+    local mnc = MailNotifyCfg()
+    if not mnc then return end
+    if (mnc.showInCombat == false) and InCombatLockdown and InCombatLockdown() then
       self:Hide()
     end
   end)
@@ -3889,19 +4059,20 @@ CreateMailNotifier = function()
   frame:SetScript("OnMouseWheel", function(self, delta)
     if not self.model then return end
     EnsureDB()
-    DB.mailNotify = DB.mailNotify or {}
-    DB.mailNotify.model = DB.mailNotify.model or {}
+    local mnc = MailNotifyCfg()
+    if not mnc then return end
+    mnc.model = mnc.model or {}
 
     if IsShiftKeyDown and IsShiftKeyDown() then
-      local r = tonumber(DB.mailNotify.model.rotation) or ModelGetRotation(self.model) or 0
+      local r = tonumber(mnc.model.rotation) or ModelGetRotation(self.model) or 0
       r = r + (delta * 0.20)
-      DB.mailNotify.model.rotation = r
+      mnc.model.rotation = r
       ModelSetRotation(self.model, r)
     else
-      local z = tonumber(DB.mailNotify.model.zoom)
+      local z = tonumber(mnc.model.zoom)
       if not z then z = 1.0 end
       z = Clamp(z + (delta * 0.08), 0.20, 3.00)
-      DB.mailNotify.model.zoom = z
+      mnc.model.zoom = z
       ModelApplyZoom(self.model, z)
     end
   end)
@@ -3919,8 +4090,9 @@ CreateMailNotifier = function()
     if IsMailEditorOpen() then return end
 
     EnsureDB()
-    if not (DB and DB.mailNotify and DB.mailNotify.model) then return end
-    local spec = DB.mailNotify.model
+    local mnc = MailNotifyCfg()
+    if not (mnc and mnc.model) then return end
+    local spec = mnc.model
     if not spec.animRepeat then return end
 
     local interval = tonumber(spec.animRepeatSec) or 10
@@ -3946,30 +4118,35 @@ end
 
 UpdateMailNotifier = function()
   EnsureDB()
-  if not (DB and DB.mailNotify and DB.mailNotify.enabled) then
+  if not (DB and DB.mailNotify and IsMailNotifierEnabled()) then
     if MailNotifier then MailNotifier:Hide() end
     return
   end
 
   local frame = CreateMailNotifier()
-  if DB.mailNotify and DB.mailNotify.ui then
+  local mn = MailNotifyCfg()
+  if not (frame and mn) then
+    if MailNotifier then MailNotifier:Hide() end
+    return
+  end
+  if mn and mn.ui then
     frame:ClearAllPoints()
-    frame:SetPoint(DB.mailNotify.ui.point or "TOPRIGHT", UIParent, DB.mailNotify.ui.point or "TOPRIGHT", DB.mailNotify.ui.x or 0, DB.mailNotify.ui.y or 0)
-    local w = Clamp(DB.mailNotify.ui.w or frame:GetWidth() or 140, 40, 600)
-    local h = Clamp(DB.mailNotify.ui.h or frame:GetHeight() or 140, 40, 600)
+    frame:SetPoint(mn.ui.point or "TOPRIGHT", UIParent, mn.ui.point or "TOPRIGHT", mn.ui.x or 0, mn.ui.y or 0)
+    local w = Clamp(mn.ui.w or frame:GetWidth() or 200, 40, 600)
+    local h = Clamp(mn.ui.h or frame:GetHeight() or 220, 40, 600)
     local currentAlpha = (frame.model and frame.model.GetAlpha and frame.model:GetAlpha()) or 1
-    local a = Clamp(DB.mailNotify.ui.alpha or currentAlpha, 0.10, 1.00)
-    DB.mailNotify.ui.w, DB.mailNotify.ui.h, DB.mailNotify.ui.alpha = w, h, a
+    local a = Clamp(mn.ui.alpha or currentAlpha, 0.10, 1.00)
+    mn.ui.w, mn.ui.h, mn.ui.alpha = w, h, a
     frame:SetSize(w, h)
     if frame.model and frame.model.SetAlpha then
       frame.model:SetAlpha(a)
     end
-    frame:SetFrameStrata(DB.mailNotify.ui.strata or frame:GetFrameStrata() or "HIGH")
+    frame:SetFrameStrata(mn.ui.strata or frame:GetFrameStrata() or "BACKGROUND")
   end
 
   ApplyMailNotifierInteractivity()
 
-  if not (DB.mailNotify.showInCombat) and InCombatLockdown and InCombatLockdown() then
+  if (mn and mn.showInCombat == false) and InCombatLockdown and InCombatLockdown() then
     frame:Hide()
     return
   end
@@ -3984,8 +4161,8 @@ UpdateMailNotifier = function()
     frame._hadMail = (frame._hadMail == true)
     if not frame._hadMail then
       frame._hadMail = true
-      if DB and DB.mailNotify and DB.mailNotify.model and DB.mailNotify.model.animRandom then
-        DB.mailNotify.model.anim = math.random(0, 150)
+      if mn and mn.model and mn.model.animRandom then
+        mn.model.anim = math.random(0, 150)
       end
     end
 
@@ -4023,8 +4200,9 @@ OpenMailModelPicker = function()
     frame._repeatElapsed = 0
     frame:SetScript("OnUpdate", function(self, elapsed)
       EnsureDB()
-      if not (DB and DB.mailNotify and DB.mailNotify.model) then return end
-      local spec = DB.mailNotify.model
+      local mnc = MailNotifyCfg()
+      if not (mnc and mnc.model) then return end
+      local spec = mnc.model
       if not spec.animRepeat then return end
 
       local interval = tonumber(spec.animRepeatSec) or 10
@@ -4047,19 +4225,20 @@ OpenMailModelPicker = function()
     preview:EnableMouseWheel(true)
     preview:SetScript("OnMouseWheel", function(self, delta)
       EnsureDB()
-      DB.mailNotify = DB.mailNotify or {}
-      DB.mailNotify.model = DB.mailNotify.model or {}
+      local mnc = MailNotifyCfg()
+      if not mnc then return end
+      mnc.model = mnc.model or {}
 
       if IsShiftKeyDown and IsShiftKeyDown() then
-        local r = tonumber(DB.mailNotify.model.rotation) or ModelGetRotation(self) or 0
+        local r = tonumber(mnc.model.rotation) or ModelGetRotation(self) or 0
         r = r + (delta * 0.20)
-        DB.mailNotify.model.rotation = r
+        mnc.model.rotation = r
         ModelSetRotation(self, r)
       else
-        local z = tonumber(DB.mailNotify.model.zoom)
+        local z = tonumber(mnc.model.zoom)
         if not z then z = 1.0 end
         z = Clamp(z + (delta * 0.08), 0.20, 3.00)
-        DB.mailNotify.model.zoom = z
+        mnc.model.zoom = z
         ModelApplyZoom(self, z)
       end
     end)
@@ -4070,10 +4249,11 @@ OpenMailModelPicker = function()
       b:SetText(text)
       b:SetScript("OnClick", function()
         EnsureDB()
-        DB.mailNotify = DB.mailNotify or {}
-        DB.mailNotify.model = DB.mailNotify.model or {}
-        DB.mailNotify.model.kind = "npc"
-        DB.mailNotify.model.id = npcID
+        local mnc = MailNotifyCfg()
+        if not mnc then return end
+        mnc.model = mnc.model or {}
+        mnc.model.kind = "npc"
+        mnc.model.id = npcID
         frame.rPlayer:SetChecked(false)
         frame.rNPC:SetChecked(true)
         frame.rDisplay:SetChecked(false)
@@ -4148,12 +4328,14 @@ OpenMailModelPicker = function()
 
     local function Preview()
       EnsureDB()
-      local spec = DB.mailNotify and DB.mailNotify.model or {}
+      local mnc = MailNotifyCfg()
+      if not mnc then return end
+      local spec = mnc.model or {}
       local kind = GetKind()
       local id = tonumber(idBox:GetText() or "")
       spec.kind = kind
       spec.id = (kind == "player") and nil or id
-      DB.mailNotify.model = spec
+      mnc.model = spec
       ApplyMailModelToFrame(preview)
     end
 
@@ -4161,13 +4343,14 @@ OpenMailModelPicker = function()
 
     local function ApplyNotifierSizingAndAlpha()
       EnsureDB()
-      DB.mailNotify = DB.mailNotify or {}
-      DB.mailNotify.ui = DB.mailNotify.ui or {}
+      local mnc = MailNotifyCfg()
+      if not mnc then return end
+      mnc.ui = mnc.ui or {}
 
-      local w = Clamp(DB.mailNotify.ui.w or 140, 40, 600)
-      local h = Clamp(DB.mailNotify.ui.h or 140, 40, 600)
-      local a = Clamp(DB.mailNotify.ui.alpha or 1, 0.10, 1.00)
-      DB.mailNotify.ui.w, DB.mailNotify.ui.h, DB.mailNotify.ui.alpha = w, h, a
+      local w = Clamp(mnc.ui.w or 200, 40, 600)
+      local h = Clamp(mnc.ui.h or 220, 40, 600)
+      local a = Clamp(mnc.ui.alpha or 0.5, 0.10, 1.00)
+      mnc.ui.w, mnc.ui.h, mnc.ui.alpha = w, h, a
 
       local mn = MailNotifier or CreateMailNotifier()
       if mn then
@@ -4175,8 +4358,8 @@ OpenMailModelPicker = function()
         if mn.model and mn.model.SetAlpha then
           mn.model:SetAlpha(a)
         end
-        if DB.mailNotify.ui and DB.mailNotify.ui.strata and mn.SetFrameStrata then
-          mn:SetFrameStrata(DB.mailNotify.ui.strata)
+        if mnc.ui and mnc.ui.strata and mn.SetFrameStrata then
+          mn:SetFrameStrata(mnc.ui.strata)
         end
       end
     end
@@ -4214,15 +4397,32 @@ OpenMailModelPicker = function()
     reset:SetText("Reset")
     reset:SetScript("OnClick", function()
       EnsureDB()
-      DB.mailNotify = DB.mailNotify or {}
-      DB.mailNotify.model = DB.mailNotify.model or {}
-      DB.mailNotify.model.kind = "player"
-      DB.mailNotify.model.id = nil
-      DB.mailNotify.model.anim = nil
-      DB.mailNotify.model.rotation = 0
-      DB.mailNotify.model.zoom = 1.0
-      SetKind("player")
+      local mnc = MailNotifyCfg()
+      if not mnc then return end
+
+      -- Model defaults
+      mnc.model = mnc.model or {}
+      mnc.model.kind = "npc"
+      mnc.model.id = 104230
+      mnc.model.anim = 0
+      mnc.model.rotation = 0.15
+      mnc.model.zoom = 0.9
+
+      -- View defaults
+      mnc.ui = mnc.ui or {}
+      mnc.ui.w = 200
+      mnc.ui.h = 220
+      mnc.ui.alpha = 0.5
+      mnc.ui.strata = "BACKGROUND"
+
+      mnc.showInCombat = true
+
+      SetKind("npc")
+      if idBox and idBox.SetText then
+        idBox:SetText("104230")
+      end
       ApplyMailModelToFrame(preview)
+      ApplyNotifierSizingAndAlpha()
       UpdateMailNotifier()
       if RefreshViewControls then RefreshViewControls() end
     end)
@@ -4297,9 +4497,10 @@ OpenMailModelPicker = function()
         info.text = s.text
         info.func = function()
           EnsureDB()
-          DB.mailNotify = DB.mailNotify or {}
-          DB.mailNotify.ui = DB.mailNotify.ui or {}
-          DB.mailNotify.ui.strata = s.key
+          local mnc = MailNotifyCfg()
+          if not mnc then return end
+          mnc.ui = mnc.ui or {}
+          mnc.ui.strata = s.key
           UIDropDownMenu_SetSelectedID(strataDD, i)
           ApplyNotifierSizingAndAlpha()
           UpdateMailNotifier()
@@ -4385,40 +4586,41 @@ OpenMailModelPicker = function()
 
     RefreshViewControls = function()
       EnsureDB()
-      DB.mailNotify = DB.mailNotify or {}
-      DB.mailNotify.ui = DB.mailNotify.ui or {}
-      DB.mailNotify.model = DB.mailNotify.model or {}
+      local mnc = MailNotifyCfg()
+      if not mnc then return end
+      mnc.ui = mnc.ui or {}
+      mnc.model = mnc.model or {}
 
-      local w = Clamp(DB.mailNotify.ui.w or 140, 40, 600)
-      local h = Clamp(DB.mailNotify.ui.h or 140, 40, 600)
-      local a = Clamp(DB.mailNotify.ui.alpha or 1, 0.10, 1.00)
+      local w = Clamp(mnc.ui.w or 200, 40, 600)
+      local h = Clamp(mnc.ui.h or 220, 40, 600)
+      local a = Clamp(mnc.ui.alpha or 0.5, 0.10, 1.00)
       wBox:SetText(tostring(math.floor(w + 0.5)))
       hBox:SetText(tostring(math.floor(h + 0.5)))
       alphaSlider:SetValue(a)
 
-      local want = tostring(DB.mailNotify.ui.strata or "HIGH")
-      local selected = 4
+      local want = tostring(mnc.ui.strata or "BACKGROUND")
+      local selected = 1
       for i, s in ipairs(STRATA) do
         if s.key == want then selected = i break end
       end
       UIDropDownMenu_SetSelectedID(strataDD, selected)
 
-      local z = Clamp(DB.mailNotify.model.zoom or 1.0, 0.20, 3.00)
+      local z = Clamp(mnc.model.zoom or 0.9, 0.20, 3.00)
       zoomSlider:SetValue(z)
 
-      local anim = tonumber(DB.mailNotify.model.anim) or 0
+      local anim = tonumber(mnc.model.anim) or 0
       actionBox:SetText(tostring(anim))
-      SetCheckBoxChecked(actionRandom, DB.mailNotify.model.animRandom)
+      SetCheckBoxChecked(actionRandom, mnc.model.animRandom)
 
-      local repeatOn = (DB.mailNotify.model.animRepeat == true)
-      local sec = tonumber(DB.mailNotify.model.animRepeatSec) or 10
+      local repeatOn = (mnc.model.animRepeat == true)
+      local sec = tonumber(mnc.model.animRepeatSec) or 10
       if sec < 1 then sec = 1 end
       if sec > 3600 then sec = 3600 end
       repeatSecBox:SetText(tostring(math.floor(sec + 0.5)))
       SetCheckBoxChecked(repeatCB, repeatOn)
       repeatSecBox:SetEnabled(repeatOn)
 
-      local randomOn = (DB.mailNotify.model.animRandom == true)
+      local randomOn = (mnc.model.animRandom == true)
       local allowManual = (not randomOn)
       actionBox:SetEnabled(allowManual)
       actionPrev:SetEnabled(allowManual)
@@ -4427,11 +4629,12 @@ OpenMailModelPicker = function()
 
     applyWH:SetScript("OnClick", function()
       EnsureDB()
-      DB.mailNotify = DB.mailNotify or {}
-      DB.mailNotify.ui = DB.mailNotify.ui or {}
+      local mnc = MailNotifyCfg()
+      if not mnc then return end
+      mnc.ui = mnc.ui or {}
 
-      DB.mailNotify.ui.w = tonumber(wBox:GetText() or "") or DB.mailNotify.ui.w or 140
-      DB.mailNotify.ui.h = tonumber(hBox:GetText() or "") or DB.mailNotify.ui.h or 140
+      mnc.ui.w = tonumber(wBox:GetText() or "") or mnc.ui.w or 200
+      mnc.ui.h = tonumber(hBox:GetText() or "") or mnc.ui.h or 220
       ApplyNotifierSizingAndAlpha()
       UpdateMailNotifier()
       RefreshViewControls()
@@ -4448,32 +4651,35 @@ OpenMailModelPicker = function()
 
     alphaSlider:SetScript("OnValueChanged", function(_, v)
       EnsureDB()
-      DB.mailNotify = DB.mailNotify or {}
-      DB.mailNotify.ui = DB.mailNotify.ui or {}
-      DB.mailNotify.ui.alpha = Clamp(v, 0.10, 1.00)
+      local mnc = MailNotifyCfg()
+      if not mnc then return end
+      mnc.ui = mnc.ui or {}
+      mnc.ui.alpha = Clamp(v, 0.10, 1.00)
       ApplyNotifierSizingAndAlpha()
       if preview and preview.SetAlpha then
-        preview:SetAlpha(DB.mailNotify.ui.alpha)
+        preview:SetAlpha(mnc.ui.alpha)
       end
       UpdateMailNotifier()
     end)
 
     zoomSlider:SetScript("OnValueChanged", function(_, v)
       EnsureDB()
-      DB.mailNotify = DB.mailNotify or {}
-      DB.mailNotify.model = DB.mailNotify.model or {}
-      DB.mailNotify.model.zoom = Clamp(v, 0.20, 3.00)
+      local mnc = MailNotifyCfg()
+      if not mnc then return end
+      mnc.model = mnc.model or {}
+      mnc.model.zoom = Clamp(v, 0.20, 3.00)
       ApplyMailModelToFrame(preview)
       UpdateMailNotifier()
     end)
 
     local function NudgeRotation(dir)
       EnsureDB()
-      DB.mailNotify = DB.mailNotify or {}
-      DB.mailNotify.model = DB.mailNotify.model or {}
-      local r = tonumber(DB.mailNotify.model.rotation) or ModelGetRotation(preview) or 0
+      local mnc = MailNotifyCfg()
+      if not mnc then return end
+      mnc.model = mnc.model or {}
+      local r = tonumber(mnc.model.rotation) or ModelGetRotation(preview) or 0
       r = r + (dir * 0.20)
-      DB.mailNotify.model.rotation = r
+      mnc.model.rotation = r
       ModelSetRotation(preview, r)
       UpdateMailNotifier()
     end
@@ -4482,22 +4688,24 @@ OpenMailModelPicker = function()
     rotRight:SetScript("OnClick", function() NudgeRotation(1) end)
     rotReset:SetScript("OnClick", function()
       EnsureDB()
-      DB.mailNotify = DB.mailNotify or {}
-      DB.mailNotify.model = DB.mailNotify.model or {}
-      DB.mailNotify.model.rotation = 0
+      local mnc = MailNotifyCfg()
+      if not mnc then return end
+      mnc.model = mnc.model or {}
+      mnc.model.rotation = 0
       ModelSetRotation(preview, 0)
       UpdateMailNotifier()
     end)
 
     local function SetAction(anim)
       EnsureDB()
-      DB.mailNotify = DB.mailNotify or {}
-      DB.mailNotify.model = DB.mailNotify.model or {}
+      local mnc = MailNotifyCfg()
+      if not mnc then return end
+      mnc.model = mnc.model or {}
       anim = tonumber(anim) or 0
       if anim < 0 then anim = 0 end
       if anim > 150 then anim = 0 end
-      DB.mailNotify.model.animRandom = false
-      DB.mailNotify.model.anim = anim
+      mnc.model.animRandom = false
+      mnc.model.anim = anim
       actionBox:SetText(tostring(anim))
       SetCheckBoxChecked(actionRandom, false)
       actionBox:SetEnabled(true)
@@ -4509,13 +4717,15 @@ OpenMailModelPicker = function()
 
     actionPrev:SetScript("OnClick", function()
       EnsureDB()
-      local anim = tonumber(DB.mailNotify and DB.mailNotify.model and DB.mailNotify.model.anim) or 0
+      local mnc = MailNotifyCfg()
+      local anim = tonumber(mnc and mnc.model and mnc.model.anim) or 0
       SetAction(anim - 1)
     end)
 
     actionNext:SetScript("OnClick", function()
       EnsureDB()
-      local anim = tonumber(DB.mailNotify and DB.mailNotify.model and DB.mailNotify.model.anim) or 0
+      local mnc = MailNotifyCfg()
+      local anim = tonumber(mnc and mnc.model and mnc.model.anim) or 0
       SetAction(anim + 1)
     end)
 
@@ -4526,19 +4736,20 @@ OpenMailModelPicker = function()
 
     actionRandom:SetScript("OnClick", function(self)
       EnsureDB()
-      DB.mailNotify = DB.mailNotify or {}
-      DB.mailNotify.model = DB.mailNotify.model or {}
+      local mnc = MailNotifyCfg()
+      if not mnc then return end
+      mnc.model = mnc.model or {}
 
       local on = self:GetChecked() and true or false
-      DB.mailNotify.model.animRandom = on
+      mnc.model.animRandom = on
 
       if on then
-        DB.mailNotify.model.anim = math.random(0, 150)
+        mnc.model.anim = math.random(0, 150)
         actionBox:SetEnabled(false)
         actionPrev:SetEnabled(false)
         actionNext:SetEnabled(false)
       else
-        local repeatOn = (DB.mailNotify.model.animRepeat == true)
+        local repeatOn = (mnc.model.animRepeat == true)
         actionBox:SetEnabled(not repeatOn)
         actionPrev:SetEnabled(not repeatOn)
         actionNext:SetEnabled(not repeatOn)
@@ -4551,13 +4762,14 @@ OpenMailModelPicker = function()
 
     repeatCB:SetScript("OnClick", function(self)
       EnsureDB()
-      DB.mailNotify = DB.mailNotify or {}
-      DB.mailNotify.model = DB.mailNotify.model or {}
+      local mnc = MailNotifyCfg()
+      if not mnc then return end
+      mnc.model = mnc.model or {}
 
       local on = self:GetChecked() and true or false
-      DB.mailNotify.model.animRepeat = on
-      if DB.mailNotify.model.animRepeatSec == nil then
-        DB.mailNotify.model.animRepeatSec = 10
+      mnc.model.animRepeat = on
+      if mnc.model.animRepeatSec == nil then
+        mnc.model.animRepeatSec = 10
       end
 
       repeatSecBox:SetEnabled(on)
@@ -4569,13 +4781,14 @@ OpenMailModelPicker = function()
     repeatSecBox:SetScript("OnEnterPressed", function(self)
       self:ClearFocus()
       EnsureDB()
-      DB.mailNotify = DB.mailNotify or {}
-      DB.mailNotify.model = DB.mailNotify.model or {}
+      local mnc = MailNotifyCfg()
+      if not mnc then return end
+      mnc.model = mnc.model or {}
 
       local sec = tonumber(self:GetText() or "") or 10
       if sec < 1 then sec = 1 end
       if sec > 3600 then sec = 3600 end
-      DB.mailNotify.model.animRepeatSec = sec
+      mnc.model.animRepeatSec = sec
       RefreshViewControls()
     end)
 
@@ -4587,7 +4800,8 @@ OpenMailModelPicker = function()
 
     frame:SetScript("OnShow", function(self)
       EnsureDB()
-      local spec = DB.mailNotify and DB.mailNotify.model or {}
+      local mnc = MailNotifyCfg()
+      local spec = (mnc and mnc.model) or {}
       SetKind(spec.kind or "player")
       if spec.id then idBox:SetText(tostring(spec.id)) end
       ApplyMailModelToFrame(preview)
@@ -4865,33 +5079,35 @@ SlashCmdList.FR0Z3NUI_LOOTIT = function(msg)
         return
       end
 
-      DB.mailNotify.model = DB.mailNotify.model or {}
+      local mnc = MailNotifyCfg()
+      if not mnc then return end
+      mnc.model = mnc.model or {}
       if kind == "picker" then
         local ui = CreateConfigUI()
         ui:Show()
         if ui.SelectTab then ui.SelectTab("mail") end
         return
       elseif kind == "katy" then
-        DB.mailNotify.model.kind = "npc"
-        DB.mailNotify.model.id = 132969
+        mnc.model.kind = "npc"
+        mnc.model.id = 132969
         UpdateMailNotifier()
         Print("Mail model: Katy Stampwhistle (132969)")
         return
       elseif kind == "dalaran" then
-        DB.mailNotify.model.kind = "npc"
-        DB.mailNotify.model.id = 104230
+        mnc.model.kind = "npc"
+        mnc.model.id = 104230
         UpdateMailNotifier()
         Print("Mail model: Dalaran Mailemental (104230)")
         return
       elseif kind == "plagued" then
-        DB.mailNotify.model.kind = "npc"
-        DB.mailNotify.model.id = 155971
+        mnc.model.kind = "npc"
+        mnc.model.id = 155971
         UpdateMailNotifier()
         Print("Mail model: Plagued Mailemental (155971)")
         return
       elseif kind == "player" then
-        DB.mailNotify.model.kind = "player"
-        DB.mailNotify.model.id = nil
+        mnc.model.kind = "player"
+        mnc.model.id = nil
         UpdateMailNotifier()
         Print("Mail model: player")
         return
@@ -4901,8 +5117,8 @@ SlashCmdList.FR0Z3NUI_LOOTIT = function(msg)
           Print("Usage: /fli mail model display <id>")
           return
         end
-        DB.mailNotify.model.kind = "display"
-        DB.mailNotify.model.id = n
+        mnc.model.kind = "display"
+        mnc.model.id = n
         UpdateMailNotifier()
         Print("Mail model: display " .. n)
         return
@@ -4912,8 +5128,8 @@ SlashCmdList.FR0Z3NUI_LOOTIT = function(msg)
           Print("Usage: /fli mail model npc <id>")
           return
         end
-        DB.mailNotify.model.kind = "npc"
-        DB.mailNotify.model.id = n
+        mnc.model.kind = "npc"
+        mnc.model.id = n
         UpdateMailNotifier()
         Print("Mail model: npc " .. n)
         return
@@ -4923,8 +5139,8 @@ SlashCmdList.FR0Z3NUI_LOOTIT = function(msg)
           Print("Usage: /fli mail model file <id>")
           return
         end
-        DB.mailNotify.model.kind = "file"
-        DB.mailNotify.model.id = n
+        mnc.model.kind = "file"
+        mnc.model.id = n
         UpdateMailNotifier()
         Print("Mail model: file " .. n)
         return
@@ -4934,32 +5150,53 @@ SlashCmdList.FR0Z3NUI_LOOTIT = function(msg)
       end
     end
 
-    if v == "" or v == "toggle" then
-      DB.mailNotify.enabled = not DB.mailNotify.enabled
+    local function GetMailNotifyModeCLI()
+      if CHARDB and CHARDB.mailNotifyEnabledOverride == true then return "on" end
+      if CHARDB and CHARDB.mailNotifyEnabledOverride == false then return "off" end
+      if DB and DB.mailNotify and DB.mailNotify.enabled then return "acc" end
+      return "off"
+    end
+
+    local function SetMailNotifyModeCLI(mode)
+      mode = tostring(mode or ""):lower()
+      DB.mailNotify = DB.mailNotify or {}
+      if mode == "on" then
+        CHARDB.mailNotifyEnabledOverride = true
+      elseif mode == "acc" then
+        CHARDB.mailNotifyEnabledOverride = nil
+        DB.mailNotify.enabled = true
+      else -- off
+        CHARDB.mailNotifyEnabledOverride = false
+      end
       UpdateMailNotifier()
-      Print("Mail notifier: " .. (DB.mailNotify.enabled and "on" or "off"))
+      Print("Mail notifier: " .. ((mode == "on") and "on" or ((mode == "acc") and "on acc" or "off")))
+    end
+
+    if v == "" or v == "toggle" then
+      local cur = GetMailNotifyModeCLI()
+      local nextMode = (cur == "off") and "on" or ((cur == "on") and "acc" or "off")
+      SetMailNotifyModeCLI(nextMode)
       return
     end
     if v == "on" or v == "1" or v == "true" then
-      DB.mailNotify.enabled = true
-      UpdateMailNotifier()
-      Print("Mail notifier: on")
+      SetMailNotifyModeCLI("on")
+      return
+    end
+    if v == "acc" then
+      SetMailNotifyModeCLI("acc")
       return
     end
     if v == "off" or v == "0" or v == "false" then
-      DB.mailNotify.enabled = false
-      UpdateMailNotifier()
-      Print("Mail notifier: off")
+      SetMailNotifyModeCLI("off")
       return
     end
     if v == "test" then
-      DB.mailNotify.enabled = true
       local mf = CreateMailNotifier()
-      if DB.mailNotify and DB.mailNotify.ui then
-        mf:ClearAllPoints()
-        mf:SetPoint(DB.mailNotify.ui.point or "TOPRIGHT", UIParent, DB.mailNotify.ui.point or "TOPRIGHT", DB.mailNotify.ui.x or 0, DB.mailNotify.ui.y or 0)
-      end
-      if (DB.mailNotify.showInCombat == false) and InCombatLockdown and InCombatLockdown() then
+      local mnc = MailNotifyCfg()
+      if not (mf and mnc and mnc.ui) then return end
+      mf:ClearAllPoints()
+      mf:SetPoint(mnc.ui.point or "TOPRIGHT", UIParent, mnc.ui.point or "TOPRIGHT", mnc.ui.x or 0, mnc.ui.y or 0)
+      if (mnc.showInCombat == false) and InCombatLockdown and InCombatLockdown() then
         mf:Hide()
         Print("Mail notifier: hidden in combat.")
         return
@@ -4970,7 +5207,7 @@ SlashCmdList.FR0Z3NUI_LOOTIT = function(msg)
       return
     end
 
-    Print("Usage: /fli mail on|off|toggle|test")
+    Print("Usage: /fli mail on|acc|off|toggle|test")
     return
   end
 
