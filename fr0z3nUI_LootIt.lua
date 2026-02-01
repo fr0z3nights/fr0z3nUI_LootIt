@@ -79,6 +79,26 @@ local DEFAULTS = {
       enabled = true,
     },
   },
+
+  -- Debug capture: stores recent raw chat events and LootIt output decisions.
+  -- Use via: /fli capture on|off|status|dump|clear|max|stacks
+  debugCapture = false,
+  debugCaptureMax = 200,
+  debugCaptureStacks = false,
+
+  tabard = {
+    enabled = true,
+    delay = 0.75,
+    hideRepBarWhenNoChampion = false,
+    modeByContext = {
+      solo = "nochange",
+      city = "closest",
+      dungeon = "closest",
+      raid = "nochange",
+      pvp = "nochange",
+    },
+    tabardMap = {},
+  },
 }
 
 fr0z3nUI_LootItDB = fr0z3nUI_LootItDB or nil
@@ -214,6 +234,85 @@ local function MailNotifyCfg()
   return (CHARDB and type(CHARDB.mailNotify) == "table") and CHARDB.mailNotify or nil
 end
 
+local function CaptureEnabled()
+  return (DB and DB.debugCapture) == true
+end
+
+local function CaptureGetLog()
+  EnsureDB()
+  if not CHARDB then return nil end
+  if type(CHARDB.debugCaptureLog) ~= "table" then
+    CHARDB.debugCaptureLog = {}
+  end
+  return CHARDB.debugCaptureLog
+end
+
+local function CaptureNowString()
+  if type(date) == "function" then
+    return date("%H:%M:%S")
+  end
+  if type(time) == "function" then
+    return tostring(time())
+  end
+  return ""
+end
+
+local function CaptureExtractLink(msg)
+  if type(msg) ~= "string" then return nil end
+  return msg:match("(|c%x%x%x%x%x%x%x%x|Hitem:.-|h%[.-%]|h|r)")
+    or msg:match("(|Hitem:.-|h%[.-%]|h)")
+    or msg:match("(|c%x%x%x%x%x%x%x%x|Hcurrency:.-|h%[.-%]|h|r)")
+    or msg:match("(|Hcurrency:.-|h%[.-%]|h)")
+end
+
+local function CaptureItemIDFromLink(link)
+  if type(link) ~= "string" then return nil end
+  local id = link:match("Hitem:(%d+):")
+  return id and tonumber(id) or nil
+end
+
+local function CaptureAppend(kind, data)
+  if not CaptureEnabled() then return end
+  local log = CaptureGetLog()
+  if not log then return end
+
+  local entry = (type(data) == "table") and data or { msg = tostring(data or "") }
+  entry.t = entry.t or CaptureNowString()
+  entry.kind = tostring(kind or entry.kind or "CAP")
+  log[#log + 1] = entry
+
+  local maxN = tonumber(DB and DB.debugCaptureMax) or 200
+  if maxN < 20 then maxN = 20 end
+  if maxN > 500 then maxN = 500 end
+  while #log > maxN do
+    table.remove(log, 1)
+  end
+end
+
+local function CaptureChatIn(eventName, msg, author)
+  if not CaptureEnabled() then return end
+  local link = CaptureExtractLink(msg)
+  CaptureAppend("CHAT_IN", {
+    event = tostring(eventName or ""),
+    author = (type(author) == "string") and author or nil,
+    msg = msg,
+    hasItemLink = (type(msg) == "string" and msg:find("|Hitem:", 1, true) ~= nil) or false,
+    hasCurrencyLink = (type(msg) == "string" and msg:find("|Hcurrency:", 1, true) ~= nil) or false,
+    link = link,
+    itemID = CaptureItemIDFromLink(link),
+  })
+end
+
+local function CaptureChatOut(eventName, out, meta)
+  if not CaptureEnabled() then return end
+  local entry = (type(meta) == "table") and meta or {}
+  entry.event = tostring(eventName or "")
+  entry.out = out
+  CaptureAppend("CHAT_OUT", entry)
+end
+
+local pendingAsyncLoot = {}
+
 local function Print(msg)
   local frame
   if DB and type(DB.outputChatFrame) == "number" then
@@ -228,11 +327,22 @@ local function Print(msg)
     if type(prefix) ~= "string" then
       prefix = ""
     end
-    if prefix ~= "" then
-      frame:AddMessage(prefix .. text)
-    else
-      frame:AddMessage(text)
+
+    local final = (prefix ~= "") and (prefix .. text) or text
+    if CaptureEnabled() then
+      local e = {
+        msg = final,
+        raw = text,
+        prefix = prefix,
+        outputChatFrame = (DB and DB.outputChatFrame) or nil,
+      }
+      if (DB and DB.debugCaptureStacks) and type(debugstack) == "function" then
+        e.stack = debugstack(2, 10, 10)
+      end
+      CaptureAppend("PRINT", e)
     end
+
+    frame:AddMessage(final)
   end
 end
 
@@ -246,7 +356,18 @@ local function PrintToChatFrame(msg, chatFrameID)
     frame = DEFAULT_CHAT_FRAME
   end
   if frame and frame.AddMessage then
-    frame:AddMessage(tostring(msg or ""))
+    local text = tostring(msg or "")
+    if CaptureEnabled() then
+      local e = {
+        msg = text,
+        outputChatFrame = tonumber(chatFrameID) or nil,
+      }
+      if (DB and DB.debugCaptureStacks) and type(debugstack) == "function" then
+        e.stack = debugstack(2, 10, 10)
+      end
+      CaptureAppend("PRINT", e)
+    end
+    frame:AddMessage(text)
   end
 end
 
@@ -501,6 +622,25 @@ local function NormalizeItemLink(link)
   if type(link) ~= "string" or link == "" then return link end
   if link:match("^|c%x%x%x%x%x%x%x%x|Hitem:") then
     return link
+  end
+
+  -- Some chat events can provide non-hyperlinked bracket text like "[Chest of Gold]".
+  -- Try to resolve the display name into a real item hyperlink so aliases/ilvl work.
+  do
+    local name = link
+    local bracketName = link:match("^%[([^%]]+)%]$")
+    if bracketName and bracketName ~= "" then
+      name = bracketName
+    end
+
+    if name and not name:match("|Hitem:") then
+      if C_Item and C_Item.GetItemInfo then
+        local _, itemLink = C_Item.GetItemInfo(name)
+        if type(itemLink) == "string" and itemLink ~= "" then
+          return itemLink
+        end
+      end
+    end
   end
 
   if link:match("|Hitem:") then
@@ -842,6 +982,8 @@ local function OnCurrencyChat(_, _, msg, ...)
   if not IsEnabled() then return false end
   if type(msg) ~= "string" or msg == "" then return false end
 
+  CaptureChatIn("CHAT_MSG_CURRENCY", msg)
+
   if not CURRENCY_PATTERNS then BuildCurrencyPatterns() end
 
   local link, qty
@@ -915,6 +1057,14 @@ local function OnCurrencyChat(_, _, msg, ...)
       Print(FormatSelfLine(out))
       handled = true
     end
+
+    CaptureChatOut("CHAT_MSG_CURRENCY", out, {
+      handled = handled,
+      combine = LootCombineEnabled() and true or false,
+      includeCurrency = (DB and DB.lootCombineIncludeCurrency) and true or false,
+      qty = n,
+      currencyID = currencyID,
+    })
   end
 
   -- Only suppress the original system line when we actually output (or buffer) a replacement.
@@ -1070,6 +1220,8 @@ local function OnMoneyChat(_, _, msg, ...)
   if not IsEnabled() then return false end
   if type(msg) ~= "string" or msg == "" then return false end
 
+  CaptureChatIn("CHAT_MSG_MONEY", msg)
+
   if not IsLikelyMoneyMessage(msg) then return false end
 
   local handled = false
@@ -1086,6 +1238,15 @@ local function OnMoneyChat(_, _, msg, ...)
         Print(FormatSelfLine(out))
         handled = true
       end
+
+      CaptureChatOut("CHAT_MSG_MONEY", out, {
+        handled = handled,
+        combine = LootCombineEnabled() and true or false,
+        includeGold = (DB and DB.lootCombineIncludeGold) and true or false,
+        gold = coins and coins.gold or nil,
+        silver = coins and coins.silver or nil,
+        copper = coins and coins.copper or nil,
+      })
     end
   end
 
@@ -1098,6 +1259,41 @@ local function OnSystemChat(_, _, msg, ...)
   if not IsEnabled() then return false end
   if type(msg) ~= "string" or msg == "" then return false end
 
+  CaptureChatIn("CHAT_MSG_SYSTEM", msg)
+
+  -- Some sources emit money rewards as system lines like "Received 1000 Gold.".
+  -- Route them through our money formatter so they don't leak.
+  if IsLikelyMoneyMessage(msg) then
+    local handled = false
+    if DB and DB.echoItem then
+      local coins = ParseCoinsFromMoneyMessage(msg)
+      local out = FormatMoney(coins)
+      if out then
+        if LootCombineEnabled() then
+          if DB and DB.lootCombineIncludeGold then
+            LootCombineAdd(out)
+            handled = true
+          end
+        else
+          Print(FormatSelfLine(out))
+          handled = true
+        end
+
+        CaptureChatOut("CHAT_MSG_SYSTEM", out, {
+          handled = handled,
+          rewrittenMoney = true,
+          combine = LootCombineEnabled() and true or false,
+          includeGold = (DB and DB.lootCombineIncludeGold) and true or false,
+          gold = coins and coins.gold or nil,
+          silver = coins and coins.silver or nil,
+          copper = coins and coins.copper or nil,
+        })
+      end
+    end
+
+    return (handled and DB and DB.hideLootText) and true or false
+  end
+
   if not LOOT_PATTERNS then BuildLootPatterns() end
 
   local link, qty
@@ -1108,6 +1304,15 @@ local function OnSystemChat(_, _, msg, ...)
       qty = b
       break
     end
+  end
+
+  if CaptureEnabled() then
+    CaptureAppend("MATCH", {
+      event = "CHAT_MSG_SYSTEM",
+      link = link,
+      qty = qty,
+      hasItemLink = (msg:find("|Hitem:", 1, true) ~= nil) or false,
+    })
   end
 
   if not link then
@@ -1142,6 +1347,13 @@ local function OnSystemChat(_, _, msg, ...)
     end
 
     LootCombineAdd(out)
+
+    CaptureChatOut("CHAT_MSG_SYSTEM", out, {
+      handled = true,
+      combine = LootCombineEnabled() and true or false,
+      qty = tonumber(qty),
+      itemID = CaptureItemIDFromLink(link),
+    })
   end
 
   return (DB and DB.hideLootText) and true or false
@@ -1150,6 +1362,8 @@ end
 local function OnLootChat(_, _, msg, author, ...)
   if not IsEnabled() then return false end
   if type(msg) ~= "string" or msg == "" then return false end
+
+  CaptureChatIn("CHAT_MSG_LOOT", msg, author)
 
   if not LOOT_PATTERNS then BuildLootPatterns() end
 
@@ -1193,6 +1407,15 @@ local function OnLootChat(_, _, msg, author, ...)
         Print(FormatSelfLine(out))
         handled = true
       end
+
+      CaptureChatOut("CHAT_MSG_LOOT", out, {
+        handled = handled,
+        rewrittenCurrency = true,
+        combine = LootCombineEnabled() and true or false,
+        includeCurrency = (DB and DB.lootCombineIncludeCurrency) and true or false,
+        qty = n,
+        currencyID = currencyID,
+      })
     end
 
     return (handled and DB and DB.hideLootText) and true or false
@@ -1235,6 +1458,16 @@ local function OnLootChat(_, _, msg, author, ...)
           Print(FormatSelfLine(out))
           handled = true
         end
+
+        CaptureChatOut("CHAT_MSG_LOOT", out, {
+          handled = handled,
+          rewrittenMoney = true,
+          combine = LootCombineEnabled() and true or false,
+          includeGold = (DB and DB.lootCombineIncludeGold) and true or false,
+          gold = coins and coins.gold or nil,
+          silver = coins and coins.silver or nil,
+          copper = coins and coins.copper or nil,
+        })
       end
     end
     return (handled and DB.hideLootText) and true or false
@@ -1285,8 +1518,94 @@ local function OnLootChat(_, _, msg, author, ...)
   if not link then
     link = ExtractLinkFallback(msg)
   end
+
+  if CaptureEnabled() then
+    CaptureAppend("MATCH", {
+      event = "CHAT_MSG_LOOT",
+      isSelfLoot = isSelfLoot and true or false,
+      link = link,
+      qty = qty,
+      hasItemLink = (msg:find("|Hitem:", 1, true) ~= nil) or false,
+    })
+  end
   if not link then
     return false
+  end
+
+  -- Some loot lines can contain a bracketed item name without a hyperlink, e.g.
+  --   "You receive item: [Chest of Gold]"
+  -- In those cases we can't apply aliases/ilvl or even reliably suppress the original line.
+  -- For known problematic items, resolve by itemID asynchronously and re-print.
+  do
+    local bracketName = (type(link) == "string") and link:match("^%[([^%]]+)%]$") or nil
+    if bracketName and not link:find("|Hitem:", 1, true) then
+      local knownItemID = nil
+      if bracketName == "Chest of Gold" then
+        knownItemID = 226814
+      end
+
+      if knownItemID and Item and (Item.CreateFromItemID or Item.createFromItemID) then
+        local n = tonumber(qty)
+        if not n or n < 1 then n = 1 end
+
+        local key = tostring(knownItemID) .. ":" .. tostring(n)
+        if not pendingAsyncLoot[key] then
+          pendingAsyncLoot[key] = true
+
+          local itemObj = (Item.CreateFromItemID and Item:CreateFromItemID(knownItemID))
+            or (Item.createFromItemID and Item:createFromItemID(knownItemID))
+
+          local function finalize(withLink)
+            pendingAsyncLoot[key] = nil
+            EnsureDB()
+            if not (IsEnabled() and DB and DB.echoItem) then return end
+
+            local resolved = withLink
+            if type(resolved) ~= "string" or resolved == "" then
+              resolved = "[" .. bracketName .. "]"
+            end
+
+            resolved = NormalizeItemLink(resolved)
+            resolved = ApplyItemLinkAlias(resolved)
+            local displayLink = StripDisplayedLinkBrackets(resolved)
+            local out = displayLink
+            if n and n > 1 then
+              out = string.format("%s x%d", displayLink, n)
+            end
+
+            if IsItemLevelEnabled() then
+              local ilvl = GetEquippableItemLevelSuffix(resolved)
+              if ilvl then
+                local color = resolved:match("^(|c%x%x%x%x%x%x%x%x)")
+                local ilvlText = color and (color .. tostring(ilvl) .. "|r") or tostring(ilvl)
+                out = out .. " " .. ilvlText
+              end
+            end
+
+            LootCombineAdd(out)
+            CaptureChatOut("CHAT_MSG_LOOT", out, { handled = true, async = true, itemID = knownItemID, from = bracketName })
+          end
+
+          if itemObj and itemObj.ContinueOnItemLoad then
+            itemObj:ContinueOnItemLoad(function()
+              local itemLink = (itemObj.GetItemLink and itemObj:GetItemLink()) or nil
+              finalize(itemLink)
+            end)
+
+            -- Safety fallback: if something goes wrong, print the plain name shortly after.
+            if C_Timer and C_Timer.After then
+              C_Timer.After(1.0, function()
+                if pendingAsyncLoot[key] then
+                  finalize(nil)
+                end
+              end)
+            end
+
+            return (DB and DB.hideLootText) and true or false
+          end
+        end
+      end
+    end
   end
 
   if DB.echoItem then
@@ -1319,6 +1638,15 @@ local function OnLootChat(_, _, msg, author, ...)
     else
       Print(FormatOtherLine(playerName, out))
     end
+
+    CaptureChatOut("CHAT_MSG_LOOT", out, {
+      handled = true,
+      isSelfLoot = isSelfLoot and true or false,
+      player = (not isSelfLoot) and playerName or nil,
+      qty = tonumber(qty),
+      itemID = CaptureItemIDFromLink(link),
+      combine = LootCombineEnabled() and true or false,
+    })
   end
 
   return DB.hideLootText and true or false
@@ -1596,24 +1924,29 @@ local function CreateConfigUI()
 
   -- Tabs
   local tabLoot = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
-  tabLoot:SetSize(130, 22)
+  tabLoot:SetSize(120, 22)
   tabLoot:SetPoint("TOPLEFT", frame, "TOPLEFT", 12, -6)
   tabLoot:SetText("|cff00ccff[FLI]|r LootIt")
 
   local tabAlias = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
-  tabAlias:SetSize(80, 22)
+  tabAlias:SetSize(70, 22)
   tabAlias:SetPoint("LEFT", tabLoot, "RIGHT", 10, 0)
   tabAlias:SetText("Alias")
 
   local tabOther = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
-  tabOther:SetSize(80, 22)
+  tabOther:SetSize(70, 22)
   tabOther:SetPoint("LEFT", tabAlias, "RIGHT", 10, 0)
   tabOther:SetText("Other")
 
   local tabMail = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
-  tabMail:SetSize(80, 22)
+  tabMail:SetSize(70, 22)
   tabMail:SetPoint("LEFT", tabOther, "RIGHT", 10, 0)
   tabMail:SetText("Mail")
+
+  local tabTabard = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
+  tabTabard:SetSize(70, 22)
+  tabTabard:SetPoint("LEFT", tabMail, "RIGHT", 10, 0)
+  tabTabard:SetText("Tabard")
 
   local lootPanel = CreateFrame("Frame", nil, frame)
   lootPanel:SetPoint("TOPLEFT", frame.InsetBg, "TOPLEFT", 0, -24)
@@ -1640,17 +1973,23 @@ local function CreateConfigUI()
   otherPanel:SetPoint("TOPLEFT", frame.InsetBg, "TOPLEFT", 0, -24)
   otherPanel:SetPoint("BOTTOMRIGHT", frame.InsetBg, "BOTTOMRIGHT", 0, 0)
 
+  local tabardPanel = CreateFrame("Frame", nil, frame)
+  tabardPanel:SetPoint("TOPLEFT", frame.InsetBg, "TOPLEFT", 0, -24)
+  tabardPanel:SetPoint("BOTTOMRIGHT", frame.InsetBg, "BOTTOMRIGHT", 0, 0)
+
   local function SelectTab(which)
     which = tostring(which or "loot"):lower()
     local isLoot = (which == "loot")
     local isAlias = (which == "alias")
     local isOther = (which == "other")
     local isMail = (which == "mail")
+    local isTabard = (which == "tabard")
 
     lootPanel:SetShown(isLoot)
     aliasPanel:SetShown(isAlias)
     otherPanel:SetShown(isOther)
     mailPanel:SetShown(isMail)
+    tabardPanel:SetShown(isTabard)
 
     if enableModeBtn and enableModeBtn.SetShown then
       enableModeBtn:SetShown(isLoot)
@@ -1673,8 +2012,9 @@ local function CreateConfigUI()
     StyleTab(tabAlias, isAlias)
     StyleTab(tabOther, isOther)
     StyleTab(tabMail, isMail)
+    StyleTab(tabTabard, isTabard)
 
-    frame._activeTab = isLoot and "loot" or (isAlias and "alias" or (isOther and "other" or "mail"))
+    frame._activeTab = isLoot and "loot" or (isAlias and "alias" or (isOther and "other" or (isMail and "mail" or "tabard")))
 
     ApplyMailNotifierInteractivity()
   end
@@ -1685,6 +2025,66 @@ local function CreateConfigUI()
   tabAlias:SetScript("OnClick", function() SelectTab("alias") end)
   tabOther:SetScript("OnClick", function() SelectTab("other") end)
   tabMail:SetScript("OnClick", function() SelectTab("mail") end)
+  tabTabard:SetScript("OnClick", function() SelectTab("tabard") end)
+
+  -- Tabard tab
+  local tabardTitle = tabardPanel:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+  tabardTitle:SetPoint("TOPLEFT", tabardPanel, "TOPLEFT", 10, -10)
+  tabardTitle:SetText("Tabard")
+
+  local function GetTabardEnableMode()
+    local mod = _G and rawget(_G, "fr0z3nUI_LootItTabard")
+    if mod and mod.GetEnableMode then
+      return mod.GetEnableMode()
+    end
+    EnsureDB()
+    if CHARDB and CHARDB.tabardEnabledOverride == true then return "on" end
+    if CHARDB and CHARDB.tabardEnabledOverride == false then return "off" end
+    if DB and DB.tabard and DB.tabard.enabled then return "acc" end
+    return "off"
+  end
+
+  local function SetTabardEnableMode(mode)
+    local mod = _G and rawget(_G, "fr0z3nUI_LootItTabard")
+    if mod and mod.SetEnableMode then
+      mod.SetEnableMode(mode)
+      return
+    end
+    EnsureDB()
+    DB.tabard = (type(DB.tabard) == "table") and DB.tabard or {}
+    mode = tostring(mode or ""):lower()
+    if mode == "on" then
+      CHARDB.tabardEnabledOverride = true
+    elseif mode == "acc" then
+      CHARDB.tabardEnabledOverride = nil
+      DB.tabard.enabled = true
+    else
+      CHARDB.tabardEnabledOverride = false
+    end
+  end
+
+  local tabardEnableLabel = tabardPanel:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+  tabardEnableLabel:SetPoint("TOPLEFT", tabardTitle, "BOTTOMLEFT", 0, -14)
+  tabardEnableLabel:SetText("Enable")
+
+  local tabardEnableModeBtn = CreateFrame("Button", nil, tabardPanel, "UIPanelButtonTemplate")
+  tabardEnableModeBtn:SetSize(90, 20)
+  tabardEnableModeBtn:SetPoint("LEFT", tabardEnableLabel, "RIGHT", 12, 0)
+
+  local function RefreshTabardEnableModeButton()
+    if not (tabardEnableModeBtn and tabardEnableModeBtn.SetText) then return end
+    local m = GetTabardEnableMode()
+    tabardEnableModeBtn:SetText((m == "on") and "On" or ((m == "acc") and "On Acc" or "Off"))
+  end
+
+  tabardEnableModeBtn:SetScript("OnClick", function()
+    local cur = GetTabardEnableMode()
+    local nextMode = (cur == "off") and "on" or ((cur == "on") and "acc" or "off")
+    SetTabardEnableMode(nextMode)
+    RefreshTabardEnableModeButton()
+  end)
+
+  tabardPanel:SetScript("OnShow", RefreshTabardEnableModeButton)
 
   -- Other tab
   local otherTitle = otherPanel:CreateFontString(nil, "OVERLAY", "GameFontNormal")
@@ -4883,7 +5283,119 @@ SlashCmdList.FR0Z3NUI_LOOTIT = function(msg)
     Print("/fli alias set [acc|char] <itemID> <text>")
     Print("/fli alias del [acc|char] <itemID>")
     Print("/fli alias list")
+    Print("/fli capture on|off|status|dump|clear|max|stacks")
     Print("/fli status")
+    return
+  end
+
+  if cmd == "capture" or cmd == "cap" then
+    local parts = {}
+    for w in tostring(rest or ""):gmatch("%S+") do
+      parts[#parts + 1] = w
+    end
+    local sub = (parts[1] and parts[1]:lower()) or "status"
+
+    if sub == "on" then
+      DB.debugCapture = true
+      -- Force a first entry so users can verify capture is working immediately.
+      CaptureAppend("CAPTURE", { event = "manual_on", msg = "Capture enabled" })
+      Print("Capture: on")
+      return
+    end
+    if sub == "off" then
+      DB.debugCapture = false
+      Print("Capture: off")
+      return
+    end
+    if sub == "stacks" then
+      DB.debugCaptureStacks = not (DB and DB.debugCaptureStacks)
+      Print("Capture stacks: " .. ((DB.debugCaptureStacks and "on") or "off"))
+      return
+    end
+    if sub == "max" then
+      local n = tonumber(parts[2])
+      if not n then
+        Print("Capture max: " .. tostring(DB.debugCaptureMax or 200))
+        return
+      end
+      if n < 20 then n = 20 end
+      if n > 500 then n = 500 end
+      DB.debugCaptureMax = n
+      Print("Capture max set: " .. n)
+      return
+    end
+    if sub == "clear" then
+      if CHARDB then
+        CHARDB.debugCaptureLog = {}
+      end
+      Print("Capture: cleared")
+      return
+    end
+    if sub == "dump" then
+      if not (DB and DB.debugCapture) then
+        Print("Capture is OFF. Run: /fli capture on")
+      end
+      local n = tonumber(parts[2]) or 30
+      if n < 1 then n = 1 end
+      if n > 200 then n = 200 end
+      local filter = table.concat(parts, " ", 3)
+      filter = (type(filter) == "string") and filter:lower() or ""
+
+      local log = (CHARDB and type(CHARDB.debugCaptureLog) == "table") and CHARDB.debugCaptureLog or {}
+      Print(string.format("Capture dump: %d entries (showing last %d)", #log, n))
+      if #log == 0 then
+        Print("(No entries yet. Make sure you ran /fli capture on, then loot something or run /fli status.)")
+      end
+      local start = #log - n + 1
+      if start < 1 then start = 1 end
+      for i = start, #log do
+        local e = log[i]
+        if type(e) == "table" then
+          local line = string.format("%s %s %s", tostring(e.t or ""), tostring(e.kind or ""), tostring(e.event or ""))
+          local msg2 = tostring(e.out or e.msg or e.link or "")
+
+          local hay = (msg2 ~= "" and msg2 or line)
+          if filter == "" or hay:lower():find(filter, 1, true) then
+            local extra = ""
+            if e.kind == "MATCH" then
+              extra = string.format(" (hasItemLink=%s link=%s qty=%s)", tostring(e.hasItemLink), tostring(e.link or ""), tostring(e.qty or ""))
+            else
+              if e.itemID then
+                extra = extra .. string.format(" (itemID=%s)", tostring(e.itemID))
+              end
+              if e.link and e.link ~= "" and (e.kind == "CHAT_IN" or e.kind == "CHAT_OUT") then
+                extra = extra .. string.format(" (link=%s)", tostring(e.link))
+              end
+              if e.hasItemLink ~= nil and e.kind == "CHAT_IN" then
+                extra = extra .. string.format(" (hasItemLink=%s)", tostring(e.hasItemLink))
+              end
+              if e.rewrittenMoney then
+                extra = extra .. " (rewrittenMoney=true)"
+              end
+              if e.rewrittenCurrency then
+                extra = extra .. " (rewrittenCurrency=true)"
+              end
+              if e.async then
+                extra = extra .. " (async=true)"
+              end
+            end
+
+            if msg2 ~= "" then
+              Print(line .. " :: " .. msg2 .. extra)
+            else
+              Print(line .. extra)
+            end
+          end
+        end
+      end
+      return
+    end
+
+    local enabled = (DB and DB.debugCapture) and "on" or "off"
+    local stacks = (DB and DB.debugCaptureStacks) and "on" or "off"
+    local count = (CHARDB and type(CHARDB.debugCaptureLog) == "table") and #CHARDB.debugCaptureLog or 0
+    Print(string.format("Capture: %s (stacks=%s, max=%s, entries=%d)", enabled, stacks, tostring(DB and DB.debugCaptureMax or 200), count))
+    Print("Usage: /fli capture on|off|status|dump [n] [filter]|clear|max <n>|stacks")
     return
   end
   if cmd == "alias" then
@@ -5226,6 +5738,12 @@ f:RegisterEvent("LOOT_READY")
 f:SetScript("OnEvent", function(_, event)
   EnsureDB()
   if event == "PLAYER_LOGIN" then
+    do
+      local tabard = _G and rawget(_G, "fr0z3nUI_LootItTabard")
+      if tabard and tabard.Init then
+        tabard.Init(DB, CHARDB)
+      end
+    end
     ApplyFilters()
     ApplyFiltersSoon(1)
     C_Timer.After(1, UpdateMailNotifier)
