@@ -122,9 +122,12 @@ end
 
 local function isTabardItem(itemID)
 	if not itemID then return false end
-	local equipLoc = C_Item and C_Item.GetItemInventoryTypeByID and C_Item.GetItemInventoryTypeByID(itemID)
-	if type(equipLoc) == "number" then
-		-- INVSLOT_TABARD is 19; inventory type is a different enum; use tooltip scan fallback.
+	-- Prefer instant info so we don't depend on item cache.
+	if GetItemInfoInstant then
+		local _, _, _, itemEquipLoc = GetItemInfoInstant(itemID)
+		if itemEquipLoc == "INVTYPE_TABARD" then
+			return true
+		end
 	end
 	local _, _, _, _, _, _, _, _, itemEquipLoc = GetItemInfo(itemID)
 	return itemEquipLoc == "INVTYPE_TABARD"
@@ -272,8 +275,47 @@ local STATE = {
 	tabardToFactionId = {},
 	lastScan = 0,
 	pendingTabard = nil,
+	pendingSwap = false,
+	pendingSwapReason = nil,
+	lastWatchedFactionId = nil,
+	suppressNextUpdateFaction = false,
+	lastClearWatchedAt = 0,
 	factionRep = {},
+	wasInInstance = nil,
+	lastEquippedFactionId = nil,
+	equippedFactionWasExalted = nil,
 }
+
+local function getInstanceContext()
+	local inInstance, instanceType = IsInInstance()
+	if not inInstance then return nil end
+	if instanceType == "party" or instanceType == "scenario" then return "dungeon" end
+	if instanceType == "raid" then return "raid" end
+	if instanceType == "pvp" or instanceType == "arena" then return "pvp" end
+	return "dungeon"
+end
+
+local function isFactionExalted(factionId)
+	factionId = tonumber(factionId)
+	if not factionId then return false end
+	local rep = STATE.factionRep and STATE.factionRep[factionId]
+	local accrued = rep and rep.accrued
+	if type(accrued) ~= "number" then
+		local data = getFactionDataByID(factionId)
+		accrued = data and getTotalRepFromFactionData(data) or nil
+	end
+	return (type(accrued) == "number" and accrued >= EXALTED_MIN) and true or false
+end
+
+local function getWatchedFactionId()
+	if C_Reputation and C_Reputation.GetWatchedFactionData then
+		local ok, data = pcall(C_Reputation.GetWatchedFactionData)
+		if ok and type(data) == "table" then
+			return tonumber(data.factionID) or nil
+		end
+	end
+	return nil
+end
 
 local function updateReputationCache()
 	if not (DATA and DATA.reputationXRef) then return end
@@ -348,7 +390,22 @@ end
 
 local function setWatchedFactionById(factionId)
 	if not factionId then return end
+	factionId = tonumber(factionId)
+	if not factionId then return end
+
+	-- Guard: setting watched faction can fire UPDATE_FACTION; avoid loops.
+	local current = getWatchedFactionId()
+	if current and current == factionId then
+		STATE.lastWatchedFactionId = factionId
+		return
+	end
+	if STATE.lastWatchedFactionId and STATE.lastWatchedFactionId == factionId then
+		return
+	end
+	STATE.lastWatchedFactionId = factionId
+
 	if C_Reputation and C_Reputation.SetWatchedFactionByID then
+		STATE.suppressNextUpdateFaction = true
 		C_Reputation.SetWatchedFactionByID(factionId)
 		return
 	end
@@ -404,7 +461,17 @@ local function onUpdateFaction()
 
 	local db = getDB()
 	if db and db.hideRepBarWhenNoChampion and SetWatchedFactionIndex then
-		SetWatchedFactionIndex(0)
+		-- Avoid hammering the API (can also generate UPDATE_FACTION loops).
+		local watched = getWatchedFactionId()
+		if watched ~= nil then
+			local now = (GetTime and GetTime()) or 0
+			if now == 0 or (now - (STATE.lastClearWatchedAt or 0)) > 1.0 then
+				STATE.lastClearWatchedAt = now
+				STATE.lastWatchedFactionId = nil
+				STATE.suppressNextUpdateFaction = true
+				SetWatchedFactionIndex(0)
+			end
+		end
 	end
 end
 
@@ -460,16 +527,43 @@ local function chooseTabardForMode(mode)
 	ensureScanned()
 	updateReputationCache()
 
+	local currentTabard = getCurrentTabardItemID()
+
+	local function getAccruedRep(factionId)
+		if not factionId then return nil end
+		local cached = STATE.factionRep and STATE.factionRep[factionId]
+		if cached and type(cached.accrued) == "number" then
+			return cached.accrued
+		end
+		local data = getFactionDataByID(factionId)
+		if not data then return nil end
+		local total = getTotalRepFromFactionData(data)
+		if type(total) ~= "number" then return nil end
+		STATE.factionRep[factionId] = STATE.factionRep[factionId] or {}
+		STATE.factionRep[factionId].accrued = total
+		return total
+	end
+
 	local function pickClosestFromGroup(groupKey)
 		local bestItemID
-		local bestValue = 0
+		local bestValue = -1
 		for itemID, fId in pairs(STATE.tabardToFactionId) do
 			if groupKey == "all" or isInTabardGroup(itemID, groupKey) then
-				local rep = STATE.factionRep[fId]
-				local currentValue = rep and rep.repCurrent
-				if currentValue and currentValue < EXALTED_MIN and currentValue > bestValue then
-					bestValue = currentValue
-					bestItemID = itemID
+				local currentValue = getAccruedRep(fId)
+				if currentValue and currentValue < EXALTED_MIN then
+					if currentValue > bestValue then
+						bestValue = currentValue
+						bestItemID = itemID
+					elseif currentValue == bestValue and bestItemID ~= nil then
+						-- Tie-breakers: prefer keeping current tabard, then lowest itemID.
+						if itemID == currentTabard then
+							bestItemID = itemID
+						elseif bestItemID ~= currentTabard and itemID < bestItemID then
+							bestItemID = itemID
+						end
+					elseif currentValue == bestValue and bestItemID == nil then
+						bestItemID = itemID
+					end
 				end
 			end
 		end
@@ -482,11 +576,21 @@ local function chooseTabardForMode(mode)
 		if which == "lowest" then bestValue = EXALTED_MAX end
 		for itemID, fId in pairs(STATE.tabardToFactionId) do
 			if groupKey == "all" or isInTabardGroup(itemID, groupKey) then
-				local rep = STATE.factionRep[fId]
-				local currentValue = rep and rep.repCurrent
-				if currentValue and currentValue < bestValue then
-					bestValue = currentValue
-					bestItemID = itemID
+				local currentValue = getAccruedRep(fId)
+				if currentValue then
+					if currentValue < bestValue then
+						bestValue = currentValue
+						bestItemID = itemID
+					elseif currentValue == bestValue and bestItemID ~= nil then
+						-- Tie-breakers: prefer keeping current tabard, then lowest itemID.
+						if itemID == currentTabard then
+							bestItemID = itemID
+						elseif bestItemID ~= currentTabard and itemID < bestItemID then
+							bestItemID = itemID
+						end
+					elseif currentValue == bestValue and bestItemID == nil then
+						bestItemID = itemID
+					end
 				end
 			end
 		end
@@ -576,10 +680,16 @@ local function maybeSwapTabard(reason)
 	if not IsEnabled() then return end
 	local db = getDB()
 	if not db then return end
-	if InCombatLockdown() then return end
+	-- Requested behavior: only swap automatically when entering an instance (or when becoming Exalted inside one).
+	local context = getInstanceContext()
+	if not context then return end
+	if InCombatLockdown() then
+		STATE.pendingSwap = true
+		STATE.pendingSwapReason = tostring(reason or "")
+		return
+	end
 	if C_Loot and C_Loot.IsLootOpen and C_Loot.IsLootOpen() then return end
 
-	local context = getContext()
 	local mode = db.modeByContext[context] or "nochange"
 	if mode == "nochange" then return end
 
@@ -615,25 +725,102 @@ function Tabard.MaybeSwap(reason)
 end
 
 function Tabard.Debug()
+	ensureScanned()
+	updateReputationCache()
+
 	local uiMapID = getPlayerUiMapID()
 	local instanceMapID = getInstanceMapID()
 	local instanceName, instanceType, difficultyID, difficultyName = GetInstanceInfo()
 	local ctx = getContext()
+	local instCtx = getInstanceContext()
 	local tierGroup, tier = getCurrentDungeonTierGroup()
+	local db = getDB()
+	local mode = (db and db.modeByContext and ((instCtx and db.modeByContext[instCtx]) or db.modeByContext[ctx])) or nil
+	local tabardCount = 0
+	for _ in pairs(STATE.tabardToFactionId) do tabardCount = tabardCount + 1 end
+	local current = getCurrentTabardItemID()
+	local desired = (mode and mode ~= "nochange" and mode ~= "none") and chooseTabardForMode(mode) or nil
 	print(PREFIX .. "debug")
+	print(PREFIX .. " autoSwap: instance-enter, plus exalted-in-instance")
 	print(PREFIX .. " uiMapID: " .. tostring(uiMapID) .. " instanceMapID: " .. tostring(instanceMapID))
 	print(PREFIX .. " instance: " .. tostring(instanceName) .. " type: " .. tostring(instanceType) .. " difficulty: " .. tostring(difficultyID) .. " " .. tostring(difficultyName))
-	print(PREFIX .. " context: " .. tostring(ctx) .. " mode: " .. tostring(getDB() and getDB().modeByContext[ctx]))
+	print(PREFIX .. " context: " .. tostring(ctx) .. " instanceContext: " .. tostring(instCtx) .. " mode: " .. tostring(mode))
 	print(PREFIX .. " tier: " .. tostring(tier) .. " tierGroup: " .. tostring(tierGroup))
+	print(PREFIX .. " tabardsInBags: " .. tostring(tabardCount) .. " current: " .. tostring(current) .. " desired: " .. tostring(desired))
+	print(PREFIX .. " pendingTabard: " .. tostring(STATE.pendingTabard) .. " pendingSwap: " .. tostring(STATE.pendingSwap))
 	print(PREFIX .. " dataLoaded: " .. tostring(DATA ~= nil))
 end
 
 function Tabard.OnSettingsChanged(_)
 	if not Tabard._initialized then return end
-	if IsEnabled() then
-		ensureScanned()
-		C_Timer.After(getDB().delay or 0, function() maybeSwapTabard("settings") end)
-		C_Timer.After(0, onUpdateFaction)
+	if not IsEnabled() then return end
+	ensureScanned()
+	C_Timer.After(0, onUpdateFaction)
+end
+
+local function updateInstanceTransition(reason)
+	local inInstance = select(1, IsInInstance()) and true or false
+	local was = STATE.wasInInstance
+	STATE.wasInInstance = inInstance
+
+	if was == nil then
+		-- First run (login/reload): treat "already inside" as an enter.
+		if inInstance then
+			local db = getDB()
+			C_Timer.After((db and db.delay) or 0, function() maybeSwapTabard(reason or "enter") end)
+		end
+		return
+	end
+
+	if (not was) and inInstance then
+		local db = getDB()
+		C_Timer.After((db and db.delay) or 0, function() maybeSwapTabard(reason or "enter") end)
+		return
+	end
+
+	if was and (not inInstance) then
+		-- Reset exalt tracking when leaving instances.
+		STATE.lastEquippedFactionId = nil
+		STATE.equippedFactionWasExalted = nil
+		STATE.pendingSwapReason = nil
+	end
+end
+
+local function maybeSwapIfEquippedTabardJustHitExalted(reason)
+	if not IsEnabled() then return end
+	if not getInstanceContext() then
+		STATE.lastEquippedFactionId = nil
+		STATE.equippedFactionWasExalted = nil
+		return
+	end
+
+	ensureScanned()
+	updateReputationCache()
+
+	local itemID = getCurrentTabardItemID()
+	local factionId = itemID and STATE.tabardToFactionId[itemID]
+	if not factionId then
+		STATE.lastEquippedFactionId = nil
+		STATE.equippedFactionWasExalted = nil
+		return
+	end
+
+	local exalted = isFactionExalted(factionId)
+	if STATE.lastEquippedFactionId ~= factionId then
+		STATE.lastEquippedFactionId = factionId
+		STATE.equippedFactionWasExalted = exalted
+		return
+	end
+
+	if exalted and not STATE.equippedFactionWasExalted then
+		STATE.equippedFactionWasExalted = true
+		if InCombatLockdown() then
+			STATE.pendingSwap = true
+			STATE.pendingSwapReason = tostring(reason or "exalted")
+			return
+		end
+		local db = getDB()
+		C_Timer.After((db and db.delay) or 0, function() maybeSwapTabard(reason or "exalted") end)
 	end
 end
 
@@ -648,18 +835,29 @@ FRAME:SetScript("OnEvent", function(_, event)
 	if not Tabard._initialized then return end
 	if event == "PLAYER_ENTERING_WORLD" then
 		ensureScanned()
-		C_Timer.After(getDB().delay or 0, function() maybeSwapTabard("enter") end)
+		updateInstanceTransition("enter")
 		C_Timer.After(0, onUpdateFaction)
 	elseif event == "ZONE_CHANGED_NEW_AREA" then
-		C_Timer.After(getDB().delay or 0, function() maybeSwapTabard("zone") end)
+		updateInstanceTransition("zone")
 	elseif event == "PLAYER_EQUIPMENT_CHANGED" then
 		C_Timer.After(0, onUpdateFaction)
+		C_Timer.After(0, function() maybeSwapIfEquippedTabardJustHitExalted("equip") end)
 	elseif event == "BAG_UPDATE_DELAYED" then
 		scanBagsForTabards()
-		C_Timer.After(getDB().delay or 0, function() maybeSwapTabard("bags") end)
+		-- No auto-swap from bag changes; only instance enter or Exalted transition.
 	elseif event == "UPDATE_FACTION" then
+		if STATE.suppressNextUpdateFaction then
+			STATE.suppressNextUpdateFaction = false
+			return
+		end
 		onUpdateFaction()
+		maybeSwapIfEquippedTabardJustHitExalted("exalted")
 	elseif event == "PLAYER_REGEN_ENABLED" then
+		if STATE.pendingSwap then
+			STATE.pendingSwap = false
+			C_Timer.After(0, function() maybeSwapTabard(STATE.pendingSwapReason or "regen") end)
+			return
+		end
 		if STATE.pendingTabard then
 			local pending = STATE.pendingTabard
 			STATE.pendingTabard = nil
@@ -672,6 +870,7 @@ end)
 -- Optional: keep the old slash commands for convenience.
 local function HandleSlash(msg)
 	msg = tostring(msg or ""):lower():gsub("^%s+", ""):gsub("%s+$", "")
+	print(PREFIX .. "Deprecated: use /fli tabard swap|debug")
 	if msg == "debug" then
 		Tabard.Debug()
 		return
@@ -680,7 +879,7 @@ local function HandleSlash(msg)
 		Tabard.MaybeSwap("cmd")
 		return
 	end
-	print(PREFIX .. "commands: /ftm swap | /ftm debug")
+	print(PREFIX .. "commands: /fli tabard swap | /fli tabard debug")
 end
 
 SLASH_FR0Z3NUILOOTITTABARD1 = "/ftm"

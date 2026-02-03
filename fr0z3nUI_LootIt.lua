@@ -44,6 +44,7 @@ local DEFAULTS = {
   hideLootText = true, -- suppress the default "You receive loot:" chat line
   echoItem = true, -- re-print a simplified line with just the item link
   showItemLevel = true, -- append (ilvl N) for equippable items
+  ignoredItemIDs = {}, -- [itemID] = true hides the item from chat (suppresses both original + LootIt output)
   linkAliases = {}, -- [itemID] = "Short Name" (display only, keeps original link)
   linkAliasDisabledAddon = {}, -- [itemID] = true disables addon built-in alias
   linkAliasDisabledAccount = {}, -- [itemID] = true disables account alias
@@ -59,6 +60,28 @@ local DEFAULTS = {
   lootCombineIncludeGold = false, -- when combining, include money (gold/silver/copper per toggles) in the combined line
   lootCombineIncludeMoneyCurrency = false, -- legacy (kept for migration)
   lootCombineMode = "loot", -- loot | timer
+
+  -- Delay-print: aggregate spammy items and print once after a delay.
+  -- Configured per itemID via the Alias tab.
+  delayPrint = {
+    enabled = true,
+    itemSeconds = {
+      -- Darkmoon:
+      [71083] = 30, -- Darkmoon Game Token
+      -- Sack/Pouch o' Tokens variants:
+      [78910] = 2,
+      [78909] = 2,
+      [78908] = 2,
+      [78907] = 2,
+      [78906] = 2,
+      [78905] = 2,
+      [78904] = 2,
+    },
+    flushOnMerchantClose = true,
+  },
+
+  -- Loot-output styling: suppress tabard iLvl suffix below this iLvl (0 disables).
+  ignoreTabardLootBelowIlvl = 10,
   mailNotify = {
     enabled = true,
   },
@@ -139,6 +162,7 @@ local function EnsureDB()
 
   DB = CopyDefaults(fr0z3nUI_LootItDB, DEFAULTS)
   CHARDB = fr0z3nUI_LootItCharDB
+  if type(DB.ignoredItemIDs) ~= "table" then DB.ignoredItemIDs = {} end
   if type(CHARDB.linkAliases) ~= "table" then CHARDB.linkAliases = {} end
   if type(CHARDB.linkAliasDisabledChar) ~= "table" then CHARDB.linkAliasDisabledChar = {} end
 
@@ -150,6 +174,13 @@ local function EnsureDB()
   end
   if DB and DB.other and DB.other.outputChatFrame == nil then
     DB.other.outputChatFrame = DB.outputChatFrame or 1
+  end
+
+  if DB then
+    if type(DB.delayPrint) ~= "table" then DB.delayPrint = {} end
+    if type(DB.delayPrint.itemSeconds) ~= "table" then DB.delayPrint.itemSeconds = {} end
+    if DB.delayPrint.enabled == nil then DB.delayPrint.enabled = true end
+    if DB.delayPrint.flushOnMerchantClose == nil then DB.delayPrint.flushOnMerchantClose = true end
   end
 
   if (not hadNewCurrency) and (not hadNewGold) and (fr0z3nUI_LootItDB.lootCombineIncludeMoneyCurrency == true) then
@@ -209,6 +240,10 @@ local function EnsureDB()
     if mn.ui.alpha == nil then mn.ui.alpha = 0.5 end
     if mn.ui.strata == nil then mn.ui.strata = "BACKGROUND" end
   end
+end
+
+local function IsIgnoredItemID(itemID)
+  return (DB and type(DB.ignoredItemIDs) == "table" and DB.ignoredItemIDs[itemID] == true) and true or false
 end
 
 local function IsItemLevelEnabled()
@@ -936,6 +971,140 @@ local function LootCombineAdd(part)
   end
 end
 
+-- Delay-print aggregation (separate from loot-combine):
+-- Used to suppress spam for specific itemIDs and reprint once with a summed xN.
+local delayPrintBuckets
+
+local function GetDelayPrintSecondsForItemID(itemID)
+  if not (DB and DB.delayPrint and DB.delayPrint.enabled) then return nil end
+  if not (itemID and itemID > 0) then return nil end
+  local t = DB.delayPrint.itemSeconds
+  if type(t) ~= "table" then return nil end
+  local sec = tonumber(t[itemID])
+  if not sec or sec <= 0 then return nil end
+  if sec > 3600 then sec = 3600 end
+  return sec
+end
+
+local function FormatLootItemPartFromLink(link, totalQty)
+  if type(link) ~= "string" or link == "" then return nil end
+  link = NormalizeItemLink(link)
+  link = ApplyItemLinkAlias(link)
+
+  local displayLink = StripDisplayedLinkBrackets(link)
+  local out = displayLink
+  local n = tonumber(totalQty)
+  if n and n > 1 then
+    out = string.format("%s x%d", displayLink, n)
+  end
+
+  if IsItemLevelEnabled() then
+    local ilvl = GetEquippableItemLevelSuffix(link)
+    if ilvl then
+      local color = link:match("^(|c%x%x%x%x%x%x%x%x)")
+      local ilvlText = color and (color .. tostring(ilvl) .. "|r") or tostring(ilvl)
+      out = out .. " " .. ilvlText
+    end
+  end
+
+  return out
+end
+
+local function DelayPrintFlushBucket(secKey)
+  if not delayPrintBuckets then return end
+  local b = delayPrintBuckets[secKey]
+  if not (b and b.order and b.items) then return end
+  if #b.order == 0 then return end
+
+  local parts = {}
+  for i = 1, #b.order do
+    local id = b.order[i]
+    local it = b.items[id]
+    if it and it.link and it.qty and it.qty > 0 then
+      local part = FormatLootItemPartFromLink(it.link, it.qty)
+      if part then
+        parts[#parts + 1] = part
+      end
+    end
+  end
+
+  -- Clear bucket.
+  b.items = {}
+  b.order = {}
+  b.gen = (b.gen or 0) + 1
+
+  if #parts > 0 then
+    local msg = table.concat(parts, "|cff15AB0D,|r ")
+    Print(FormatSelfLine(msg))
+  end
+end
+
+local function DelayPrintFlushAll()
+  if not delayPrintBuckets then return end
+  for secKey in pairs(delayPrintBuckets) do
+    DelayPrintFlushBucket(secKey)
+  end
+end
+
+local function DelayPrintAddItem(itemID, link, qty, sec)
+  if not (sec and sec > 0) then return false end
+  if not (C_Timer and C_Timer.After) then
+    -- No timers available; fall back to immediate printing.
+    local part = FormatLootItemPartFromLink(link, qty)
+    if part then
+      Print(FormatSelfLine(part))
+      return true
+    end
+    return false
+  end
+
+  local secKey = tostring(sec)
+  if not delayPrintBuckets then delayPrintBuckets = {} end
+  if not delayPrintBuckets[secKey] then
+    delayPrintBuckets[secKey] = { items = {}, order = {}, gen = 0 }
+  end
+  local b = delayPrintBuckets[secKey]
+  b.gen = (b.gen or 0) + 1
+  local myGen = b.gen
+
+  local n = tonumber(qty) or 1
+  if n < 1 then n = 1 end
+
+  local it = b.items[itemID]
+  if not it then
+    it = { link = link, qty = 0 }
+    b.items[itemID] = it
+    b.order[#b.order + 1] = itemID
+  else
+    -- Prefer the most recent link, in case it was upgraded/normalized.
+    it.link = link or it.link
+  end
+  it.qty = (tonumber(it.qty) or 0) + n
+
+  C_Timer.After(sec, function()
+    -- Debounce: only flush if nothing else arrived since scheduling.
+    if not delayPrintBuckets then return end
+    local cur = delayPrintBuckets[secKey]
+    if not cur then return end
+    if cur.gen ~= myGen then return end
+    DelayPrintFlushBucket(secKey)
+  end)
+
+  return true
+end
+
+local function ShouldSuppressTabardIlvlSuffix(link)
+  local minIlvl = DB and tonumber(DB.ignoreTabardLootBelowIlvl) or 0
+  if not minIlvl or minIlvl <= 0 then return false end
+
+  if not (C_Item and C_Item.GetItemInfoInstant) then return false end
+  local _, _, _, equipLoc = C_Item.GetItemInfoInstant(link)
+  if equipLoc ~= "INVTYPE_TABARD" then return false end
+
+  local ilvl = GetEquippableItemLevelSuffix(link)
+  return (ilvl and ilvl > 0 and ilvl < minIlvl) and true or false
+end
+
 local function FormatOtherLine(name, text)
   local colored = GetClassColoredName(name or "")
   if colored and colored ~= "" then
@@ -1324,6 +1493,34 @@ local function OnSystemChat(_, _, msg, ...)
 
   if DB and DB.echoItem then
     link = NormalizeItemLink(link)
+    local ignoredID = CaptureItemIDFromLink(link)
+    if ignoredID and IsIgnoredItemID(ignoredID) then
+      CaptureChatOut("CHAT_MSG_SYSTEM", link, {
+        handled = true,
+        ignored = true,
+        qty = tonumber(qty),
+        itemID = ignoredID,
+      })
+      return true
+    end
+
+    do
+      local n = tonumber(qty)
+      local delaySec = GetDelayPrintSecondsForItemID(ignoredID)
+      if delaySec then
+        if DelayPrintAddItem(ignoredID, link, n, delaySec) then
+          CaptureChatOut("CHAT_MSG_SYSTEM", link, {
+            handled = true,
+            delayed = true,
+            delaySec = delaySec,
+            qty = n,
+            itemID = ignoredID,
+          })
+          return true
+        end
+      end
+    end
+
     link = ApplyItemLinkAlias(link)
     local displayLink = StripDisplayedLinkBrackets(link)
     local out = displayLink
@@ -1532,6 +1729,21 @@ local function OnLootChat(_, _, msg, author, ...)
     return false
   end
 
+  do
+    local ignoredID = CaptureItemIDFromLink(link)
+    if ignoredID and IsIgnoredItemID(ignoredID) then
+      CaptureChatOut("CHAT_MSG_LOOT", link, {
+        handled = true,
+        ignored = true,
+        isSelfLoot = isSelfLoot and true or false,
+        player = (not isSelfLoot) and playerName or nil,
+        qty = tonumber(qty),
+        itemID = ignoredID,
+      })
+      return true
+    end
+  end
+
   -- Some loot lines can contain a bracketed item name without a hyperlink, e.g.
   --   "You receive item: [Chest of Gold]"
   -- In those cases we can't apply aliases/ilvl or even reliably suppress the original line.
@@ -1542,6 +1754,11 @@ local function OnLootChat(_, _, msg, author, ...)
       local knownItemID = nil
       if bracketName == "Chest of Gold" then
         knownItemID = 226814
+      end
+
+      if knownItemID and IsIgnoredItemID(knownItemID) then
+        CaptureChatOut("CHAT_MSG_LOOT", "[" .. bracketName .. "]", { handled = true, ignored = true, async = true, itemID = knownItemID, from = bracketName })
+        return true
       end
 
       if knownItemID and Item and (Item.CreateFromItemID or Item.createFromItemID) then
@@ -1559,6 +1776,11 @@ local function OnLootChat(_, _, msg, author, ...)
             pendingAsyncLoot[key] = nil
             EnsureDB()
             if not (IsEnabled() and DB and DB.echoItem) then return end
+
+            if IsIgnoredItemID(knownItemID) then
+              CaptureChatOut("CHAT_MSG_LOOT", "[" .. bracketName .. "]", { handled = true, ignored = true, async = true, itemID = knownItemID, from = bracketName })
+              return
+            end
 
             local resolved = withLink
             if type(resolved) ~= "string" or resolved == "" then
@@ -1610,10 +1832,44 @@ local function OnLootChat(_, _, msg, author, ...)
 
   if DB.echoItem then
     link = NormalizeItemLink(link)
+    local n = tonumber(qty)
+    do
+      local ignoredID = CaptureItemIDFromLink(link)
+      if ignoredID and IsIgnoredItemID(ignoredID) then
+        CaptureChatOut("CHAT_MSG_LOOT", link, {
+          handled = true,
+          ignored = true,
+          isSelfLoot = isSelfLoot and true or false,
+          player = (not isSelfLoot) and playerName or nil,
+          qty = tonumber(qty),
+          itemID = ignoredID,
+          combine = LootCombineEnabled() and true or false,
+        })
+        return true
+      end
+    end
+
+    if isSelfLoot then
+      local itemID = CaptureItemIDFromLink(link)
+      local delaySec = GetDelayPrintSecondsForItemID(itemID)
+      if delaySec then
+        if DelayPrintAddItem(itemID, link, n, delaySec) then
+          CaptureChatOut("CHAT_MSG_LOOT", link, {
+            handled = true,
+            delayed = true,
+            delaySec = delaySec,
+            isSelfLoot = true,
+            qty = n,
+            itemID = itemID,
+          })
+          return true
+        end
+      end
+    end
+
     link = ApplyItemLinkAlias(link)
     local displayLink = StripDisplayedLinkBrackets(link)
     local out = displayLink
-    local n = tonumber(qty)
     if n and n > 1 then
       out = string.format("%s x%d", displayLink, n)
     end
@@ -2084,7 +2340,179 @@ local function CreateConfigUI()
     RefreshTabardEnableModeButton()
   end)
 
+  local function TabardMod()
+    return _G and rawget(_G, "fr0z3nUI_LootItTabard")
+  end
+
+  local function EnsureTabardDB()
+    EnsureDB()
+    DB.tabard = (type(DB.tabard) == "table") and DB.tabard or {}
+    DB.tabard.modeByContext = (type(DB.tabard.modeByContext) == "table") and DB.tabard.modeByContext or {
+      solo = "nochange",
+      city = "closest",
+      dungeon = "closest",
+      raid = "nochange",
+      pvp = "nochange",
+    }
+    if DB.tabard.delay == nil then DB.tabard.delay = 0.75 end
+    if DB.tabard.hideRepBarWhenNoChampion == nil then DB.tabard.hideRepBarWhenNoChampion = false end
+    return DB.tabard
+  end
+
+  local function NotifyTabardSettingsChanged(reason)
+    local mod = TabardMod()
+    if mod and mod.OnSettingsChanged then
+      mod.OnSettingsChanged(reason or "ui")
+    end
+  end
+
+  -- Context mode controls
+  local tabardModeTitle = tabardPanel:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+  tabardModeTitle:SetPoint("TOPLEFT", tabardEnableLabel, "BOTTOMLEFT", 0, -18)
+  tabardModeTitle:SetText("Context modes")
+
+  local MODE_LABELS = {
+    nochange = "No change",
+    closest = "Closest to Exalted",
+    furthest = "Furthest from Exalted",
+    lowest = "Lowest rep",
+    random = "Random",
+    faction = "Faction (cities)",
+    auto = "Auto",
+    none = "Unequip",
+  }
+
+  local MODE_ORDER = { "nochange", "closest", "furthest", "lowest", "random", "auto", "faction", "none" }
+
+  local function CreateModeDropDown(name, anchor, yOffset)
+    local label = tabardPanel:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+    label:SetPoint("TOPLEFT", anchor, "BOTTOMLEFT", 0, yOffset)
+    label:SetText(name)
+
+    local dd = CreateFrame("Frame", nil, tabardPanel, "UIDropDownMenuTemplate")
+    dd:SetPoint("LEFT", label, "RIGHT", -6, -2)
+    UIDropDownMenu_SetWidth(dd, 170)
+    return label, dd
+  end
+
+  local soloLabel, soloDD = CreateModeDropDown("Solo", tabardModeTitle, -8)
+  local cityLabel, cityDD = CreateModeDropDown("City", soloLabel, -8)
+  local dungeonLabel, dungeonDD = CreateModeDropDown("Dungeon", cityLabel, -8)
+  local raidLabel, raidDD = CreateModeDropDown("Raid", dungeonLabel, -8)
+  local pvpLabel, pvpDD = CreateModeDropDown("PvP", raidLabel, -8)
+
+  local function SetModeFor(ctx, mode)
+    local tdb = EnsureTabardDB()
+    tdb.modeByContext[ctx] = tostring(mode or "nochange")
+    NotifyTabardSettingsChanged("mode")
+  end
+
+  local function GetModeFor(ctx)
+    local tdb = EnsureTabardDB()
+    return tostring((tdb.modeByContext and tdb.modeByContext[ctx]) or "nochange")
+  end
+
+  local function InitModeDropDown(dd, ctx)
+    UIDropDownMenu_Initialize(dd, function(_, level)
+      if level ~= 1 then return end
+      local current = GetModeFor(ctx)
+      for _, key in ipairs(MODE_ORDER) do
+        local info = UIDropDownMenu_CreateInfo()
+        info.text = MODE_LABELS[key] or key
+        info.value = key
+        info.checked = (key == current)
+        info.func = function()
+          UIDropDownMenu_SetText(dd, MODE_LABELS[key] or key)
+          SetModeFor(ctx, key)
+        end
+        UIDropDownMenu_AddButton(info, level)
+      end
+    end)
+  end
+
+  InitModeDropDown(soloDD, "solo")
+  InitModeDropDown(cityDD, "city")
+  InitModeDropDown(dungeonDD, "dungeon")
+  InitModeDropDown(raidDD, "raid")
+  InitModeDropDown(pvpDD, "pvp")
+
+  -- Delay + misc
+  local delayLabel = tabardPanel:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+  delayLabel:SetPoint("TOPLEFT", pvpLabel, "BOTTOMLEFT", 0, -14)
+  delayLabel:SetText("Delay")
+
+  local delaySlider = CreateFrame("Slider", nil, tabardPanel, "OptionsSliderTemplate")
+  delaySlider:SetPoint("LEFT", delayLabel, "RIGHT", 14, 0)
+  delaySlider:SetWidth(180)
+  delaySlider:SetMinMaxValues(0, 3.0)
+  delaySlider:SetValueStep(0.05)
+  delaySlider:SetObeyStepOnDrag(true)
+  if delaySlider.Low then delaySlider.Low:SetText("0") end
+  if delaySlider.High then delaySlider.High:SetText("3.0") end
+  if delaySlider.Text then delaySlider.Text:SetText("") end
+
+  local delayValue = tabardPanel:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+  delayValue:SetPoint("LEFT", delaySlider, "RIGHT", 10, 0)
+  delayValue:SetText("0.75s")
+
+  delaySlider:SetScript("OnValueChanged", function(self, value)
+    local tdb = EnsureTabardDB()
+    local v = Clamp(value or 0, 0, 3.0)
+    tdb.delay = v
+    delayValue:SetText(string.format("%.2fs", v))
+    NotifyTabardSettingsChanged("delay")
+  end)
+
+  local repCB = CreateFrame("CheckButton", nil, tabardPanel, "UICheckButtonTemplate")
+  repCB:SetPoint("TOPLEFT", delayLabel, "BOTTOMLEFT", 0, -10)
+  SetCheckBoxText(repCB, "Hide rep bar when not championing")
+  repCB:SetScript("OnClick", function(self)
+    local tdb = EnsureTabardDB()
+    tdb.hideRepBarWhenNoChampion = self:GetChecked() and true or false
+    NotifyTabardSettingsChanged("repbar")
+  end)
+
+  local swapBtn = CreateFrame("Button", nil, tabardPanel, "UIPanelButtonTemplate")
+  swapBtn:SetSize(90, 20)
+  swapBtn:SetPoint("TOPLEFT", repCB, "BOTTOMLEFT", 0, -10)
+  swapBtn:SetText("Swap Now")
+  swapBtn:SetScript("OnClick", function()
+    local mod = TabardMod()
+    if mod and mod.MaybeSwap then mod.MaybeSwap("ui") end
+  end)
+
+  local dbgBtn = CreateFrame("Button", nil, tabardPanel, "UIPanelButtonTemplate")
+  dbgBtn:SetSize(90, 20)
+  dbgBtn:SetPoint("LEFT", swapBtn, "RIGHT", 10, 0)
+  dbgBtn:SetText("Debug")
+  dbgBtn:SetScript("OnClick", function()
+    local mod = TabardMod()
+    if mod and mod.Debug then mod.Debug() end
+  end)
+
+  local tip = tabardPanel:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+  tip:SetPoint("TOPLEFT", swapBtn, "BOTTOMLEFT", 0, -10)
+  tip:SetJustifyH("LEFT")
+  tip:SetText("Tip: If you don't want auto-equips in towns, set City to 'No change'.")
+
+  local function RefreshTabardControls()
+    RefreshTabardEnableModeButton()
+    local tdb = EnsureTabardDB()
+    UIDropDownMenu_SetText(soloDD, MODE_LABELS[GetModeFor("solo")] or GetModeFor("solo"))
+    UIDropDownMenu_SetText(cityDD, MODE_LABELS[GetModeFor("city")] or GetModeFor("city"))
+    UIDropDownMenu_SetText(dungeonDD, MODE_LABELS[GetModeFor("dungeon")] or GetModeFor("dungeon"))
+    UIDropDownMenu_SetText(raidDD, MODE_LABELS[GetModeFor("raid")] or GetModeFor("raid"))
+    UIDropDownMenu_SetText(pvpDD, MODE_LABELS[GetModeFor("pvp")] or GetModeFor("pvp"))
+    local d = tonumber(tdb.delay) or 0.75
+    delaySlider:SetValue(Clamp(d, 0, 3.0))
+    delayValue:SetText(string.format("%.2fs", Clamp(d, 0, 3.0)))
+    repCB:SetChecked(tdb.hideRepBarWhenNoChampion and true or false)
+  end
+
   tabardPanel:SetScript("OnShow", RefreshTabardEnableModeButton)
+
+  -- Replace with full refresh (enable + controls)
+  tabardPanel:SetScript("OnShow", RefreshTabardControls)
 
   -- Other tab
   local otherTitle = otherPanel:CreateFontString(nil, "OVERLAY", "GameFontNormal")
@@ -2913,6 +3341,24 @@ local function CreateConfigUI()
     status:SetText("Type/Paste an ID above")
     SetFontStringSize(status, 13)
 
+    local ignoreCB = CreateFrame("CheckButton", nil, aliasPanel, "UICheckButtonTemplate")
+    ignoreCB:SetPoint("BOTTOMLEFT", aliasPanel, "BOTTOMLEFT", 10, 44)
+    SetCheckBoxText(ignoreCB, "Ignore (hide from loot chat)")
+    ignoreCB:Disable()
+
+    local delayLabel = aliasPanel:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    delayLabel:SetPoint("BOTTOMRIGHT", aliasPanel, "BOTTOMRIGHT", -140, 48)
+    delayLabel:SetText("Delay print (sec)")
+
+    local delayBox = CreateFrame("EditBox", nil, aliasPanel, "InputBoxTemplate")
+    delayBox:SetSize(54, 20)
+    delayBox:SetPoint("LEFT", delayLabel, "RIGHT", 8, -2)
+    delayBox:SetAutoFocus(false)
+    delayBox:SetJustifyH("CENTER")
+    delayBox:SetNumeric(true)
+    delayBox:SetText("0")
+    delayBox:Disable()
+
     local BTN_W, BTN_H, BTN_GAP = 120, 22, 10
     local ADD_ROW_X = (BTN_W / 2) + (BTN_GAP / 2)
 
@@ -3129,6 +3575,10 @@ local function CreateConfigUI()
         status:SetText("Type/Paste an ID above")
         btnAcc:Disable()
         btnChar:Disable()
+        ignoreCB:SetChecked(false)
+        ignoreCB:Disable()
+        delayBox:SetText("0")
+        delayBox:Disable()
         SetButtonColor(btnAcc, "Account", nil)
         SetButtonColor(btnChar, "Character", nil)
         return
@@ -3143,6 +3593,32 @@ local function CreateConfigUI()
 
       local st = GetAliasState(mode, id)
       local exists = AnyAliasExists(st)
+
+      if mode == MODE_ITEM then
+        local ignored = (DB and type(DB.ignoredItemIDs) == "table" and DB.ignoredItemIDs[id] == true) and true or false
+        ignoreCB:SetChecked(ignored)
+        ignoreCB:Enable()
+
+        do
+          EnsureDB()
+          DB.delayPrint = (type(DB.delayPrint) == "table") and DB.delayPrint or {}
+          DB.delayPrint.itemSeconds = (type(DB.delayPrint.itemSeconds) == "table") and DB.delayPrint.itemSeconds or {}
+          local sec = tonumber(DB.delayPrint.itemSeconds[id]) or 0
+          if sec < 0 then sec = 0 end
+          if sec > 3600 then sec = 3600 end
+          delayBox:SetText(tostring(math.floor(sec + 0.5)))
+          delayBox:Enable()
+        end
+
+        if ignored then
+          status:SetText("Ignored: hidden (no chat output)")
+        end
+      else
+        ignoreCB:SetChecked(false)
+        ignoreCB:Disable()
+        delayBox:SetText("0")
+        delayBox:Disable()
+      end
 
       local activeText, activeSource = GetEffectiveAlias(mode, id)
       if activeText then
@@ -3168,7 +3644,9 @@ local function CreateConfigUI()
         btnChar:Disable()
         SetButtonColor(btnAcc, "Account", nil)
         SetButtonColor(btnChar, "Character", nil)
-        status:SetText("Type an Alias, Click Account to Save")
+        if not (mode == MODE_ITEM and ignoreCB:GetChecked()) then
+          status:SetText("Type an Alias, Click Account to Save")
+        end
         return
       end
 
@@ -3178,7 +3656,9 @@ local function CreateConfigUI()
         btnChar:Disable()
         SetButtonColor(btnAcc, "Account", "yellow")
         SetButtonColor(btnChar, "Character", nil)
-        status:SetText("Click Account to Save")
+        if not (mode == MODE_ITEM and ignoreCB:GetChecked()) then
+          status:SetText("Click Account to Save")
+        end
         return
       end
 
@@ -3189,9 +3669,13 @@ local function CreateConfigUI()
       SetButtonColor(btnChar, "Character", st.char.disabled and "yellow" or "red")
 
       if st.char.disabled then
-        status:SetText("Click Character to Enable, Account to Remove")
+        if not (mode == MODE_ITEM and ignoreCB:GetChecked()) then
+          status:SetText("Click Character to Enable, Account to Remove")
+        end
       else
-        status:SetText("Click Character to Disable, Account to Remove")
+        if not (mode == MODE_ITEM and ignoreCB:GetChecked()) then
+          status:SetText("Click Character to Disable, Account to Remove")
+        end
       end
     end
 
@@ -3349,6 +3833,62 @@ local function CreateConfigUI()
       if self and self.HasFocus and self:HasFocus() then
         SyncUI()
       end
+    end)
+
+    ignoreCB:SetScript("OnClick", function(self)
+      local id = aliasPanel._aliasID or GetValidID()
+      local mode = aliasPanel._aliasMode or GetAliasInputMode()
+      if not (id and mode == MODE_ITEM) then
+        self:SetChecked(false)
+        self:Disable()
+        return
+      end
+
+      EnsureDB()
+      DB.ignoredItemIDs = (type(DB.ignoredItemIDs) == "table") and DB.ignoredItemIDs or {}
+      local on = self:GetChecked() and true or false
+      DB.ignoredItemIDs[id] = on and true or nil
+      Print(PREFIX .. string.format("Ignore %s: %d", on and "enabled" or "disabled", id))
+      SyncUI()
+    end)
+
+    delayBox:SetScript("OnEnterPressed", function(self)
+      self:ClearFocus()
+      local id = aliasPanel._aliasID or GetValidID()
+      local mode = aliasPanel._aliasMode or GetAliasInputMode()
+      if not (id and mode == MODE_ITEM) then
+        self:SetText("0")
+        self:Disable()
+        return
+      end
+
+      EnsureDB()
+      DB.delayPrint = (type(DB.delayPrint) == "table") and DB.delayPrint or {}
+      DB.delayPrint.itemSeconds = (type(DB.delayPrint.itemSeconds) == "table") and DB.delayPrint.itemSeconds or {}
+
+      local sec = tonumber(self:GetText() or "") or 0
+      if sec < 0 then sec = 0 end
+      if sec > 3600 then sec = 3600 end
+
+      if sec <= 0 then
+        DB.delayPrint.itemSeconds[id] = nil
+        Print(PREFIX .. string.format("Delay print: disabled (%d)", id))
+      else
+        DB.delayPrint.itemSeconds[id] = sec
+        Print(PREFIX .. string.format("Delay print: %ds (%d)", sec, id))
+      end
+
+      SyncUI()
+    end)
+
+    delayBox:SetScript("OnEscapePressed", function(self)
+      local id = aliasPanel._aliasID or GetValidID()
+      EnsureDB()
+      local sec = (DB and DB.delayPrint and DB.delayPrint.itemSeconds and id and tonumber(DB.delayPrint.itemSeconds[id])) or 0
+      if sec < 0 then sec = 0 end
+      if sec > 3600 then sec = 3600 end
+      self:SetText(tostring(math.floor(sec + 0.5)))
+      self:ClearFocus()
     end)
 
     btnAcc:SetScript("OnClick", function()
@@ -5272,6 +5812,9 @@ SlashCmdList.FR0Z3NUI_LOOTIT = function(msg)
     Print("/fli echo on|off")
     Print("/fli selfname on|off")
     Print("/fli prefix <text>|default (leave blank to clear)")
+    Print("/fli ignore <itemID>")
+    Print("/fli tabard swap")
+    Print("/fli tabard debug")
     Print("/fli mail on|off|toggle|test")
     Print("/fli mail model player")
     Print("/fli mail model katy")
@@ -5285,6 +5828,53 @@ SlashCmdList.FR0Z3NUI_LOOTIT = function(msg)
     Print("/fli alias list")
     Print("/fli capture on|off|status|dump|clear|max|stacks")
     Print("/fli status")
+    return
+  end
+
+  if cmd == "ignore" then
+    local id = tonumber((rest or ""):match("(%d+)"))
+    if not id or id <= 0 then
+      local n = 0
+      if DB and type(DB.ignoredItemIDs) == "table" then
+        for _ in pairs(DB.ignoredItemIDs) do n = n + 1 end
+      end
+      Print("Usage: /fli ignore <itemID>")
+      Print("Ignored items: " .. tostring(n))
+      return
+    end
+
+    DB.ignoredItemIDs = (type(DB.ignoredItemIDs) == "table") and DB.ignoredItemIDs or {}
+    local on = not (DB.ignoredItemIDs[id] == true)
+    DB.ignoredItemIDs[id] = on and true or nil
+    Print(string.format("Ignore %s: %d", on and "enabled" or "disabled", id))
+    return
+  end
+
+  if cmd == "tabard" then
+    local sub = tostring(rest or ""):lower():gsub("^%s+", ""):gsub("%s+$", "")
+    local tabard = _G and rawget(_G, "fr0z3nUI_LootItTabard")
+    if sub == "" or sub == "help" or sub == "?" then
+      Print("Tabard commands:")
+      Print("  /fli tabard swap")
+      Print("  /fli tabard debug")
+      return
+    end
+
+    if not (tabard and (tabard.MaybeSwap or tabard.Debug)) then
+      Print("Tabard module not loaded.")
+      return
+    end
+
+    if sub == "swap" then
+      if tabard.MaybeSwap then tabard.MaybeSwap("cmd") end
+      return
+    end
+    if sub == "debug" then
+      if tabard.Debug then tabard.Debug() end
+      return
+    end
+
+    Print("Unknown tabard command. Try: /fli tabard help")
     return
   end
 
@@ -5729,6 +6319,8 @@ end
 local f = CreateFrame("Frame")
 f:RegisterEvent("PLAYER_LOGIN")
 f:RegisterEvent("PLAYER_ENTERING_WORLD")
+f:RegisterEvent("MERCHANT_SHOW")
+f:RegisterEvent("MERCHANT_CLOSED")
 f:RegisterEvent("UPDATE_PENDING_MAIL")
 f:RegisterEvent("PLAYER_REGEN_DISABLED")
 f:RegisterEvent("PLAYER_REGEN_ENABLED")
@@ -5750,6 +6342,10 @@ f:SetScript("OnEvent", function(_, event)
   elseif event == "PLAYER_ENTERING_WORLD" then
     ApplyFiltersSoon(0.5)
     C_Timer.After(1, UpdateMailNotifier)
+  elseif event == "MERCHANT_CLOSED" then
+    if DB and DB.delayPrint and DB.delayPrint.flushOnMerchantClose then
+      DelayPrintFlushAll()
+    end
   elseif event == "UPDATE_PENDING_MAIL" then
     C_Timer.After(0.5, UpdateMailNotifier)
   elseif event == "PLAYER_REGEN_DISABLED" or event == "PLAYER_REGEN_ENABLED" then
