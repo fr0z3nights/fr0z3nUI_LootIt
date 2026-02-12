@@ -424,6 +424,11 @@ function LI.Trade.BuildTab(depositPanel)
   restockBtn:SetText("Restock")
   restockBtn:Hide()
 
+  local function SetRestockBtnVisual(on)
+    if not (restockBtn and restockBtn.SetText) then return end
+    restockBtn:SetText(on and "|cffffff00Restock|r" or "Restock")
+  end
+
   local actionBtn = CreateFrame("Button", nil, depositPanel, "UIPanelButtonTemplate")
   actionBtn:SetSize(90, 22)
   actionBtn:SetPoint("BOTTOMLEFT", depositPanel, "BOTTOMLEFT", 10, 10)
@@ -996,6 +1001,7 @@ function LI.Trade.BuildTab(depositPanel)
       stackLabel:SetText("")
       reasonLabel:SetText("")
       restockBtn:Disable()
+      SetRestockBtnVisual(false)
 
       if keepBox and keepBox.SetText then
         keepBox:SetText("")
@@ -1455,7 +1461,7 @@ function LI.Trade.BuildTab(depositPanel)
     end
 
     restockBtn:Enable()
-    restockBtn:SetText(restockOn and "|cffffff00Restock|r" or "Restock")
+    SetRestockBtnVisual(restockOn)
   end
 
   local function NormalizeBankTarget(t)
@@ -1818,7 +1824,8 @@ function LI.Trade.BuildTab(depositPanel)
       hasAnyRule = (rAcc ~= nil) or (rChar ~= nil) or (rRealm ~= nil)
     end
     if not hasAnyRule then
-      TogglePendingForID(id)
+      local on = TogglePendingForID(id)
+      SetRestockBtnVisual(on)
       UpdateScopeButtons(id)
       return
     end
@@ -1836,6 +1843,9 @@ function LI.Trade.BuildTab(depositPanel)
 
     depositPanel._pendingRestockID = id
     depositPanel._pendingRestock = nextVal
+
+    -- Update the button immediately even if some other UI refresh is delayed.
+    SetRestockBtnVisual(nextVal)
 
     UpdateScopeButtons(id)
   end)
