@@ -367,12 +367,21 @@ local function DepositCfgAcc()
   DB.deposit = (type(DB.deposit) == "table") and DB.deposit or {}
   if DB.deposit.tradeMode == nil then DB.deposit.tradeMode = "deposit" end
   DB.deposit.itemsAcc = (type(DB.deposit.itemsAcc) == "table") and DB.deposit.itemsAcc or {}
+  DB.deposit.itemsAccDisabled = (type(DB.deposit.itemsAccDisabled) == "table") and DB.deposit.itemsAccDisabled or {}
+  DB.deposit.itemsAccDisableRealm = (type(DB.deposit.itemsAccDisableRealm) == "table") and DB.deposit.itemsAccDisableRealm or {}
   DB.deposit.itemsRealm = (type(DB.deposit.itemsRealm) == "table") and DB.deposit.itemsRealm or {}
+  DB.deposit.itemsRealmDisabled = (type(DB.deposit.itemsRealmDisabled) == "table") and DB.deposit.itemsRealmDisabled or {}
   DB.deposit.guildTabByRealm = (type(DB.deposit.guildTabByRealm) == "table") and DB.deposit.guildTabByRealm or {}
   DB.deposit.buyItemsAcc = (type(DB.deposit.buyItemsAcc) == "table") and DB.deposit.buyItemsAcc or {}
+  DB.deposit.buyItemsAccDisabled = (type(DB.deposit.buyItemsAccDisabled) == "table") and DB.deposit.buyItemsAccDisabled or {}
+  DB.deposit.buyItemsAccDisableRealm = (type(DB.deposit.buyItemsAccDisableRealm) == "table") and DB.deposit.buyItemsAccDisableRealm or {}
   DB.deposit.buyItemsRealm = (type(DB.deposit.buyItemsRealm) == "table") and DB.deposit.buyItemsRealm or {}
+  DB.deposit.buyItemsRealmDisabled = (type(DB.deposit.buyItemsRealmDisabled) == "table") and DB.deposit.buyItemsRealmDisabled or {}
   DB.deposit.sellItemsAcc = (type(DB.deposit.sellItemsAcc) == "table") and DB.deposit.sellItemsAcc or {}
+  DB.deposit.sellItemsAccDisabled = (type(DB.deposit.sellItemsAccDisabled) == "table") and DB.deposit.sellItemsAccDisabled or {}
+  DB.deposit.sellItemsAccDisableRealm = (type(DB.deposit.sellItemsAccDisableRealm) == "table") and DB.deposit.sellItemsAccDisableRealm or {}
   DB.deposit.sellItemsRealm = (type(DB.deposit.sellItemsRealm) == "table") and DB.deposit.sellItemsRealm or {}
+  DB.deposit.sellItemsRealmDisabled = (type(DB.deposit.sellItemsRealmDisabled) == "table") and DB.deposit.sellItemsRealmDisabled or {}
   return DB.deposit
 end
 
@@ -399,11 +408,17 @@ local function DepositCfgChar()
   EnsureDB()
   CHARDB.deposit = (type(CHARDB.deposit) == "table") and CHARDB.deposit or {}
   CHARDB.deposit.itemsChar = (type(CHARDB.deposit.itemsChar) == "table") and CHARDB.deposit.itemsChar or {}
+  CHARDB.deposit.itemsCharDisabled = (type(CHARDB.deposit.itemsCharDisabled) == "table") and CHARDB.deposit.itemsCharDisabled or {}
   CHARDB.deposit.disableAcc = (type(CHARDB.deposit.disableAcc) == "table") and CHARDB.deposit.disableAcc or {}
+  CHARDB.deposit.disableRealm = (type(CHARDB.deposit.disableRealm) == "table") and CHARDB.deposit.disableRealm or {}
   CHARDB.deposit.buyItemsChar = (type(CHARDB.deposit.buyItemsChar) == "table") and CHARDB.deposit.buyItemsChar or {}
+  CHARDB.deposit.buyItemsCharDisabled = (type(CHARDB.deposit.buyItemsCharDisabled) == "table") and CHARDB.deposit.buyItemsCharDisabled or {}
   CHARDB.deposit.buyDisableAcc = (type(CHARDB.deposit.buyDisableAcc) == "table") and CHARDB.deposit.buyDisableAcc or {}
+  CHARDB.deposit.buyDisableRealm = (type(CHARDB.deposit.buyDisableRealm) == "table") and CHARDB.deposit.buyDisableRealm or {}
   CHARDB.deposit.sellItemsChar = (type(CHARDB.deposit.sellItemsChar) == "table") and CHARDB.deposit.sellItemsChar or {}
+  CHARDB.deposit.sellItemsCharDisabled = (type(CHARDB.deposit.sellItemsCharDisabled) == "table") and CHARDB.deposit.sellItemsCharDisabled or {}
   CHARDB.deposit.sellDisableAcc = (type(CHARDB.deposit.sellDisableAcc) == "table") and CHARDB.deposit.sellDisableAcc or {}
+  CHARDB.deposit.sellDisableRealm = (type(CHARDB.deposit.sellDisableRealm) == "table") and CHARDB.deposit.sellDisableRealm or {}
   return CHARDB.deposit
 end
 
@@ -413,26 +428,35 @@ local function GetEffectiveDepositItemIDs()
   local acc = DepositCfgAcc()
   local ch = DepositCfgChar()
   local out = {}
+  local rk = GetCurrentRealmKey()
+  local accDisableRealm = (rk ~= "" and type(acc.itemsAccDisableRealm) == "table") and acc.itemsAccDisableRealm[rk] or nil
   for id, on in pairs(acc.itemsAcc or {}) do
     id = tonumber(id)
-    if id and id > 0 and on == true and not (ch.disableAcc and ch.disableAcc[id] == true) then
+    if id and id > 0 and on == true
+      and not (acc.itemsAccDisabled and acc.itemsAccDisabled[id] == true)
+      and not (type(accDisableRealm) == "table" and accDisableRealm[id] == true)
+      and not (ch.disableAcc and ch.disableAcc[id] == true)
+    then
       out[id] = true
     end
   end
   for id, on in pairs(ch.itemsChar or {}) do
     id = tonumber(id)
-    if id and id > 0 and on == true then
+    if id and id > 0 and on == true and not (ch.itemsCharDisabled and ch.itemsCharDisabled[id] == true) then
       out[id] = true
     end
   end
 
   do
-    local realmItems = nil
-    realmItems = (type(acc.itemsRealm) == "table") and acc.itemsRealm[GetCurrentRealmKey()] or nil
+    local realmItems = (type(acc.itemsRealm) == "table") and acc.itemsRealm[rk] or nil
+    local realmDisabled = (type(acc.itemsRealmDisabled) == "table") and acc.itemsRealmDisabled[rk] or nil
     if type(realmItems) == "table" then
       for id, on in pairs(realmItems) do
         id = tonumber(id)
-        if id and id > 0 and on == true then
+        if id and id > 0 and on == true
+          and not (type(realmDisabled) == "table" and realmDisabled[id] == true)
+          and not (ch.disableRealm and ch.disableRealm[id] == true)
+        then
           out[id] = true
         end
       end
@@ -855,15 +879,48 @@ end
 
 local function GetEffectiveTradeRules(mode)
   mode = NormalizeTradeMode(mode)
-  local accTbl, realmTbl, _, charTbl, disableAccTbl = GetScopeStores(mode)
+  local accTbl, realmTbl, realmKey, charTbl, disableAccTbl = GetScopeStores(mode)
   local out = {}
 
-  local function setFrom(tbl, isAccount)
+  local cfg = DepositCfgAcc()
+  local ch = DepositCfgChar()
+
+  local accDisabledTbl = nil
+  local accDisableRealmTbl = nil
+  local realmDisabledTbl = nil
+  local charDisabledTbl = nil
+  local disableRealmTbl = nil
+
+  if mode == "buy" then
+    accDisabledTbl = cfg.buyItemsAccDisabled
+    accDisableRealmTbl = (type(cfg.buyItemsAccDisableRealm) == "table" and realmKey and realmKey ~= "") and cfg.buyItemsAccDisableRealm[realmKey] or nil
+    realmDisabledTbl = (type(cfg.buyItemsRealmDisabled) == "table" and realmKey and realmKey ~= "") and cfg.buyItemsRealmDisabled[realmKey] or nil
+    charDisabledTbl = ch.buyItemsCharDisabled
+    disableRealmTbl = ch.buyDisableRealm
+  elseif mode == "sell" then
+    accDisabledTbl = cfg.sellItemsAccDisabled
+    accDisableRealmTbl = (type(cfg.sellItemsAccDisableRealm) == "table" and realmKey and realmKey ~= "") and cfg.sellItemsAccDisableRealm[realmKey] or nil
+    realmDisabledTbl = (type(cfg.sellItemsRealmDisabled) == "table" and realmKey and realmKey ~= "") and cfg.sellItemsRealmDisabled[realmKey] or nil
+    charDisabledTbl = ch.sellItemsCharDisabled
+    disableRealmTbl = ch.sellDisableRealm
+  else
+    accDisabledTbl = cfg.itemsAccDisabled
+    accDisableRealmTbl = (type(cfg.itemsAccDisableRealm) == "table" and realmKey and realmKey ~= "") and cfg.itemsAccDisableRealm[realmKey] or nil
+    realmDisabledTbl = (type(cfg.itemsRealmDisabled) == "table" and realmKey and realmKey ~= "") and cfg.itemsRealmDisabled[realmKey] or nil
+    charDisabledTbl = ch.itemsCharDisabled
+    disableRealmTbl = ch.disableRealm
+  end
+
+  local function setFrom(tbl, isAccount, isRealm, isChar)
     if type(tbl) ~= "table" then return end
     for id, v in pairs(tbl) do
       id = tonumber(id)
       if id and id > 0 then
-        if isAccount and type(disableAccTbl) == "table" and disableAccTbl[id] == true then
+        if isAccount and ((type(accDisabledTbl) == "table" and accDisabledTbl[id] == true) or (type(accDisableRealmTbl) == "table" and accDisableRealmTbl[id] == true) or (type(disableAccTbl) == "table" and disableAccTbl[id] == true)) then
+          -- skip
+        elseif isRealm and ((type(realmDisabledTbl) == "table" and realmDisabledTbl[id] == true) or (type(disableRealmTbl) == "table" and disableRealmTbl[id] == true)) then
+          -- skip
+        elseif isChar and (type(charDisabledTbl) == "table" and charDisabledTbl[id] == true) then
           -- skip
         else
           if mode == "deposit" then
@@ -882,9 +939,9 @@ local function GetEffectiveTradeRules(mode)
   end
 
   -- Priority: Account -> Realm -> Character
-  setFrom(accTbl, true)
-  setFrom(realmTbl, false)
-  setFrom(charTbl, false)
+  setFrom(accTbl, true, false, false)
+  setFrom(realmTbl, false, true, false)
+  setFrom(charTbl, false, false, true)
   return out
 end
 

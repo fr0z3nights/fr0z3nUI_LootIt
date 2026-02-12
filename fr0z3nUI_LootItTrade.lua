@@ -195,18 +195,21 @@ function LI.Trade.BuildTab(depositPanel)
   btnChar:SetSize(BTN_W, BTN_H)
   btnChar:SetPoint("BOTTOM", depositPanel, "BOTTOM", -(BTN_W + BTN_GAP), ROW_Y)
   btnChar:SetText("Character")
+  if btnChar.RegisterForClicks then btnChar:RegisterForClicks("LeftButtonUp", "RightButtonUp") end
   btnChar:Disable()
 
   local btnRealm = CreateFrame("Button", nil, depositPanel, "UIPanelButtonTemplate")
   btnRealm:SetSize(BTN_W, BTN_H)
   btnRealm:SetPoint("BOTTOM", depositPanel, "BOTTOM", (BTN_W + BTN_GAP), ROW_Y)
   btnRealm:SetText("Realm")
+  if btnRealm.RegisterForClicks then btnRealm:RegisterForClicks("LeftButtonUp", "RightButtonUp") end
   btnRealm:Disable()
 
   local btnAcc = CreateFrame("Button", nil, depositPanel, "UIPanelButtonTemplate")
   btnAcc:SetSize(BTN_W, BTN_H)
   btnAcc:SetPoint("BOTTOM", depositPanel, "BOTTOM", 0, ROW_Y)
   btnAcc:SetText("Account")
+  if btnAcc.RegisterForClicks then btnAcc:RegisterForClicks("LeftButtonUp", "RightButtonUp") end
   btnAcc:Disable()
 
   local bankBtn = CreateFrame("Button", nil, depositPanel, "UIPanelButtonTemplate")
@@ -251,13 +254,18 @@ function LI.Trade.BuildTab(depositPanel)
   restockBtn:SetText("Restock")
   restockBtn:Hide()
 
-  local function SetButtonState(btn, label, isDisabled)
+  local function SetButtonColor(btn, label, state)
     if not btn then return end
-    if isDisabled then
-      btn:SetText("|cffffff00" .. label .. "|r")
-    else
-      btn:SetText("|cffff0000" .. label .. "|r")
+    local s = tostring(state or "inactive")
+    if s == "active" then
+      btn:SetText("|cff00ff00" .. label .. "|r")
+      return
     end
+    if s == "disabled" then
+      btn:SetText("|cffffa500" .. label .. "|r")
+      return
+    end
+    btn:SetText("|cffffff00" .. label .. "|r")
   end
 
   local function Tip(frame, title, line1, line2)
@@ -279,6 +287,26 @@ function LI.Trade.BuildTab(depositPanel)
   Tip(guildTabBtn, "Guild Tab", "Current / Tab 1..8", "Disabled on Warbank")
   Tip(targetBox, "Target (bags)", "Buy: buy up to target", "Sell: sell down to target (0 = sell all)")
   Tip(restockBtn, "Restock", "When enabled: also sells low-level food (<= player-10)", "Matching food is grouped by tooltip Use: lines")
+
+  local function SetDynamicTip(frame, get)
+    if not (frame and frame.SetScript) then return end
+    frame:SetScript("OnEnter", function(self)
+      if not (GameTooltip and GameTooltip.SetOwner and GameTooltip.SetText) then return end
+      local title, line1, line2, line3 = nil, nil, nil, nil
+      if type(get) == "function" then
+        title, line1, line2, line3 = get()
+      end
+      GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+      GameTooltip:SetText(title or "")
+      if line1 then GameTooltip:AddLine(line1, 0.85, 0.85, 0.85, true) end
+      if line2 then GameTooltip:AddLine(line2, 0.85, 0.85, 0.85, true) end
+      if line3 then GameTooltip:AddLine(line3, 0.85, 0.85, 0.85, true) end
+      GameTooltip:Show()
+    end)
+    frame:SetScript("OnLeave", function()
+      if GameTooltip and GameTooltip.Hide then GameTooltip:Hide() end
+    end)
+  end
 
   local function GetItemNameSafe(id)
     id = tonumber(id)
@@ -427,20 +455,71 @@ function LI.Trade.BuildTab(depositPanel)
     return cfg.itemsRealm[rk], rk
   end
 
+  local function EnsureAccDisableRealmTable(cfg, mode)
+    local rk = GetCurrentRealmKey()
+    if rk == "" then return nil, nil end
+
+    if mode == "buy" then
+      cfg.buyItemsAccDisableRealm = (type(cfg.buyItemsAccDisableRealm) == "table") and cfg.buyItemsAccDisableRealm or {}
+      cfg.buyItemsAccDisableRealm[rk] = (type(cfg.buyItemsAccDisableRealm[rk]) == "table") and cfg.buyItemsAccDisableRealm[rk] or {}
+      return cfg.buyItemsAccDisableRealm[rk], rk
+    end
+    if mode == "sell" then
+      cfg.sellItemsAccDisableRealm = (type(cfg.sellItemsAccDisableRealm) == "table") and cfg.sellItemsAccDisableRealm or {}
+      cfg.sellItemsAccDisableRealm[rk] = (type(cfg.sellItemsAccDisableRealm[rk]) == "table") and cfg.sellItemsAccDisableRealm[rk] or {}
+      return cfg.sellItemsAccDisableRealm[rk], rk
+    end
+
+    cfg.itemsAccDisableRealm = (type(cfg.itemsAccDisableRealm) == "table") and cfg.itemsAccDisableRealm or {}
+    cfg.itemsAccDisableRealm[rk] = (type(cfg.itemsAccDisableRealm[rk]) == "table") and cfg.itemsAccDisableRealm[rk] or {}
+    return cfg.itemsAccDisableRealm[rk], rk
+  end
+
+  local function EnsureRealmDisabledTable(cfg, mode)
+    local rk = GetCurrentRealmKey()
+    if rk == "" then return nil, nil end
+
+    if mode == "buy" then
+      cfg.buyItemsRealmDisabled = (type(cfg.buyItemsRealmDisabled) == "table") and cfg.buyItemsRealmDisabled or {}
+      cfg.buyItemsRealmDisabled[rk] = (type(cfg.buyItemsRealmDisabled[rk]) == "table") and cfg.buyItemsRealmDisabled[rk] or {}
+      return cfg.buyItemsRealmDisabled[rk], rk
+    end
+    if mode == "sell" then
+      cfg.sellItemsRealmDisabled = (type(cfg.sellItemsRealmDisabled) == "table") and cfg.sellItemsRealmDisabled or {}
+      cfg.sellItemsRealmDisabled[rk] = (type(cfg.sellItemsRealmDisabled[rk]) == "table") and cfg.sellItemsRealmDisabled[rk] or {}
+      return cfg.sellItemsRealmDisabled[rk], rk
+    end
+
+    cfg.itemsRealmDisabled = (type(cfg.itemsRealmDisabled) == "table") and cfg.itemsRealmDisabled or {}
+    cfg.itemsRealmDisabled[rk] = (type(cfg.itemsRealmDisabled[rk]) == "table") and cfg.itemsRealmDisabled[rk] or {}
+    return cfg.itemsRealmDisabled[rk], rk
+  end
+
   local function GetScopeStores(mode)
     local cfg = DepositCfgAcc()
     local ch = DepositCfgChar()
     local realmTbl, realmKey = EnsureRealmRuleTable(cfg, mode)
+    local accDisableRealmTbl = nil
+    local realmDisabledTbl = nil
+    if realmKey and realmKey ~= "" then
+      accDisableRealmTbl = EnsureAccDisableRealmTable(cfg, mode)
+      realmDisabledTbl = EnsureRealmDisabledTable(cfg, mode)
+    end
 
     if mode == "buy" then
       return {
         cfg = cfg,
         ch = ch,
         accTbl = cfg.buyItemsAcc,
+        accDisabledTbl = cfg.buyItemsAccDisabled,
+        accDisableRealmTbl = accDisableRealmTbl,
         realmTbl = realmTbl,
         realmKey = realmKey,
+        realmDisabledTbl = realmDisabledTbl,
         charTbl = ch.buyItemsChar,
+        charDisabledTbl = ch.buyItemsCharDisabled,
         disableAccTbl = ch.buyDisableAcc,
+        disableRealmTbl = ch.buyDisableRealm,
       }
     end
     if mode == "sell" then
@@ -448,10 +527,15 @@ function LI.Trade.BuildTab(depositPanel)
         cfg = cfg,
         ch = ch,
         accTbl = cfg.sellItemsAcc,
+        accDisabledTbl = cfg.sellItemsAccDisabled,
+        accDisableRealmTbl = accDisableRealmTbl,
         realmTbl = realmTbl,
         realmKey = realmKey,
+        realmDisabledTbl = realmDisabledTbl,
         charTbl = ch.sellItemsChar,
+        charDisabledTbl = ch.sellItemsCharDisabled,
         disableAccTbl = ch.sellDisableAcc,
+        disableRealmTbl = ch.sellDisableRealm,
       }
     end
 
@@ -459,16 +543,24 @@ function LI.Trade.BuildTab(depositPanel)
       cfg = cfg,
       ch = ch,
       accTbl = cfg.itemsAcc,
+      accDisabledTbl = cfg.itemsAccDisabled,
+      accDisableRealmTbl = accDisableRealmTbl,
       realmTbl = realmTbl,
       realmKey = realmKey,
+      realmDisabledTbl = realmDisabledTbl,
       charTbl = ch.itemsChar,
+      charDisabledTbl = ch.itemsCharDisabled,
       disableAccTbl = ch.disableAcc,
+      disableRealmTbl = ch.disableRealm,
     }
   end
 
   local function UpdateScopeButtons(id)
+    depositPanel._liScopeID = id
+
     local mode = GetTradeMode()
     local stores = GetScopeStores(mode)
+
     id = tonumber(id)
     if not id or id <= 0 then
       btnAcc:Disable()
@@ -488,29 +580,33 @@ function LI.Trade.BuildTab(depositPanel)
       btnRealm:Disable()
     end
 
-    local inAcc = false
-    local accDisabledOnChar = false
-    local inChar = false
-    local inRealm = false
+    local function HasRule(tbl)
+      if mode == "deposit" then
+        return (type(tbl) == "table" and tbl[id] == true) and true or false
+      end
+      return (NormalizeRule(type(tbl) == "table" and tbl[id]) ~= nil)
+    end
+
+    local hasAccRule = HasRule(stores.accTbl)
+    local hasCharRule = HasRule(stores.charTbl)
+    local hasRealmRule = (stores.realmKey and stores.realmKey ~= "") and HasRule(stores.realmTbl) or false
+
+    local accDisabled = (type(stores.accDisabledTbl) == "table" and stores.accDisabledTbl[id] == true) and true or false
+    local accDisabledOnRealm = (type(stores.accDisableRealmTbl) == "table" and stores.accDisableRealmTbl[id] == true) and true or false
+    local accDisabledOnChar = (type(stores.disableAccTbl) == "table" and stores.disableAccTbl[id] == true) and true or false
+
+    local realmDisabled = (type(stores.realmDisabledTbl) == "table" and stores.realmDisabledTbl[id] == true) and true or false
+    local realmDisabledOnChar = (type(stores.disableRealmTbl) == "table" and stores.disableRealmTbl[id] == true) and true or false
+
+    local charDisabled = (type(stores.charDisabledTbl) == "table" and stores.charDisabledTbl[id] == true) and true or false
+
     local restockOn = false
-
-    if mode == "deposit" then
-      inAcc = (stores.accTbl and stores.accTbl[id] == true) and true or false
-      accDisabledOnChar = (stores.disableAccTbl and stores.disableAccTbl[id] == true) and true or false
-      inChar = (stores.charTbl and stores.charTbl[id] == true) and true or false
-      inRealm = (type(stores.realmTbl) == "table" and stores.realmTbl[id] == true) and true or false
-    else
-      inAcc = (NormalizeRule(stores.accTbl and stores.accTbl[id]) ~= nil)
-      accDisabledOnChar = (stores.disableAccTbl and stores.disableAccTbl[id] == true) and true or false
-      inChar = (NormalizeRule(stores.charTbl and stores.charTbl[id]) ~= nil)
-      inRealm = (NormalizeRule(type(stores.realmTbl) == "table" and stores.realmTbl[id]) ~= nil)
-
-      local rAcc = NormalizeRule(stores.accTbl and stores.accTbl[id])
-      local rChar = NormalizeRule(stores.charTbl and stores.charTbl[id])
+    if mode ~= "deposit" then
+      local rAcc = NormalizeRule(type(stores.accTbl) == "table" and stores.accTbl[id])
+      local rChar = NormalizeRule(type(stores.charTbl) == "table" and stores.charTbl[id])
       local rRealm = NormalizeRule(type(stores.realmTbl) == "table" and stores.realmTbl[id])
       restockOn = ((rAcc and rAcc.restock) or (rChar and rChar.restock) or (rRealm and rRealm.restock)) and true or false
-
-      if (not inAcc) and (not inChar) and (not inRealm) then
+      if (not hasAccRule) and (not hasCharRule) and (not hasRealmRule) then
         restockOn = (depositPanel._pendingRestockID == id and depositPanel._pendingRestock == true) and true or false
       end
     end
@@ -521,9 +617,9 @@ function LI.Trade.BuildTab(depositPanel)
 
     if flags.warbound and bankTarget ~= "warbank" then
       stores.cfg.target = "warbank"
-      bankTarget = "warbank"
       if RefreshBankAndTabButtons then RefreshBankAndTabButtons() end
     end
+
     local canAdd = true
     do
       local warnLines = {}
@@ -545,23 +641,109 @@ function LI.Trade.BuildTab(depositPanel)
       for i = 1, #warnLines do
         lines[#lines + 1] = "|cffffa500" .. warnLines[i] .. "|r"
       end
-      if mode == "deposit" then
-        if inAcc or inChar or inRealm then
-          lines[#lines + 1] = "|cffaaaaaaAccount: Red=disable on this character, Yellow=enable, Right-click=remove. Realm: Red=remove. Character: Red=remove.|r"
-        end
-      else
-        local tgt = tonumber(targetBox:GetText() or "")
-        if tgt ~= nil then
-          lines[#lines + 1] = "|cffaaaaaaTarget (bags): " .. tostring(math.floor(tgt)) .. "|r"
-        end
-        if inAcc or inChar or inRealm then
-          lines[#lines + 1] = "|cffaaaaaaAccount: Red=disable on this character, Yellow=enable, Right-click=remove. Realm: Red=remove. Character: Red=remove.|r"
-        end
-      end
       reasonLabel:SetText(table.concat(lines, "\n"))
     end
 
-    if (not inAcc) and (not inChar) and (not inRealm) and (canAdd == false) then
+    local function RequireTargetCount()
+      local n = tonumber(targetBox:GetText() or "")
+      n = (n ~= nil) and math.floor(n) or nil
+      if mode == "buy" and (not n or n <= 0) then
+        Print("Target must be > 0 for Buy.")
+        return nil
+      end
+      if not n or n < 0 then
+        Print("Enter a target count first.")
+        return nil
+      end
+      return n
+    end
+
+    local function AddRule(tbl)
+      if mode == "deposit" then
+        tbl[id] = true
+        return true
+      end
+      local n = RequireTargetCount()
+      if n == nil then return false end
+      tbl[id] = { count = n, restock = restockOn and true or false }
+      return true
+    end
+
+    local function RemoveRule(tbl)
+      if type(tbl) ~= "table" then return end
+      tbl[id] = nil
+    end
+
+    local function ClearPerID(t)
+      if type(t) == "table" then t[id] = nil end
+    end
+
+    local function EnsureTable(t)
+      return (type(t) == "table") and t or {}
+    end
+
+    local function RemoveAccountRuleAndDisables(st)
+      RemoveRule(st.accTbl)
+      ClearPerID(st.accDisabledTbl)
+      ClearPerID(st.accDisableRealmTbl)
+      ClearPerID(st.disableAccTbl)
+    end
+
+    local function RemoveRealmRuleAndDisables(st)
+      RemoveRule(st.realmTbl)
+      ClearPerID(st.realmDisabledTbl)
+      ClearPerID(st.disableRealmTbl)
+    end
+
+    local function RemoveCharRuleAndDisables(st)
+      RemoveRule(st.charTbl)
+      ClearPerID(st.charDisabledTbl)
+    end
+
+    local function GetAccState()
+      if not hasAccRule then return "inactive" end
+      return accDisabled and "disabled" or "active"
+    end
+
+    local function GetRealmState()
+      if hasRealmRule then
+        return realmDisabled and "disabled" or "active"
+      end
+      if hasAccRule and not accDisabled then
+        return accDisabledOnRealm and "disabled" or "active"
+      end
+      return "inactive"
+    end
+
+    local function GetCharState()
+      if hasCharRule then
+        return charDisabled and "disabled" or "active"
+      end
+      if hasAccRule and not accDisabled then
+        return accDisabledOnChar and "disabled" or "active"
+      end
+      if hasRealmRule and not realmDisabled then
+        return realmDisabledOnChar and "disabled" or "active"
+      end
+      return "inactive"
+    end
+
+    local function GetEffectiveSource()
+      if hasAccRule and not accDisabled and not accDisabledOnRealm and not accDisabledOnChar then
+        return "acc"
+      end
+      if hasRealmRule and not realmDisabled and not realmDisabledOnChar then
+        return "realm"
+      end
+      if hasCharRule and not charDisabled then
+        return "char"
+      end
+      return nil
+    end
+
+    local effectiveSource = GetEffectiveSource()
+
+    if (not hasAccRule) and (not hasCharRule) and (not hasRealmRule) and (canAdd == false) then
       btnAcc:Disable()
       btnChar:Disable()
       if stores.realmKey and stores.realmKey ~= "" then
@@ -569,125 +751,260 @@ function LI.Trade.BuildTab(depositPanel)
       end
     end
 
-    if inAcc then
-      SetButtonState(btnAcc, "Account", accDisabledOnChar)
-      btnAcc:SetScript("OnClick", function(_, button)
-        local mode2 = GetTradeMode()
-        local stores2 = GetScopeStores(mode2)
-        if button == "RightButton" then
-          stores2.accTbl[id] = nil
-          if stores2.disableAccTbl then stores2.disableAccTbl[id] = nil end
-          Print("Removed from Account " .. mode2 .. " list: " .. (GetItemNameSafe(id) or tostring(id)))
+    SetButtonColor(btnAcc, "Account", GetAccState())
+    SetButtonColor(btnRealm, "Realm", GetRealmState())
+    SetButtonColor(btnChar, "Character", GetCharState())
+
+    btnChar:SetScript("OnClick", function(_, mouseButton)
+      local st = GetScopeStores(GetTradeMode())
+
+      if hasCharRule then
+        if mouseButton == "RightButton" then
+          RemoveCharRuleAndDisables(st)
+          Print("Removed from Character " .. GetTradeMode() .. " list: " .. (GetItemNameSafe(id) or tostring(id)))
         else
-          stores2.disableAccTbl = (type(stores2.disableAccTbl) == "table") and stores2.disableAccTbl or {}
-          if stores2.disableAccTbl[id] == true then
-            stores2.disableAccTbl[id] = nil
+          st.charDisabledTbl = EnsureTable(st.charDisabledTbl)
+          if st.charDisabledTbl[id] == true then
+            st.charDisabledTbl[id] = nil
             Print("Enabled on this character: " .. (GetItemNameSafe(id) or tostring(id)))
           else
-            stores2.disableAccTbl[id] = true
+            st.charDisabledTbl[id] = true
             Print("Disabled on this character: " .. (GetItemNameSafe(id) or tostring(id)))
           end
         end
         UpdateScopeButtons(id)
-      end)
-    else
-      btnAcc:SetText("Account")
-      btnAcc:SetScript("OnClick", function()
-        local mode2 = GetTradeMode()
-        local stores2 = GetScopeStores(mode2)
-        if mode2 == "deposit" then
-          stores2.accTbl[id] = true
-          if stores2.disableAccTbl then stores2.disableAccTbl[id] = nil end
-          Print("Added to Account deposit list: " .. (GetItemNameSafe(id) or tostring(id)))
-        else
-          local n = tonumber(targetBox:GetText() or "")
-          n = (n ~= nil) and math.floor(n) or nil
-          if mode2 == "buy" and (not n or n <= 0) then
-            Print("Enter a target count first.")
-            return
-          end
-          if not n or n < 0 then
-            Print("Enter a target count first.")
-            return
-          end
-          stores2.accTbl[id] = { count = n, restock = restockOn and true or false }
-          if stores2.disableAccTbl then stores2.disableAccTbl[id] = nil end
-          Print("Added to Account " .. mode2 .. " list: " .. (GetItemNameSafe(id) or tostring(id)) .. " (" .. tostring(n) .. ")")
-        end
-        UpdateScopeButtons(id)
-      end)
-    end
+        return
+      end
 
-    if inChar then
-      SetButtonState(btnChar, "Character", false)
-      btnChar:SetScript("OnClick", function()
-        local mode2 = GetTradeMode()
-        local stores2 = GetScopeStores(mode2)
-        stores2.charTbl[id] = nil
-        Print("Removed from Character " .. mode2 .. " list: " .. (GetItemNameSafe(id) or tostring(id)))
-        UpdateScopeButtons(id)
-      end)
-    else
-      btnChar:SetText("Character")
-      btnChar:SetScript("OnClick", function()
-        local mode2 = GetTradeMode()
-        local stores2 = GetScopeStores(mode2)
-        if mode2 == "deposit" then
-          stores2.charTbl[id] = true
-          Print("Added to Character deposit list: " .. (GetItemNameSafe(id) or tostring(id)))
+      if hasAccRule and not accDisabled then
+        st.disableAccTbl = EnsureTable(st.disableAccTbl)
+        if st.disableAccTbl[id] == true then
+          st.disableAccTbl[id] = nil
+          Print("Enabled on this character: " .. (GetItemNameSafe(id) or tostring(id)))
         else
-          local n = tonumber(targetBox:GetText() or "")
-          n = (n ~= nil) and math.floor(n) or nil
-          if mode2 == "buy" and (not n or n <= 0) then
-            Print("Enter a target count first.")
-            return
-          end
-          if not n or n < 0 then
-            Print("Enter a target count first.")
-            return
-          end
-          stores2.charTbl[id] = { count = n, restock = restockOn and true or false }
-          Print("Added to Character " .. mode2 .. " list: " .. (GetItemNameSafe(id) or tostring(id)) .. " (" .. tostring(n) .. ")")
+          st.disableAccTbl[id] = true
+          Print("Disabled on this character: " .. (GetItemNameSafe(id) or tostring(id)))
         end
         UpdateScopeButtons(id)
-      end)
-    end
+        return
+      end
 
-    if inRealm then
-      SetButtonState(btnRealm, "Realm", false)
-      btnRealm:SetScript("OnClick", function()
-        local mode2 = GetTradeMode()
-        local stores2 = GetScopeStores(mode2)
-        if not (stores2.realmTbl and stores2.realmKey and stores2.realmKey ~= "") then return end
-        stores2.realmTbl[id] = nil
-        Print("Removed from Realm " .. mode2 .. " list: " .. (GetItemNameSafe(id) or tostring(id)))
-        UpdateScopeButtons(id)
-      end)
-    else
-      btnRealm:SetText("Realm")
-      btnRealm:SetScript("OnClick", function()
-        local mode2 = GetTradeMode()
-        local stores2 = GetScopeStores(mode2)
-        if not (stores2.realmTbl and stores2.realmKey and stores2.realmKey ~= "") then return end
-        if mode2 == "deposit" then
-          stores2.realmTbl[id] = true
-          Print("Added to Realm deposit list: " .. (GetItemNameSafe(id) or tostring(id)))
+      if hasRealmRule and not realmDisabled then
+        st.disableRealmTbl = EnsureTable(st.disableRealmTbl)
+        if st.disableRealmTbl[id] == true then
+          st.disableRealmTbl[id] = nil
+          Print("Enabled on this character: " .. (GetItemNameSafe(id) or tostring(id)))
         else
-          local n = tonumber(targetBox:GetText() or "")
-          n = (n ~= nil) and math.floor(n) or nil
-          if mode2 == "buy" and (not n or n <= 0) then
-            Print("Enter a target count first.")
-            return
-          end
-          if not n or n < 0 then
-            Print("Enter a target count first.")
-            return
-          end
-          stores2.realmTbl[id] = { count = n, restock = restockOn and true or false }
-          Print("Added to Realm " .. mode2 .. " list: " .. (GetItemNameSafe(id) or tostring(id)) .. " (" .. tostring(n) .. ")")
+          st.disableRealmTbl[id] = true
+          Print("Disabled on this character: " .. (GetItemNameSafe(id) or tostring(id)))
         end
         UpdateScopeButtons(id)
-      end)
+        return
+      end
+
+      if canAdd == false then
+        UpdateScopeButtons(id)
+        return
+      end
+
+      st.charTbl = EnsureTable(st.charTbl)
+      if not AddRule(st.charTbl) then
+        UpdateScopeButtons(id)
+        return
+      end
+      Print("Added to Character " .. GetTradeMode() .. " list: " .. (GetItemNameSafe(id) or tostring(id)))
+      UpdateScopeButtons(id)
+    end)
+
+    btnAcc:SetScript("OnClick", function(_, mouseButton)
+      local st = GetScopeStores(GetTradeMode())
+
+      if hasAccRule then
+        if mouseButton == "RightButton" then
+          RemoveAccountRuleAndDisables(st)
+          Print("Removed from Account " .. GetTradeMode() .. " list: " .. (GetItemNameSafe(id) or tostring(id)))
+        else
+          st.accDisabledTbl = EnsureTable(st.accDisabledTbl)
+          if st.accDisabledTbl[id] == true then
+            st.accDisabledTbl[id] = nil
+            Print("Enabled account-wide: " .. (GetItemNameSafe(id) or tostring(id)))
+          else
+            st.accDisabledTbl[id] = true
+            Print("Disabled account-wide: " .. (GetItemNameSafe(id) or tostring(id)))
+          end
+        end
+        UpdateScopeButtons(id)
+        return
+      end
+
+      if hasRealmRule then
+        RemoveRealmRuleAndDisables(st)
+      end
+      if hasCharRule then
+        RemoveCharRuleAndDisables(st)
+      end
+
+      if canAdd == false then
+        UpdateScopeButtons(id)
+        return
+      end
+
+      st.accTbl = EnsureTable(st.accTbl)
+      if not AddRule(st.accTbl) then
+        UpdateScopeButtons(id)
+        return
+      end
+
+      ClearPerID(st.accDisabledTbl)
+      ClearPerID(st.accDisableRealmTbl)
+      ClearPerID(st.disableAccTbl)
+      Print("Added to Account " .. GetTradeMode() .. " list: " .. (GetItemNameSafe(id) or tostring(id)))
+      UpdateScopeButtons(id)
+    end)
+
+    btnRealm:SetScript("OnClick", function(_, mouseButton)
+      local st = GetScopeStores(GetTradeMode())
+      if not (st.realmKey and st.realmKey ~= "") then return end
+
+      if hasRealmRule then
+        if mouseButton == "RightButton" then
+          RemoveRealmRuleAndDisables(st)
+          Print("Removed from Realm " .. GetTradeMode() .. " list: " .. (GetItemNameSafe(id) or tostring(id)))
+        else
+          st.realmDisabledTbl = EnsureTable(st.realmDisabledTbl)
+          if st.realmDisabledTbl[id] == true then
+            st.realmDisabledTbl[id] = nil
+            Print("Enabled on this realm: " .. (GetItemNameSafe(id) or tostring(id)))
+          else
+            st.realmDisabledTbl[id] = true
+            Print("Disabled on this realm: " .. (GetItemNameSafe(id) or tostring(id)))
+          end
+        end
+        UpdateScopeButtons(id)
+        return
+      end
+
+      if hasAccRule and not accDisabled then
+        st.accDisableRealmTbl = EnsureTable(st.accDisableRealmTbl)
+        if st.accDisableRealmTbl[id] == true then
+          st.accDisableRealmTbl[id] = nil
+          Print("Enabled on this realm: " .. (GetItemNameSafe(id) or tostring(id)))
+        else
+          st.accDisableRealmTbl[id] = true
+          Print("Disabled on this realm: " .. (GetItemNameSafe(id) or tostring(id)))
+        end
+        UpdateScopeButtons(id)
+        return
+      end
+
+      if hasCharRule then
+        RemoveCharRuleAndDisables(st)
+      end
+
+      if canAdd == false then
+        UpdateScopeButtons(id)
+        return
+      end
+
+      st.realmTbl = EnsureTable(st.realmTbl)
+      if not AddRule(st.realmTbl) then
+        UpdateScopeButtons(id)
+        return
+      end
+
+      ClearPerID(st.realmDisabledTbl)
+      ClearPerID(st.disableRealmTbl)
+      Print("Added to Realm " .. GetTradeMode() .. " list: " .. (GetItemNameSafe(id) or tostring(id)))
+      UpdateScopeButtons(id)
+    end)
+
+    SetDynamicTip(btnAcc, function()
+      local st = GetScopeStores(GetTradeMode())
+      local curID = tonumber(depositPanel._liScopeID)
+      if not curID or curID <= 0 then
+        return "Account", "Enter an ItemID first."
+      end
+
+      local aState = GetAccState()
+      if aState == "inactive" then
+        if hasCharRule or hasRealmRule then
+          return "Account (Inactive)", "Left-click: convert to Account-wide", "(Moves from Character/Realm to Account)"
+        end
+        return "Account (Inactive)", "Left-click: add Account-wide"
+      end
+      if aState == "disabled" then
+        return "Account (Disabled)", "Left-click: re-enable Account-wide", "Right-click: remove (back to Inactive)"
+      end
+      return "Account (Active)", "Left-click: disable Account-wide", "Click Character: disable on this character", "Click Realm: disable on this realm"
+    end)
+
+    SetDynamicTip(btnRealm, function()
+      local curID = tonumber(depositPanel._liScopeID)
+      if not curID or curID <= 0 then
+        return "Realm", "Enter an ItemID first."
+      end
+
+      if hasRealmRule then
+        local rState = GetRealmState()
+        if rState == "disabled" then
+          return "Realm (Disabled)", "Left-click: re-enable on this realm", "Right-click: remove from Realm"
+        end
+        return "Realm (Active)", "Left-click: disable on this realm", "Right-click: remove from Realm"
+      end
+
+      if hasAccRule and not accDisabled then
+        if accDisabledOnRealm then
+          return "Realm (Disabled)", "Account rule is disabled on this realm", "Left-click: re-enable on this realm"
+        end
+        return "Realm (Active)", "Account rule is active on this realm", "Left-click: disable on this realm"
+      end
+
+      if hasCharRule then
+        return "Realm (Inactive)", "Left-click: move to Realm (this realm)", "(Removes from Character)"
+      end
+      return "Realm (Inactive)", "Left-click: add for this realm"
+    end)
+
+    SetDynamicTip(btnChar, function()
+      local curID = tonumber(depositPanel._liScopeID)
+      if not curID or curID <= 0 then
+        return "Character", "Enter an ItemID first."
+      end
+
+      if hasCharRule then
+        local cState = GetCharState()
+        if cState == "disabled" then
+          return "Character (Disabled)", "Left-click: re-enable on this character", "Right-click: remove from Character"
+        end
+        return "Character (Active)", "Left-click: disable on this character", "Right-click: remove from Character"
+      end
+
+      if hasAccRule and not accDisabled then
+        if accDisabledOnChar then
+          return "Character (Disabled)", "Account rule is disabled on this character", "Left-click: re-enable on this character"
+        end
+        return "Character (Active)", "Account rule is active on this character", "Left-click: disable on this character"
+      end
+
+      if hasRealmRule and not realmDisabled then
+        if realmDisabledOnChar then
+          return "Character (Disabled)", "Realm rule is disabled on this character", "Left-click: re-enable on this character"
+        end
+        return "Character (Active)", "Realm rule is active on this character", "Left-click: disable on this character"
+      end
+
+      if hasRealmRule and realmDisabled then
+        return "Character (Inactive)", "Realm rule exists but is disabled", "Re-enable Realm first"
+      end
+      if hasAccRule and accDisabled then
+        return "Character (Inactive)", "Account rule exists but is disabled", "Re-enable Account first"
+      end
+      return "Character (Inactive)", "Left-click: add for this character"
+    end)
+
+    if effectiveSource == "char" then
+      -- Character scope active: clicking Account/Realm moves the rule.
+      -- (Move behavior is implemented in those buttons' click handlers.)
     end
 
     restockBtn:Enable()
@@ -705,9 +1022,46 @@ function LI.Trade.BuildTab(depositPanel)
     return t
   end
 
+  local function IsGuildBankOpen()
+    local f = _G and rawget(_G, "GuildBankFrame")
+    if f and f.IsShown and f:IsShown() then
+      return true
+    end
+    return false
+  end
+
+  local _warbankInteractionOpen = false
+
+  local function IsWarbankOpen()
+    if _warbankInteractionOpen then
+      return true
+    end
+
+    local candidates = {
+      "AccountBankFrame",
+      "AccountBankPanel",
+      "WarbandBankFrame",
+      "WarbandBankPanel",
+    }
+
+    for i = 1, #candidates do
+      local f = _G and rawget(_G, candidates[i])
+      if f and f.IsShown and f:IsShown() then
+        return true
+      end
+    end
+    return false
+  end
+
   RefreshBankAndTabButtons = function()
     local cfg = DepositCfgAcc()
-    cfg.target = NormalizeBankTarget(cfg.target)
+    local t = NormalizeBankTarget(cfg.target)
+    if t == "guild" and not IsGuildBankOpen() then
+      t = "bank"
+    elseif t == "warbank" and not IsWarbankOpen() then
+      t = "bank"
+    end
+    cfg.target = t
 
     if cfg.target == "guild" then
       bankBtn:SetText("Guild")
@@ -735,6 +1089,34 @@ function LI.Trade.BuildTab(depositPanel)
     if v > 8 then v = 8 end
     v = math.floor(v)
     guildTabBtn:SetText((v <= 0) and "Current" or ("Tab " .. tostring(v)))
+  end
+
+  do
+    if depositPanel and not depositPanel._liTradeBankEvents then
+      local ev = CreateFrame("Frame")
+      depositPanel._liTradeBankEvents = ev
+
+      ev:RegisterEvent("BANKFRAME_OPENED")
+      ev:RegisterEvent("BANKFRAME_CLOSED")
+      ev:RegisterEvent("GUILDBANKFRAME_OPENED")
+      ev:RegisterEvent("GUILDBANKFRAME_CLOSED")
+      ev:RegisterEvent("PLAYER_INTERACTION_MANAGER_FRAME_SHOW")
+      ev:RegisterEvent("PLAYER_INTERACTION_MANAGER_FRAME_HIDE")
+
+      ev:SetScript("OnEvent", function(_, event, arg1)
+        if event == "PLAYER_INTERACTION_MANAGER_FRAME_SHOW" or event == "PLAYER_INTERACTION_MANAGER_FRAME_HIDE" then
+          local it = (Enum and Enum.PlayerInteractionType) and Enum.PlayerInteractionType or nil
+          local isAccountBanker = (it and it.AccountBanker and arg1 == it.AccountBanker) and true or false
+          if isAccountBanker then
+            _warbankInteractionOpen = (event == "PLAYER_INTERACTION_MANAGER_FRAME_SHOW")
+          end
+        end
+
+        if RefreshBankAndTabButtons then
+          RefreshBankAndTabButtons()
+        end
+      end)
+    end
   end
 
   bankBtn:SetScript("OnClick", function()
