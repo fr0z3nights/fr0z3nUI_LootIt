@@ -33,6 +33,7 @@ function UIV.Handle(msg)
   local LootCombineEnabled = e.LootCombineEnabled
   local IsEnabled = e.IsEnabled
   local CaptureAppend = e.CaptureAppend
+  local DebugSellOldFoodAtMerchant = e.DebugSellOldFoodAtMerchant
 
   msg = tostring(msg or "")
   local cmd, rest = msg:match("^(%S+)%s*(.-)$")
@@ -90,6 +91,31 @@ function UIV.Handle(msg)
   if cmd == "deposit" then
     -- Macro friendly: only does something when bank UI is open.
     SafeCall(RunDeposit, nil)
+    return
+  end
+
+  if cmd == "food" then
+    local sub = tostring(rest or "")
+    local subCmd = sub:match("^(%S+)")
+    subCmd = (subCmd and subCmd:lower()) or ""
+
+    local diff = (DB and DB.deposit and tonumber(DB.deposit.sellFoodLevelDiff)) or 10
+    diff = diff and math.floor(diff) or 10
+    if diff < 1 then diff = 1 end
+    if diff > 80 then diff = 80 end
+
+    local onAcc = (DB and DB.deposit and DB.deposit.sellFoodEnabledAcc == true) and true or false
+    local onChar = (CHARDB and CHARDB.deposit and CHARDB.deposit.sellFoodEnabledChar == true) and true or false
+    local effective = onAcc or onChar
+    local state = onAcc and "On Acc" or (onChar and "On" or "Off")
+
+    if subCmd == "debug" then
+      SafeCall(DebugSellOldFoodAtMerchant, diff, 30)
+      return
+    end
+
+    SafeCall(Print, string.format("Food selling: %s (effective=%s, diff=%d)", state, tostring(effective), diff))
+    SafeCall(Print, "Run: /fli food debug (prints why items are skipped)")
     return
   end
 

@@ -144,6 +144,9 @@ local DEFAULTS = {
     guildTab = 0, -- legacy fallback; 0=current tab; 1..8 specific tab
     guildTabByRealm = {}, -- [realm] = 0..8
     showButton = true,
+    sellFoodEnabled = false,
+    sellFoodEnabledAcc = false,
+    sellFoodLevelDiff = 10,
     itemsAcc = {}, -- [itemID] = true
     itemsRealm = {}, -- [realm] = { [itemID] = true }
 
@@ -210,9 +213,27 @@ local function EnsureDB()
   if type(DB.deposit.buyItemsRealm) ~= "table" then DB.deposit.buyItemsRealm = {} end
   if type(DB.deposit.sellItemsAcc) ~= "table" then DB.deposit.sellItemsAcc = {} end
   if type(DB.deposit.sellItemsRealm) ~= "table" then DB.deposit.sellItemsRealm = {} end
+  if DB.deposit.sellFoodEnabled == nil then DB.deposit.sellFoodEnabled = false end
+  if DB.deposit.sellFoodEnabledAcc == nil then
+    -- Migration: older builds only had DB.deposit.sellFoodEnabled.
+    DB.deposit.sellFoodEnabledAcc = (DB.deposit.sellFoodEnabled == true) and true or false
+  end
+  if DB.deposit.sellFoodLevelDiff == nil then DB.deposit.sellFoodLevelDiff = 10 end
   if DB.deposit.target == nil then DB.deposit.target = "bank" end
   if DB.deposit.guildTab == nil then DB.deposit.guildTab = 0 end
   if DB.deposit.showButton == nil then DB.deposit.showButton = true end
+
+  -- Guild enable/disable (account-wide). Tracks guilds seen on any character.
+  if type(DB.deposit.guildsSeen) ~= "table" then DB.deposit.guildsSeen = {} end
+  if type(DB.deposit.guildEnabled) ~= "table" then DB.deposit.guildEnabled = {} end
+
+  do
+    local d = tonumber(DB.deposit.sellFoodLevelDiff)
+    d = d and math.floor(d) or 10
+    if d < 1 then d = 1 end
+    if d > 80 then d = 80 end
+    DB.deposit.sellFoodLevelDiff = d
+  end
 
   -- The config UI no longer exposes toggling this; keep the on-screen button on.
   DB.deposit.showButton = true
@@ -245,6 +266,7 @@ local function EnsureDB()
   if type(CHARDB.deposit.buyDisableAcc) ~= "table" then CHARDB.deposit.buyDisableAcc = {} end
   if type(CHARDB.deposit.sellItemsChar) ~= "table" then CHARDB.deposit.sellItemsChar = {} end
   if type(CHARDB.deposit.sellDisableAcc) ~= "table" then CHARDB.deposit.sellDisableAcc = {} end
+  if CHARDB.deposit.sellFoodEnabledChar == nil then CHARDB.deposit.sellFoodEnabledChar = false end
 
   if DB and type(DB.other) ~= "table" then
     DB.other = {}
@@ -340,6 +362,52 @@ local function EnsureDB()
   end
 end
 
+local function GetCurrentGuildKey()
+  if type(IsInGuild) == "function" then
+    local ok, inGuild = pcall(IsInGuild)
+    if ok and inGuild ~= true then
+      return nil
+    end
+  end
+  if type(GetGuildInfo) ~= "function" then
+    return nil
+  end
+  local ok, guildName = pcall(GetGuildInfo, "player")
+  guildName = ok and guildName or nil
+  if type(guildName) ~= "string" or guildName == "" then
+    return nil
+  end
+  local realm = (type(GetRealmName) == "function") and GetRealmName() or nil
+  realm = (type(realm) == "string" and realm ~= "") and realm or ""
+  return realm .. "::" .. guildName, guildName, realm
+end
+
+local function UpdateSeenGuilds()
+  EnsureDB()
+  if not (DB and DB.deposit) then return end
+  local key, guildName, realm = GetCurrentGuildKey()
+  if not key then return end
+
+  DB.deposit.guildsSeen = (type(DB.deposit.guildsSeen) == "table") and DB.deposit.guildsSeen or {}
+  DB.deposit.guildEnabled = (type(DB.deposit.guildEnabled) == "table") and DB.deposit.guildEnabled or {}
+
+  DB.deposit.guildsSeen[key] = DB.deposit.guildsSeen[key] or {}
+  local rec = DB.deposit.guildsSeen[key]
+  rec.name = guildName
+  rec.realm = realm
+  if type(GetServerTime) == "function" then
+    local okT, t = pcall(GetServerTime)
+    if okT and tonumber(t) then rec.lastSeen = tonumber(t) end
+  elseif type(time) == "function" then
+    local okT, t = pcall(time)
+    if okT and tonumber(t) then rec.lastSeen = tonumber(t) end
+  end
+
+  if DB.deposit.guildEnabled[key] == nil then
+    DB.deposit.guildEnabled[key] = true
+  end
+end
+
 LI.EnsureDB = EnsureDB
 LI.GetDB = function()
   EnsureDB()
@@ -366,12 +434,18 @@ local function DepositCfgAcc()
   EnsureDB()
   DB.deposit = (type(DB.deposit) == "table") and DB.deposit or {}
   if DB.deposit.tradeMode == nil then DB.deposit.tradeMode = "deposit" end
+  if DB.deposit.keepAmount == nil then DB.deposit.keepAmount = 0 end
+  if DB.deposit.stackPull == nil then DB.deposit.stackPull = false end -- legacy; replaced by stackPullByItem
+  DB.deposit.stackPullByItem = (type(DB.deposit.stackPullByItem) == "table") and DB.deposit.stackPullByItem or {}
+  DB.deposit.keepByItem = (type(DB.deposit.keepByItem) == "table") and DB.deposit.keepByItem or {}
   DB.deposit.itemsAcc = (type(DB.deposit.itemsAcc) == "table") and DB.deposit.itemsAcc or {}
   DB.deposit.itemsAccDisabled = (type(DB.deposit.itemsAccDisabled) == "table") and DB.deposit.itemsAccDisabled or {}
   DB.deposit.itemsAccDisableRealm = (type(DB.deposit.itemsAccDisableRealm) == "table") and DB.deposit.itemsAccDisableRealm or {}
   DB.deposit.itemsRealm = (type(DB.deposit.itemsRealm) == "table") and DB.deposit.itemsRealm or {}
   DB.deposit.itemsRealmDisabled = (type(DB.deposit.itemsRealmDisabled) == "table") and DB.deposit.itemsRealmDisabled or {}
   DB.deposit.guildTabByRealm = (type(DB.deposit.guildTabByRealm) == "table") and DB.deposit.guildTabByRealm or {}
+  DB.deposit.guildTabRandomByRealm = (type(DB.deposit.guildTabRandomByRealm) == "table") and DB.deposit.guildTabRandomByRealm or {}
+  if DB.deposit.guildTabRandom == nil then DB.deposit.guildTabRandom = false end
   DB.deposit.buyItemsAcc = (type(DB.deposit.buyItemsAcc) == "table") and DB.deposit.buyItemsAcc or {}
   DB.deposit.buyItemsAccDisabled = (type(DB.deposit.buyItemsAccDisabled) == "table") and DB.deposit.buyItemsAccDisabled or {}
   DB.deposit.buyItemsAccDisableRealm = (type(DB.deposit.buyItemsAccDisableRealm) == "table") and DB.deposit.buyItemsAccDisableRealm or {}
@@ -382,6 +456,43 @@ local function DepositCfgAcc()
   DB.deposit.sellItemsAccDisableRealm = (type(DB.deposit.sellItemsAccDisableRealm) == "table") and DB.deposit.sellItemsAccDisableRealm or {}
   DB.deposit.sellItemsRealm = (type(DB.deposit.sellItemsRealm) == "table") and DB.deposit.sellItemsRealm or {}
   DB.deposit.sellItemsRealmDisabled = (type(DB.deposit.sellItemsRealmDisabled) == "table") and DB.deposit.sellItemsRealmDisabled or {}
+
+  -- One-time migration (stage 1): old global keepAmount -> per-item keepByItem for
+  -- account/realm Deposit items. Character items are migrated in DepositCfgChar
+  -- (stage 2) after CHARDB tables are initialized.
+  if DB.deposit._keepMigratedAcc ~= true then
+    local legacy = tonumber(DB.deposit.keepAmount) or 0
+    legacy = legacy and math.floor(legacy) or 0
+    if legacy < 1 then legacy = 0 end
+    if legacy > 9999 then legacy = 9999 end
+
+    DB.deposit._keepLegacyValue = (legacy > 0) and legacy or nil
+
+    if legacy > 0 then
+      local function applyTo(tbl)
+        if type(tbl) ~= "table" then return end
+        for k, v in pairs(tbl) do
+          if v == true then
+            local id = tonumber(k)
+            if id and id > 0 and DB.deposit.keepByItem[id] == nil then
+              DB.deposit.keepByItem[id] = legacy
+            end
+          end
+        end
+      end
+
+      applyTo(DB.deposit.itemsAcc)
+      if type(DB.deposit.itemsRealm) == "table" then
+        for _, realmTbl in pairs(DB.deposit.itemsRealm) do
+          applyTo(realmTbl)
+        end
+      end
+    end
+
+    -- Clear legacy value to avoid UI confusion.
+    DB.deposit.keepAmount = 0
+    DB.deposit._keepMigratedAcc = true
+  end
   return DB.deposit
 end
 
@@ -419,6 +530,34 @@ local function DepositCfgChar()
   CHARDB.deposit.sellItemsCharDisabled = (type(CHARDB.deposit.sellItemsCharDisabled) == "table") and CHARDB.deposit.sellItemsCharDisabled or {}
   CHARDB.deposit.sellDisableAcc = (type(CHARDB.deposit.sellDisableAcc) == "table") and CHARDB.deposit.sellDisableAcc or {}
   CHARDB.deposit.sellDisableRealm = (type(CHARDB.deposit.sellDisableRealm) == "table") and CHARDB.deposit.sellDisableRealm or {}
+
+  -- One-time migration (stage 2): apply legacy keepAmount to character-scoped Deposit items.
+  do
+    local acc = DepositCfgAcc()
+    if acc and acc._keepMigratedChar ~= true then
+      local legacy = tonumber(acc._keepLegacyValue) or 0
+      legacy = legacy and math.floor(legacy) or 0
+      if legacy < 1 then legacy = 0 end
+      if legacy > 9999 then legacy = 9999 end
+
+      if legacy > 0 and type(acc.keepByItem) == "table" then
+        for k, v in pairs(CHARDB.deposit.itemsChar or {}) do
+          if v == true then
+            local id = tonumber(k)
+            if id and id > 0 and acc.keepByItem[id] == nil then
+              acc.keepByItem[id] = legacy
+            end
+          end
+        end
+      end
+
+      acc._keepMigratedChar = true
+      if acc._keepMigratedAcc == true and acc._keepMigratedChar == true then
+        acc._keepLegacyValue = nil
+        acc._keepMigrated = true
+      end
+    end
+  end
   return CHARDB.deposit
 end
 
@@ -465,7 +604,14 @@ local function GetEffectiveDepositItemIDs()
   return out
 end
 
+local _bankInteractionOpen = false
+local _warbankInteractionOpen = false
+local _guildbankInteractionOpen = false
+
 local function IsGuildBankOpen()
+  if _guildbankInteractionOpen == true then
+    return true
+  end
   local f = _G and rawget(_G, "GuildBankFrame")
   if f and f.IsShown and f:IsShown() then
     return true
@@ -473,23 +619,281 @@ local function IsGuildBankOpen()
   return false
 end
 
-local _warbankInteractionOpen = false
+local function GetBankPanel()
+  local p = _G and rawget(_G, "BankPanel")
+  if p then return p end
+  local bank = _G and rawget(_G, "BankFrame")
+  if bank and bank.BankPanel then return bank.BankPanel end
+  return nil
+end
+
+local function GetSelectedBankType()
+  local p = GetBankPanel()
+  if p and p.bankType ~= nil then
+    return p.bankType
+  end
+  return nil
+end
+
+local function TryAutoSortBankPanel()
+  local p = GetBankPanel()
+  local btn = p and p.AutoSortButton or nil
+  if btn and btn.IsEnabled and btn:IsEnabled() and btn.Click then
+    local ok = pcall(btn.Click, btn)
+    return ok == true
+  end
+
+  -- Fallbacks (older APIs/builds)
+  if C_Container and type(C_Container.SortBankBags) == "function" then
+    local ok = pcall(C_Container.SortBankBags)
+    return ok == true
+  end
+  local f = _G and rawget(_G, "SortBankBags")
+  if type(f) == "function" then
+    local ok = pcall(f)
+    return ok == true
+  end
+  return false
+end
+
+local function TryAutoSortGuildBank()
+  local f = _G and rawget(_G, "SortGuildBankItems")
+  if type(f) == "function" then
+    local ok = pcall(f)
+    return ok == true
+  end
+  local frame = _G and rawget(_G, "GuildBankFrame")
+  local btn = frame and (frame.SortButton or frame.AutoSortButton) or nil
+  if btn and btn.IsEnabled and btn:IsEnabled() and btn.Click then
+    local ok = pcall(btn.Click, btn)
+    return ok == true
+  end
+  return false
+end
+
+local function GetResetToken(resetKind)
+  resetKind = tostring(resetKind or "daily")
+  local now = nil
+  if type(GetServerTime) == "function" then
+    local ok, v = pcall(GetServerTime)
+    now = ok and tonumber(v) or nil
+  end
+  if not now and type(time) == "function" then
+    local ok, v = pcall(time)
+    now = ok and tonumber(v) or nil
+  end
+  if not now then return nil end
+
+  if C_DateAndTime and type(C_DateAndTime.GetSecondsUntilWeeklyReset) == "function" and resetKind == "weekly" then
+    local ok, sec = pcall(C_DateAndTime.GetSecondsUntilWeeklyReset)
+    sec = ok and tonumber(sec) or nil
+    if sec and sec > 0 and sec < 2000000 then
+      local resetAt = now + sec
+      return math.floor(resetAt / 60)
+    end
+  end
+
+  if C_DateAndTime and type(C_DateAndTime.GetSecondsUntilDailyReset) == "function" and resetKind == "daily" then
+    local ok, sec = pcall(C_DateAndTime.GetSecondsUntilDailyReset)
+    sec = ok and tonumber(sec) or nil
+    if sec and sec > 0 and sec < 200000 then
+      local resetAt = now + sec
+      return math.floor(resetAt / 60)
+    end
+  end
+
+  if type(GetQuestResetTime) == "function" and resetKind == "daily" then
+    local ok, sec = pcall(GetQuestResetTime)
+    sec = ok and tonumber(sec) or nil
+    if sec and sec > 0 and sec < 200000 then
+      -- Tokenize by the next reset moment; this stays stable throughout the day.
+      local resetAt = now + sec
+      return math.floor(resetAt / 60)
+    end
+  end
+
+  if type(date) == "function" then
+    local fmt = (resetKind == "weekly") and "%Y%W" or "%Y%m%d"
+    local ok, s = pcall(date, fmt)
+    if ok and type(s) == "string" then
+      return tonumber(s)
+    end
+    return nil
+  end
+
+  return nil
+end
+
+local function RunDepositCleanupOncePerReset(bankKey, fn, scope, resetKind)
+  if type(fn) ~= "function" then return false end
+  EnsureDB()
+  scope = tostring(scope or "account")
+
+  local cfg
+  if scope == "char" then
+    cfg = DepositCfgChar()
+  else
+    cfg = DepositCfgAcc()
+  end
+
+  if type(cfg) ~= "table" then return fn() == true end
+
+  cfg.cleanupOncePerReset = (type(cfg.cleanupOncePerReset) == "table") and cfg.cleanupOncePerReset or {}
+  local token = GetResetToken(resetKind or "daily")
+  if not token then
+    return fn() == true
+  end
+
+  bankKey = tostring(bankKey or "")
+  if bankKey == "" then
+    bankKey = "bank"
+  end
+
+  if cfg.cleanupOncePerReset[bankKey] == token then
+    return false
+  end
+
+  cfg.cleanupOncePerReset[bankKey] = token
+  return fn() == true
+end
+
+local function IsPersonalBankOpen()
+  -- New bank UI: single window with Character/Account tabs.
+  local bankType = GetSelectedBankType()
+  local charType = (Enum and Enum.BankType) and Enum.BankType.Character or nil
+  local acctType = (Enum and Enum.BankType) and Enum.BankType.Account or nil
+  if bankType ~= nil then
+    if charType ~= nil then
+      return bankType == charType
+    end
+    -- If we can't resolve Character constant, avoid treating Account as personal.
+    if acctType ~= nil and bankType == acctType then
+      return false
+    end
+  end
+
+  -- Fallbacks for older UI.
+  if _bankInteractionOpen == true then
+    return true
+  end
+  local f = _G and rawget(_G, "BankFrame")
+  if f and f.IsShown and f:IsShown() then
+    return true
+  end
+  return false
+end
+
+local function IsAccountBankBagID(bagID)
+  bagID = tonumber(bagID)
+  if not bagID then return false end
+  if not (Enum and Enum.BagIndex) then return false end
+  local e = Enum.BagIndex
+  return (bagID == e.AccountBankTab_1)
+    or (bagID == e.AccountBankTab_2)
+    or (bagID == e.AccountBankTab_3)
+    or (bagID == e.AccountBankTab_4)
+    or (bagID == e.AccountBankTab_5)
+end
+
+local function GetSelectedAccountBankTabBagID()
+  local p = _G and rawget(_G, "AccountBankPanel")
+  if not (p and p.IsVisible and p:IsVisible()) then return nil end
+  if type(p.GetSelectedTabID) ~= "function" then return nil end
+  local ok, tab = pcall(p.GetSelectedTabID, p)
+  tab = ok and tab or nil
+  if IsAccountBankBagID(tab) then
+    return tab
+  end
+  return nil
+end
+
+local function FindShownChildByNamePattern(root, patterns)
+  if not (root and root.GetChildren and type(patterns) == "table") then return nil end
+
+  local q = { root }
+  local qi = 1
+  local visited = 0
+  local maxNodes = 200
+
+  while q[qi] do
+    local node = q[qi]
+    qi = qi + 1
+    visited = visited + 1
+    if visited > maxNodes then break end
+
+    local okShown, isShown = pcall(function()
+      return node.IsShown and node:IsShown()
+    end)
+    if okShown and isShown then
+      local name = nil
+      if node.GetName then
+        local okName, v = pcall(node.GetName, node)
+        if okName then name = v end
+      end
+      if type(name) == "string" and name ~= "" then
+        for _, p in ipairs(patterns) do
+          if type(p) == "string" and p ~= "" and name:find(p, 1, true) then
+            return node
+          end
+        end
+      end
+    end
+
+    if node.GetChildren then
+      local okKids, kids = pcall(function() return { node:GetChildren() } end)
+      if okKids and type(kids) == "table" then
+        for i = 1, #kids do
+          local child = kids[i]
+          if child then q[#q + 1] = child end
+        end
+      end
+    end
+  end
+  return nil
+end
 
 local function GetWarbankFrame()
   local candidates = {
     "AccountBankFrame",
     "AccountBankPanel",
-    "BankFrame",
     "WarbandBankFrame",
     "WarbandBankPanel",
     "WarbandBank",
   }
   for _, k in ipairs(candidates) do
     local f = _G and rawget(_G, k)
+    if f and f.IsVisible and f:IsVisible() then
+      return f
+    end
     if f and f.IsShown and f:IsShown() then
       return f
     end
   end
+
+  -- If the Blizzard panel exists and a valid tab is selected, treat as open.
+  if GetSelectedAccountBankTabBagID() ~= nil then
+    local p = _G and rawget(_G, "AccountBankPanel")
+    if p then return p end
+  end
+
+  -- Some builds embed the Warband/AccountBank panel inside BankFrame.
+  local bank = _G and rawget(_G, "BankFrame")
+  if bank and bank.IsShown and bank:IsShown() then
+    -- Common field names (best-effort).
+    local direct = { bank.AccountBankPanel, bank.AccountBankFrame, bank.WarbandBankPanel, bank.WarbandBankFrame }
+    for i = 1, #direct do
+      local f = direct[i]
+      if f and f.IsShown and f:IsShown() then
+        return f
+      end
+    end
+
+    local found = FindShownChildByNamePattern(bank, { "AccountBank", "WarbandBank" })
+    if found then
+      return found
+    end
+  end
+
   return nil
 end
 
@@ -497,7 +901,92 @@ local function IsWarbankOpen()
   if _warbankInteractionOpen == true then
     return true
   end
+  local bankType = GetSelectedBankType()
+  local acctType = (Enum and Enum.BankType) and Enum.BankType.Account or nil
+  if acctType ~= nil and bankType == acctType then
+    return true
+  end
+  if GetSelectedAccountBankTabBagID() ~= nil then
+    return true
+  end
   return (GetWarbankFrame() ~= nil)
+end
+
+local _depositScanTip
+local function ScanItemTooltipText(link, scanText)
+  if type(link) ~= "string" or link == "" then return end
+  if not (CreateFrame and UIParent) then return end
+  if type(scanText) ~= "function" then return end
+
+  if not _depositScanTip then
+    _depositScanTip = CreateFrame("GameTooltip", "fr0z3nUI_LootIt_DepositScanTip", UIParent, "GameTooltipTemplate")
+    _depositScanTip:SetOwner(UIParent, "ANCHOR_NONE")
+  end
+
+  _depositScanTip:ClearLines()
+  _depositScanTip:SetHyperlink(link)
+  local n = _depositScanTip:NumLines() or 0
+  for i = 1, n do
+    local left = _G and _G["fr0z3nUI_LootIt_DepositScanTipTextLeft" .. i]
+    local right = _G and _G["fr0z3nUI_LootIt_DepositScanTipTextRight" .. i]
+    if left and left.GetText then scanText(left:GetText()) end
+    if right and right.GetText then scanText(right:GetText()) end
+  end
+end
+
+local function GetDepositItemFlagsFromLink(link)
+  local out = {
+    soulbound = false,
+    warbound = false,
+  }
+
+  local function scanText(s)
+    if type(s) ~= "string" or s == "" then return end
+    local low = s:lower()
+    if low:find("soulbound", 1, true) then
+      out.soulbound = true
+    end
+    if low:find("bind on pickup", 1, true) then
+      out.soulbound = true
+    end
+    if low:find("warbound", 1, true) then
+      out.warbound = true
+    end
+
+    if (not out.warbound) and low:find("account bound", 1, true) then
+      out.warbound = true
+    end
+    if (not out.warbound) and low:find("bound to warband", 1, true) then
+      out.warbound = true
+    end
+    if (not out.warbound) and low:find("warband", 1, true) and low:find("bound", 1, true) then
+      out.warbound = true
+    end
+    if (not out.warbound) and low:find("binds", 1, true) and low:find("warband", 1, true) then
+      out.warbound = true
+    end
+    if (not out.warbound) and low:find("bound", 1, true) and low:find("warband", 1, true) then
+      out.warbound = true
+    end
+  end
+
+  if C_TooltipInfo and type(C_TooltipInfo.GetHyperlink) == "function" then
+    local ok, tip = pcall(C_TooltipInfo.GetHyperlink, link)
+    if ok and type(tip) == "table" and type(tip.lines) == "table" then
+      for _, line in ipairs(tip.lines) do
+        if type(line) == "table" then
+          scanText(line.leftText)
+          scanText(line.rightText)
+        end
+      end
+    end
+  end
+
+  if (not out.warbound) or (not out.soulbound) then
+    ScanItemTooltipText(link, scanText)
+  end
+
+  return out
 end
 
 local function GetConfiguredGuildBankTab()
@@ -524,7 +1013,50 @@ local function GetConfiguredGuildBankTab()
   return 1
 end
 
-local function FindFirstEmptyGuildBankSlot(tab)
+local GuildBankTabCanDeposit
+
+local function IsGuildTabRandomEnabled(cfg)
+  cfg = cfg or DepositCfgAcc()
+  local rk = GetCurrentRealmKey()
+  if rk ~= "" and type(cfg.guildTabRandomByRealm) == "table" and cfg.guildTabRandomByRealm[rk] ~= nil then
+    return cfg.guildTabRandomByRealm[rk] == true
+  end
+  return cfg.guildTabRandom == true
+end
+
+local function GetGuildBankTabCount()
+  local n = (GetNumGuildBankTabs and GetNumGuildBankTabs()) or 8
+  n = tonumber(n) or 8
+  n = math.floor(n)
+  if n < 1 then n = 1 end
+  if n > 8 then n = 8 end
+  return n
+end
+
+local function PickRandomGuildBankDepositTab()
+  local n = GetGuildBankTabCount()
+  local allowed = {}
+  for t = 1, n do
+    local ok = false
+    if GuildBankTabCanDeposit then
+      ok = GuildBankTabCanDeposit(t)
+    else
+      ok = true
+    end
+    if ok == true then
+      allowed[#allowed + 1] = t
+    end
+  end
+  if #allowed < 1 then
+    return nil
+  end
+  local idx = math.random(1, #allowed)
+  return allowed[idx]
+end
+
+local CreateItemLocationFromBagSlot
+
+local function FindBestGuildBankSlot(tab, itemID)
   tab = tonumber(tab)
   if not tab or tab <= 0 then return nil end
   local maxSlots = _G and rawget(_G, "MAX_GUILDBANK_SLOTS_PER_TAB")
@@ -532,54 +1064,211 @@ local function FindFirstEmptyGuildBankSlot(tab)
   if type(GetGuildBankItemLink) ~= "function" then
     return nil
   end
+
+  local wantID = tonumber(itemID)
+  local maxStack = 1
+  if wantID and type(GetItemInfo) == "function" then
+    local okS, s = pcall(function() return select(8, GetItemInfo(wantID)) end)
+    maxStack = (okS and tonumber(s)) or 1
+  end
+
+  local firstEmpty = nil
   for slot = 1, maxSlots do
     local ok, link = pcall(GetGuildBankItemLink, tab, slot)
-    if ok and not link then
-      return slot
+    link = ok and link or nil
+    if link then
+      if wantID and maxStack and maxStack > 1 and type(GetGuildBankItemInfo) == "function" then
+        local id = tonumber(string.match(link, "item:(%d+)"))
+        if id and id == wantID then
+          local okI, _, count, locked = pcall(GetGuildBankItemInfo, tab, slot)
+          count = okI and tonumber(count) or nil
+          locked = okI and locked or nil
+          if count and count > 0 and count < maxStack and locked ~= true then
+            return slot
+          end
+        end
+      end
+    else
+      if not firstEmpty then firstEmpty = slot end
     end
   end
-  return nil
+  return firstEmpty
 end
 
-local function DepositToGuildBankOnce(bag, slot, tab, bankSlot)
+-- Forward declarations (avoid analyzer 'undefined global' when referenced earlier)
+local GetItemMaxStack
+local WithdrawFromGuildBankToBags
+local WithdrawFromContainerBagsToBags
+local GetPersonalBankBagIDs
+
+local _guildTabQueried = {}
+local function QueryGuildBankTabIfNeeded(tab)
+  tab = tonumber(tab)
+  if not tab or tab <= 0 then return end
+  if _guildTabQueried[tab] == true then return end
+  if type(QueryGuildBankTab) ~= "function" then return end
+  pcall(QueryGuildBankTab, tab)
+  _guildTabQueried[tab] = true
+end
+
+GuildBankTabCanDeposit = function(tab)
+  tab = tonumber(tab)
+  if not tab or tab <= 0 then
+    return false, "invalid tab"
+  end
+  if type(GetGuildBankTabInfo) ~= "function" then
+    return true
+  end
+  QueryGuildBankTabIfNeeded(tab)
+  local ok, name, _, canView, canDeposit = pcall(GetGuildBankTabInfo, tab)
+  if not ok then
+    return false, "tab info unavailable"
+  end
+  if not name or canView ~= true then
+    return false, "no view permission"
+  end
+  if canDeposit ~= true then
+    return false, "no deposit permission"
+  end
+  return true
+end
+
+local function SplitPickupContainerItemSafe(bag, slot, amount)
   if not (C_Container and type(C_Container.PickupContainerItem) == "function") then
-    return false
+    return false, "No container pickup API"
+  end
+  amount = tonumber(amount)
+  if amount and amount > 0 then
+    if C_Container and type(C_Container.SplitContainerItem) == "function" then
+      local ok, err = pcall(C_Container.SplitContainerItem, bag, slot, amount)
+      if ok then return true end
+      return false, tostring(err)
+    end
+    local split = _G and rawget(_G, "SplitContainerItem")
+    if type(split) == "function" then
+      local ok, err = pcall(split, bag, slot, amount)
+      if ok then return true end
+      return false, tostring(err)
+    end
+  end
+  local ok, err = pcall(C_Container.PickupContainerItem, bag, slot)
+  if ok then return true end
+  return false, tostring(err)
+end
+
+local function DepositToGuildBankOnce(bag, slot, tab, bankSlot, amount)
+  if not (C_Container and type(C_Container.PickupContainerItem) == "function") then
+    return false, "No container pickup API"
   end
   if type(PickupGuildBankItem) ~= "function" then
-    return false
+    return false, "No guild bank pickup API"
   end
 
   local clear = _G and rawget(_G, "ClearCursor")
-  local cursorHas = _G and rawget(_G, "CursorHasItem")
+
+  local function cursorHasItem()
+    if type(GetCursorInfo) == "function" then
+      local ok, kind = pcall(GetCursorInfo)
+      return ok and kind == "item"
+    end
+    local cursorHas = _G and rawget(_G, "CursorHasItem")
+    if type(cursorHas) == "function" then
+      local ok, has = pcall(cursorHas)
+      return ok and has == true
+    end
+    return false
+  end
 
   if type(clear) == "function" then pcall(clear) end
 
-  local okPick = pcall(C_Container.PickupContainerItem, bag, slot)
+  local okPick, errPick = SplitPickupContainerItemSafe(bag, slot, amount)
   if not okPick then
     if type(clear) == "function" then pcall(clear) end
-    return false
+    return false, "Pickup failed: " .. tostring(errPick)
   end
-  if type(cursorHas) == "function" then
-    local okCur, has = pcall(cursorHas)
-    if okCur and not has then
-      if type(clear) == "function" then pcall(clear) end
-      return false
-    end
+  if not cursorHasItem() then
+    if type(clear) == "function" then pcall(clear) end
+    return false, "Pickup did not put item on cursor"
   end
 
-  local okDrop = pcall(PickupGuildBankItem, tab, bankSlot)
+  QueryGuildBankTabIfNeeded(tab)
+  local okDrop, errDrop = pcall(PickupGuildBankItem, tab, bankSlot)
   if not okDrop then
     if type(clear) == "function" then pcall(clear) end
-    return false
+    return false, "Place failed: " .. tostring(errDrop)
   end
+
+  -- Cursor still holding item => place was blocked.
+  if cursorHasItem() then
+    if type(clear) == "function" then pcall(clear) end
+    return false, "Place was blocked"
+  end
+
   if type(clear) == "function" then pcall(clear) end
   return true
 end
 
+local function GetEffectiveKeepAmount(itemID)
+  itemID = tonumber(itemID)
+  if not itemID or itemID <= 0 then return 0 end
+  local cfg = DepositCfgAcc()
+  local v = 0
+  if cfg and type(cfg.keepByItem) == "table" then
+    v = tonumber(cfg.keepByItem[itemID]) or 0
+  end
+  v = v and math.floor(v) or 0
+  if v < 1 then return 0 end
+  if v > 9999 then v = 9999 end
+  return v
+end
+
+local function IsStackPullEnabledForItem(itemID)
+  itemID = tonumber(itemID)
+  if not itemID or itemID <= 0 then return false end
+  local cfg = DepositCfgAcc()
+  return (cfg and type(cfg.stackPullByItem) == "table" and cfg.stackPullByItem[itemID] == true) and true or false
+end
+
+local function CountItemInPlayerBags(itemID)
+  itemID = tonumber(itemID)
+  if not itemID or itemID <= 0 then return 0 end
+  if not (C_Container and type(C_Container.GetContainerNumSlots) == "function") then return 0 end
+  local total = 0
+  for bag = 0, 6 do
+    local okN, n = pcall(C_Container.GetContainerNumSlots, bag)
+    n = okN and tonumber(n) or 0
+    if n and n > 0 then
+      for slot = 1, n do
+        local info = nil
+        if type(C_Container.GetContainerItemInfo) == "function" then
+          local ok, v = pcall(C_Container.GetContainerItemInfo, bag, slot)
+          info = ok and v or nil
+        end
+        if info and tonumber(info.itemID) == itemID then
+          local stack = tonumber(info.stackCount)
+          total = total + (stack or 1)
+        end
+      end
+    end
+  end
+  return total
+end
+
 local function RunDepositGuild()
   if not IsGuildBankOpen() then
-    Print("Guild bank is not open.")
     return false
+  end
+
+  do
+    local key, guildName, realm = GetCurrentGuildKey()
+    if key and DB and DB.deposit and type(DB.deposit.guildEnabled) == "table" and DB.deposit.guildEnabled[key] == false then
+      local display = guildName or "Guild"
+      if type(realm) == "string" and realm ~= "" then
+        display = display .. " (" .. realm .. ")"
+      end
+      Print("Guild deposit disabled: " .. display)
+      return false
+    end
   end
 
   local targets = GetEffectiveDepositItemIDs()
@@ -590,8 +1279,84 @@ local function RunDepositGuild()
     return false
   end
 
-  local tab = GetConfiguredGuildBankTab()
+  local cfg = DepositCfgAcc()
+  local tab = nil
+  if IsGuildTabRandomEnabled(cfg) then
+    tab = PickRandomGuildBankDepositTab()
+  end
+  if not tab then
+    tab = GetConfiguredGuildBankTab()
+  end
+  if type(SetCurrentGuildBankTab) == "function" and tab and tab > 0 then
+    pcall(SetCurrentGuildBankTab, tab)
+  end
+  local okPerm, whyPerm = GuildBankTabCanDeposit(tab)
+  if not okPerm then
+    Print("Deposit blocked (guild): " .. tostring(whyPerm or "no permission"))
+    return false
+  end
+  QueryGuildBankTabIfNeeded(tab)
+
+  -- Optional Stack Pull: if this guild tab already has a partial stack (count < max stack)
+  -- for an SP-enabled item, withdraw that partial stack to bags first (only if bags have
+  -- enough to fill it), then proceed with deposit.
+  do
+    local maxSlots = _G and rawget(_G, "MAX_GUILDBANK_SLOTS_PER_TAB")
+    maxSlots = tonumber(maxSlots) or 98
+    local touched = {}
+
+    if type(GetGuildBankItemLink) == "function" and type(GetGuildBankItemInfo) == "function" then
+      for itemID in pairs(targets) do
+        itemID = tonumber(itemID)
+        if itemID and itemID > 0 and IsStackPullEnabledForItem(itemID) and not touched[itemID] then
+          local maxStack = GetItemMaxStack(itemID)
+          if maxStack and maxStack > 1 then
+            local inBags = CountItemInPlayerBags(itemID)
+            if inBags and inBags > 0 then
+              local partialCount = nil
+              for slot = 1, maxSlots do
+                local okL, link = pcall(GetGuildBankItemLink, tab, slot)
+                link = okL and link or nil
+                if type(link) == "string" then
+                  local id = tonumber(string.match(link, "item:(%d+)"))
+                  if id and id == itemID then
+                    local okI, _, count, locked = pcall(GetGuildBankItemInfo, tab, slot)
+                    count = okI and tonumber(count) or nil
+                    locked = okI and locked or nil
+                    if count and count > 0 and count < maxStack and locked ~= true then
+                      partialCount = count
+                      break
+                    end
+                  end
+                end
+              end
+
+              if partialCount and partialCount > 0 and partialCount < maxStack then
+                local needToFill = maxStack - partialCount
+                if needToFill > 0 and inBags >= needToFill then
+                  touched[itemID] = true
+                  local movedW, whyW = WithdrawFromGuildBankToBags(tab, itemID, partialCount)
+                  if whyW then
+                    Print("Withdraw blocked (guild): " .. tostring(whyW))
+                    return false
+                  end
+                  if not movedW or movedW <= 0 then
+                    -- If we couldn't withdraw, just continue without the pre-pass.
+                    touched[itemID] = true
+                  end
+                end
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+
   local moved = 0
+  local movedLines = {}
+  local skippedSoulbound = 0
+  local skippedWarbound = 0
   local maxMoves = 200
 
   for bag = 0, 6 do
@@ -611,17 +1376,57 @@ local function RunDepositGuild()
         end
         local itemID = info and tonumber(info.itemID) or nil
         if itemID and targets[itemID] == true then
-          local bankSlot = FindFirstEmptyGuildBankSlot(tab)
-          if not bankSlot then
-            Print("Guild bank tab is full.")
-            return moved > 0
+          local stack = (info and tonumber(info.stackCount)) or 1
+          local depositCount = stack
+          local keep = GetEffectiveKeepAmount(itemID)
+          if keep > 0 then
+            local current = CountItemInPlayerBags(itemID)
+            local excess = (current or 0) - keep
+            if excess <= 0 then
+              depositCount = 0
+            elseif excess < depositCount then
+              depositCount = excess
+            end
           end
-          local okMove = DepositToGuildBankOnce(bag, slot, tab, bankSlot)
-          if okMove then
-            moved = moved + 1
-          else
-            Print("Deposit blocked; try clicking Deposit again.")
-            return moved > 0
+
+          if depositCount and depositCount > 0 then
+            local link = nil
+            if C_Container and type(C_Container.GetContainerItemLink) == "function" then
+              local okL, vL = pcall(C_Container.GetContainerItemLink, bag, slot)
+              link = okL and vL or nil
+            end
+
+            local flags = GetDepositItemFlagsFromLink(link or ("item:" .. tostring(itemID)))
+            local isBound = false
+            do
+              local loc = CreateItemLocationFromBagSlot(bag, slot)
+              if loc and C_Item and type(C_Item.IsBound) == "function" then
+                local okB, vB = pcall(C_Item.IsBound, loc)
+                isBound = okB and vB == true
+              end
+            end
+            if flags.soulbound or isBound then
+              skippedSoulbound = skippedSoulbound + 1
+              Print("Skipped (soulbound, can't deposit to guild bank): " .. tostring(link or itemID))
+            elseif flags.warbound then
+              skippedWarbound = skippedWarbound + 1
+            else
+              local bankSlot = FindBestGuildBankSlot(tab, itemID)
+              if not bankSlot then
+                Print("Guild bank tab is full.")
+                return moved > 0
+              end
+              local okMove, why = DepositToGuildBankOnce(bag, slot, tab, bankSlot, depositCount ~= stack and depositCount or nil)
+              if okMove then
+                moved = moved + 1
+                if moved <= 15 then
+                  movedLines[#movedLines + 1] = tostring(link or itemID) .. " x" .. tostring(depositCount)
+                end
+              else
+                Print("Deposit blocked (guild): " .. tostring(why or "unknown"))
+                return moved > 0
+              end
+            end
           end
         end
       end
@@ -631,9 +1436,200 @@ local function RunDepositGuild()
 
   if moved > 0 then
     Print("Deposited: " .. tostring(moved) .. " move(s)")
+    for i = 1, #movedLines do
+      Print("  " .. movedLines[i])
+    end
+    if moved > #movedLines then
+      Print("  (and " .. tostring(moved - #movedLines) .. " more)")
+    end
+    if skippedSoulbound > 0 then
+      Print("Skipped soulbound: " .. tostring(skippedSoulbound))
+    end
     return true
   end
-  Print("No matching items found in bags.")
+  -- Nothing left to deposit; run a cleanup pass like BankStack /sort guild.
+  RunDepositCleanupOncePerReset("guild", TryAutoSortGuildBank, "account", "daily")
+  return false
+end
+
+local function DepositToPersonalBankOnce(bag, slot, amount)
+  if not (C_Container and type(C_Container.PickupContainerItem) == "function") then
+    return false
+  end
+
+  local putInBank = _G and rawget(_G, "PutItemInBank")
+  if type(putInBank) ~= "function" then
+    return false
+  end
+
+  local clear = _G and rawget(_G, "ClearCursor")
+  local cursorHas = _G and rawget(_G, "CursorHasItem")
+
+  if type(clear) == "function" then pcall(clear) end
+
+  local okPick = SplitPickupContainerItemSafe(bag, slot, amount)
+  if not okPick then
+    if type(clear) == "function" then pcall(clear) end
+    return false
+  end
+
+  if type(cursorHas) == "function" then
+    local okCur, has = pcall(cursorHas)
+    if okCur and not has then
+      if type(clear) == "function" then pcall(clear) end
+      return false
+    end
+  end
+
+  pcall(putInBank)
+
+  if type(cursorHas) == "function" then
+    local okCur2, has2 = pcall(cursorHas)
+    if okCur2 and has2 then
+      if type(clear) == "function" then pcall(clear) end
+      return false
+    end
+  end
+
+  if type(clear) == "function" then pcall(clear) end
+  return true
+end
+
+local function RunDepositPersonalBank()
+  if not IsPersonalBankOpen() then
+    return false
+  end
+
+  local targets = GetEffectiveDepositItemIDs()
+  local hasAny = false
+  for _ in pairs(targets) do hasAny = true break end
+  if not hasAny then
+    Print("Deposit list is empty.")
+    return false
+  end
+
+  local moved = 0
+  local movedLines = {}
+  local maxMoves = 200
+
+  -- Optional Stack Pull: withdraw a partial stack from the bank first (per item), but only
+  -- when the player has enough in bags to fill it.
+  do
+    local bankBags = GetPersonalBankBagIDs and GetPersonalBankBagIDs() or nil
+    local touched = {}
+    if type(bankBags) == "table" and #bankBags > 0 and C_Container and type(C_Container.GetContainerNumSlots) == "function" then
+      for itemID in pairs(targets) do
+        itemID = tonumber(itemID)
+        if itemID and itemID > 0 and IsStackPullEnabledForItem(itemID) and not touched[itemID] then
+          local maxStack = GetItemMaxStack(itemID)
+          if maxStack and maxStack > 1 then
+            local inBags = CountItemInPlayerBags(itemID)
+            if inBags and inBags > 0 then
+              local partialCount = nil
+              for i = 1, #bankBags do
+                local b = bankBags[i]
+                local okN, n = pcall(C_Container.GetContainerNumSlots, b)
+                n = okN and tonumber(n) or 0
+                if n and n > 0 then
+                  for s = 1, n do
+                    local info = nil
+                    if type(C_Container.GetContainerItemInfo) == "function" then
+                      local ok, v = pcall(C_Container.GetContainerItemInfo, b, s)
+                      info = ok and v or nil
+                    end
+                    if info and tonumber(info.itemID) == itemID then
+                      local count = tonumber(info.stackCount)
+                      local locked = info.isLocked
+                      if count and count > 0 and count < maxStack and locked ~= true then
+                        partialCount = count
+                        break
+                      end
+                    end
+                  end
+                end
+                if partialCount then break end
+              end
+
+              if partialCount and partialCount > 0 and partialCount < maxStack then
+                local needToFill = maxStack - partialCount
+                if needToFill > 0 and inBags >= needToFill then
+                  touched[itemID] = true
+                  WithdrawFromContainerBagsToBags(bankBags, itemID, partialCount)
+                end
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+
+  for bag = 0, 6 do
+    local n = 0
+    if C_Container and type(C_Container.GetContainerNumSlots) == "function" then
+      local ok, v = pcall(C_Container.GetContainerNumSlots, bag)
+      n = ok and tonumber(v) or 0
+    end
+    if n and n > 0 then
+      for slot = 1, n do
+        if moved >= maxMoves then break end
+
+        local info = nil
+        if C_Container and type(C_Container.GetContainerItemInfo) == "function" then
+          local ok, v = pcall(C_Container.GetContainerItemInfo, bag, slot)
+          info = ok and v or nil
+        end
+        local itemID = info and tonumber(info.itemID) or nil
+        if itemID and targets[itemID] == true then
+          local stack = (info and tonumber(info.stackCount)) or 1
+          local depositCount = stack
+          local keep = GetEffectiveKeepAmount(itemID)
+          if keep > 0 then
+            local current = CountItemInPlayerBags(itemID)
+            local excess = (current or 0) - keep
+            if excess <= 0 then
+              depositCount = 0
+            elseif excess < depositCount then
+              depositCount = excess
+            end
+          end
+
+          if depositCount and depositCount > 0 then
+            local link = nil
+            if C_Container and type(C_Container.GetContainerItemLink) == "function" then
+              local okL, vL = pcall(C_Container.GetContainerItemLink, bag, slot)
+              link = okL and vL or nil
+            end
+
+            local okMove = DepositToPersonalBankOnce(bag, slot, depositCount ~= stack and depositCount or nil)
+            if okMove then
+              moved = moved + 1
+              if moved <= 15 then
+                movedLines[#movedLines + 1] = tostring(link or itemID) .. " x" .. tostring(depositCount)
+              end
+            else
+              Print("Deposit blocked (personal bank)")
+              return moved > 0
+            end
+          end
+        end
+      end
+    end
+    if moved >= maxMoves then break end
+  end
+
+  if moved > 0 then
+    Print("Deposited: " .. tostring(moved) .. " move(s)")
+    for i = 1, #movedLines do
+      Print("  " .. movedLines[i])
+    end
+    if moved > #movedLines then
+      Print("  (and " .. tostring(moved - #movedLines) .. " more)")
+    end
+    return true
+  end
+  -- Nothing left to deposit; run a cleanup pass like BankStack /sort bank.
+  RunDepositCleanupOncePerReset("bank", TryAutoSortBankPanel, "char", "daily")
   return false
 end
 
@@ -662,7 +1658,7 @@ local function GetWarbankDepositCallable()
   return nil, nil
 end
 
-local function CreateItemLocationFromBagSlot(bag, slot)
+CreateItemLocationFromBagSlot = function(bag, slot)
   if not (bag and slot) then return nil end
   local il = _G and rawget(_G, "ItemLocation")
   if type(il) == "table" then
@@ -679,38 +1675,324 @@ local function CreateItemLocationFromBagSlot(bag, slot)
   return nil
 end
 
-local function DepositToWarbankOnce(bag, slot)
+local function DepositToWarbankOnce(bag, slot, sourceItemID, amount)
+  local function TryDepositViaCursor()
+    if not (C_Container and type(C_Container.PickupContainerItem) == "function") then
+      return false, "No container pickup API"
+    end
+
+    local wantID = tonumber(sourceItemID)
+    if not wantID and type(C_Container.GetContainerItemID) == "function" then
+      local ok, v = pcall(C_Container.GetContainerItemID, bag, slot)
+      wantID = ok and tonumber(v) or nil
+    end
+
+    local maxStack = 1
+    if wantID and type(GetItemInfo) == "function" then
+      local okS, s = pcall(function() return select(8, GetItemInfo(wantID)) end)
+      maxStack = (okS and tonumber(s)) or 1
+    end
+
+    local selectedTab = GetSelectedAccountBankTabBagID()
+    local targetBags = {}
+    if selectedTab then
+      targetBags[1] = selectedTab
+    elseif Enum and Enum.BagIndex then
+      local e = Enum.BagIndex
+      local all = { e.AccountBankTab_1, e.AccountBankTab_2, e.AccountBankTab_3, e.AccountBankTab_4, e.AccountBankTab_5 }
+      for i = 1, #all do
+        if IsAccountBankBagID(all[i]) then
+          targetBags[#targetBags + 1] = all[i]
+        end
+      end
+    end
+
+    if #targetBags == 0 then
+      return false, "No AccountBank tab is available/selected"
+    end
+
+    -- Optional pre-check: is the item allowed in Account bank.
+    local loc = CreateItemLocationFromBagSlot(bag, slot)
+    local bankTypeAccount = (Enum and Enum.BankType) and Enum.BankType.Account or nil
+    if bankTypeAccount ~= nil and loc ~= nil
+      and C_Bank and type(C_Bank.IsItemAllowedInBankType) == "function" and type(C_Bank.CanViewBank) == "function"
+    then
+      local okView, canView = pcall(C_Bank.CanViewBank, bankTypeAccount)
+      if okView and canView == true then
+        local okAllow, allowed = pcall(C_Bank.IsItemAllowedInBankType, bankTypeAccount, loc)
+        if okAllow and allowed == false then
+          return false, "Not allowed in Warbank"
+        end
+      end
+    end
+
+    local function findBestSlot(tBag)
+      local n = 0
+      if type(C_Container.GetContainerNumSlots) == "function" then
+        local ok, v = pcall(C_Container.GetContainerNumSlots, tBag)
+        n = ok and tonumber(v) or 0
+      end
+      if not (n and n > 0) then return nil end
+
+      local firstEmpty
+      for tSlot = 1, n do
+        local info = nil
+        if type(C_Container.GetContainerItemInfo) == "function" then
+          local ok, v = pcall(C_Container.GetContainerItemInfo, tBag, tSlot)
+          info = ok and v or nil
+        end
+        if info and wantID and maxStack and maxStack > 1 then
+          local id = tonumber(info.itemID)
+          local count = tonumber(info.stackCount)
+          local locked = info.isLocked
+          if id and id == wantID and count and count > 0 and count < maxStack and locked ~= true then
+            return tSlot
+          end
+        end
+        if info == nil and not firstEmpty then
+          firstEmpty = tSlot
+        end
+      end
+
+      return firstEmpty
+    end
+
+    local targetBag, targetSlot
+    for i = 1, #targetBags do
+      local tBag = targetBags[i]
+      local tSlot = findBestSlot(tBag)
+      if tSlot then
+        targetBag, targetSlot = tBag, tSlot
+        break
+      end
+    end
+    if not (targetBag and targetSlot) then
+      return false, "Warbank tab full"
+    end
+
+    if GetCursorInfo and GetCursorInfo() == "item" and ClearCursor then
+      ClearCursor()
+    end
+
+    local okPick, errPick = SplitPickupContainerItemSafe(bag, slot, amount)
+    if not okPick then
+      return false, "Pickup failed: " .. tostring(errPick)
+    end
+    if GetCursorInfo and GetCursorInfo() ~= "item" then
+      return false, "Pickup did not put item on cursor"
+    end
+
+    local okPlace, errPlace = pcall(C_Container.PickupContainerItem, targetBag, targetSlot)
+    if not okPlace then
+      if ClearCursor then ClearCursor() end
+      return false, "Place failed: " .. tostring(errPlace)
+    end
+    if GetCursorInfo and GetCursorInfo() == "item" then
+      if ClearCursor then ClearCursor() end
+      return false, "Place was blocked"
+    end
+
+    return true
+  end
+
+  -- Prefer the same approach as BankStack: move to AccountBankTab containers.
+  local okCursor, whyCursor = TryDepositViaCursor()
+  if okCursor then
+    return true
+  end
+
+  if amount and tonumber(amount) and tonumber(amount) > 0 then
+    -- For partial-stack deposits we must not fall back to any opaque API
+    -- that would deposit the full remaining stack from the original slot.
+    if ClearCursor then pcall(ClearCursor) end
+    return false, tostring(whyCursor or "Partial deposit failed")
+  end
+
+  -- Fallback: try any detected Warbank deposit API.
   local f, fnName = GetWarbankDepositCallable()
   if type(f) ~= "function" then
-    return false, "No deposit API"
+    return false, tostring(whyCursor or "No Warbank deposit API")
   end
 
   -- Try common signatures (API differs by build).
   local loc = CreateItemLocationFromBagSlot(bag, slot)
   local bankTypeAccount = (Enum and Enum.BankType) and Enum.BankType.Account or nil
 
+  local lastErr
   local function tryCall(...)
-    local ok, res = pcall(f, ...)
-    if ok and res ~= false then
+    local ok, resOrErr = pcall(f, ...)
+    if ok then
+      if resOrErr == false then
+        lastErr = "returned false"
+        return false
+      end
       return true
+    end
+    lastErr = tostring(resOrErr)
+    return false
+  end
+
+  -- Signature zoo: different builds use different function names/args.
+  -- We try the safest/most common permutations first.
+  if loc ~= nil then
+    if tryCall(loc) then return true end
+  end
+  if tryCall(bag, slot) then return true end
+
+  if bankTypeAccount ~= nil then
+    if loc ~= nil and tryCall(bankTypeAccount, loc) then return true end
+    if tryCall(bankTypeAccount, bag, slot) then return true end
+    if loc ~= nil and tryCall(loc, bankTypeAccount) then return true end
+    if tryCall(bag, slot, bankTypeAccount) then return true end
+  end
+
+  return false, tostring(fnName or "deposit") .. ": " .. tostring(lastErr or "failed")
+end
+
+GetItemMaxStack = function(itemID)
+  itemID = tonumber(itemID)
+  if not itemID or itemID <= 0 then return 1 end
+  if type(GetItemInfo) ~= "function" then return 1 end
+  local okS, s = pcall(function() return select(8, GetItemInfo(itemID)) end)
+  local maxStack = (okS and tonumber(s)) or 1
+  if not maxStack or maxStack < 1 then maxStack = 1 end
+  return math.floor(maxStack)
+end
+
+local function WithdrawWarbankPartialStacksToBags(itemID, maxStack)
+  itemID = tonumber(itemID)
+  maxStack = tonumber(maxStack)
+  if not itemID or itemID <= 0 then return true end
+  if not maxStack or maxStack <= 1 then return true end
+  if not (C_Container and type(C_Container.PickupContainerItem) == "function") then
+    return false, "No container pickup API"
+  end
+
+  local function cursorHasItem()
+    if GetCursorInfo then
+      local ok, kind = pcall(GetCursorInfo)
+      return ok and kind == "item"
+    end
+    local cursorHas = _G and rawget(_G, "CursorHasItem")
+    if type(cursorHas) == "function" then
+      local ok, has = pcall(cursorHas)
+      return ok and has == true
     end
     return false
   end
 
-  if bankTypeAccount ~= nil then
-    if tryCall(bankTypeAccount, bag, slot) then return true end
-    if loc ~= nil and tryCall(bankTypeAccount, loc) then return true end
+  local function clearCursor()
+    if ClearCursor and type(ClearCursor) == "function" then
+      pcall(ClearCursor)
+    end
   end
 
-  if tryCall(bag, slot) then return true end
-  if loc ~= nil and tryCall(loc) then return true end
+  local function findBestBagSlot()
+    local bestBag, bestSlot
+    local firstEmptyBag, firstEmptySlot
+    for bag = 0, 6 do
+      local n = 0
+      if type(C_Container.GetContainerNumSlots) == "function" then
+        local ok, v = pcall(C_Container.GetContainerNumSlots, bag)
+        n = ok and tonumber(v) or 0
+      end
+      if n and n > 0 then
+        for slot = 1, n do
+          local info = nil
+          if type(C_Container.GetContainerItemInfo) == "function" then
+            local ok, v = pcall(C_Container.GetContainerItemInfo, bag, slot)
+            info = ok and v or nil
+          end
+          if info and tonumber(info.itemID) == itemID then
+            local count = tonumber(info.stackCount)
+            local locked = info.isLocked
+            if count and count > 0 and count < maxStack and locked ~= true then
+              return bag, slot
+            end
+          end
+          if info == nil and not firstEmptyBag then
+            firstEmptyBag, firstEmptySlot = bag, slot
+          end
+        end
+      end
+    end
+    return firstEmptyBag, firstEmptySlot
+  end
 
-  return false, tostring(fnName or "deposit")
+  local selectedTab = GetSelectedAccountBankTabBagID()
+  local warBags = {}
+  if selectedTab then
+    warBags[1] = selectedTab
+  elseif Enum and Enum.BagIndex then
+    local e = Enum.BagIndex
+    warBags = { e.AccountBankTab_1, e.AccountBankTab_2, e.AccountBankTab_3, e.AccountBankTab_4, e.AccountBankTab_5 }
+  end
+
+  local moved = 0
+  local maxMoves = 80
+  for i = 1, #warBags do
+    local wBag = warBags[i]
+    if IsAccountBankBagID(wBag) then
+      local n = 0
+      if type(C_Container.GetContainerNumSlots) == "function" then
+        local ok, v = pcall(C_Container.GetContainerNumSlots, wBag)
+        n = ok and tonumber(v) or 0
+      end
+      if n and n > 0 then
+        for wSlot = 1, n do
+          if moved >= maxMoves then
+            return true
+          end
+
+          local info = nil
+          if type(C_Container.GetContainerItemInfo) == "function" then
+            local ok, v = pcall(C_Container.GetContainerItemInfo, wBag, wSlot)
+            info = ok and v or nil
+          end
+          if info and tonumber(info.itemID) == itemID then
+            local count = tonumber(info.stackCount)
+            local locked = info.isLocked
+            if count and count > 0 and count < maxStack and locked ~= true then
+              local tBag, tSlot = findBestBagSlot()
+              if not (tBag and tSlot) then
+                clearCursor()
+                return false, "No bag space to withdraw partial Warbank stack"
+              end
+
+              if cursorHasItem() then clearCursor() end
+
+              local okPick, errPick = pcall(C_Container.PickupContainerItem, wBag, wSlot)
+              if not okPick then
+                clearCursor()
+                return false, "Withdraw pickup failed: " .. tostring(errPick)
+              end
+              if not cursorHasItem() then
+                clearCursor()
+                return false, "Withdraw pickup did not put item on cursor"
+              end
+
+              local okPlace, errPlace = pcall(C_Container.PickupContainerItem, tBag, tSlot)
+              if not okPlace then
+                clearCursor()
+                return false, "Withdraw place failed: " .. tostring(errPlace)
+              end
+              if cursorHasItem() then
+                clearCursor()
+                return false, "Withdraw place was blocked"
+              end
+              moved = moved + 1
+            end
+          end
+        end
+      end
+    end
+  end
+
+  return true
 end
 
 local function RunDepositWarband()
   if not IsWarbankOpen() then
-    Print("WarBank is not open.")
     return false
   end
 
@@ -722,7 +2004,81 @@ local function RunDepositWarband()
     return false
   end
 
+  -- Optional workaround (Stack Pull): For stackable items, if Warbank already has
+  -- a partial stack (count < max stack), withdraw that partial stack to bags first, then deposit.
+  do
+    local function FindAnyPartialWarbankStackCount(itemID, maxStack)
+      itemID = tonumber(itemID)
+      maxStack = tonumber(maxStack) or 1
+      if not itemID or itemID <= 0 then return nil end
+      if not maxStack or maxStack < 2 then return nil end
+
+      local warBags = {}
+      if Enum and Enum.BagIndex then
+        local e = Enum.BagIndex
+        warBags = { e.AccountBankTab_1, e.AccountBankTab_2, e.AccountBankTab_3, e.AccountBankTab_4, e.AccountBankTab_5 }
+      end
+
+      for i = 1, #warBags do
+        local wBag = warBags[i]
+        if IsAccountBankBagID(wBag) then
+          local n = 0
+          if type(C_Container.GetContainerNumSlots) == "function" then
+            local ok, v = pcall(C_Container.GetContainerNumSlots, wBag)
+            n = ok and tonumber(v) or 0
+          end
+          if n and n > 0 then
+            for wSlot = 1, n do
+              local info = nil
+              if type(C_Container.GetContainerItemInfo) == "function" then
+                local ok, v = pcall(C_Container.GetContainerItemInfo, wBag, wSlot)
+                info = ok and v or nil
+              end
+              if info and tonumber(info.itemID) == itemID then
+                local count = tonumber(info.stackCount)
+                local locked = info.isLocked
+                if count and count > 0 and count < maxStack and locked ~= true then
+                  return count
+                end
+              end
+            end
+          end
+        end
+      end
+
+      return nil
+    end
+
+    local touched = {}
+    for itemID in pairs(targets) do
+      itemID = tonumber(itemID)
+      if itemID and itemID > 0 and IsStackPullEnabledForItem(itemID) and not touched[itemID] then
+        local maxStack = GetItemMaxStack(itemID)
+        if maxStack and maxStack > 1 then
+          -- Prevent oscillation: only apply the workaround when we can actually
+          -- fill a partial stack using items currently in bags.
+          local inBags = CountItemInPlayerBags(itemID)
+          if inBags and inBags > 0 then
+            local partialCount = FindAnyPartialWarbankStackCount(itemID, maxStack)
+            if partialCount and partialCount > 0 and partialCount < maxStack then
+              local needToFill = maxStack - partialCount
+              if needToFill > 0 and inBags >= needToFill then
+                touched[itemID] = true
+                local okW, whyW = WithdrawWarbankPartialStacksToBags(itemID, maxStack)
+                if not okW then
+                  Print("Withdraw blocked (warbank): " .. tostring(whyW or "unknown"))
+                  return false
+                end
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+
   local moved = 0
+  local movedLines = {}
   local maxMoves = 200
   for bag = 0, 6 do
     local n = 0
@@ -741,12 +2097,36 @@ local function RunDepositWarband()
         end
         local itemID = info and tonumber(info.itemID) or nil
         if itemID and targets[itemID] == true then
-          local okMove = DepositToWarbankOnce(bag, slot)
-          if okMove then
-            moved = moved + 1
-          else
-            Print("Deposit blocked; try clicking Deposit again.")
-            return moved > 0
+          local stack = (info and tonumber(info.stackCount)) or 1
+          local depositCount = stack
+          local keep = GetEffectiveKeepAmount(itemID)
+          if keep > 0 then
+            local current = CountItemInPlayerBags(itemID)
+            local excess = (current or 0) - keep
+            if excess <= 0 then
+              depositCount = 0
+            elseif excess < depositCount then
+              depositCount = excess
+            end
+          end
+
+          if depositCount and depositCount > 0 then
+            local link = nil
+            if C_Container and type(C_Container.GetContainerItemLink) == "function" then
+              local okL, vL = pcall(C_Container.GetContainerItemLink, bag, slot)
+              link = okL and vL or nil
+            end
+
+            local okMove, why = DepositToWarbankOnce(bag, slot, itemID, depositCount ~= stack and depositCount or nil)
+            if okMove then
+              moved = moved + 1
+              if moved <= 15 then
+                movedLines[#movedLines + 1] = tostring(link or itemID) .. " x" .. tostring(depositCount)
+              end
+            else
+              Print("Deposit blocked (warbank): " .. tostring(why or "unknown"))
+              return moved > 0
+            end
           end
         end
       end
@@ -756,13 +2136,389 @@ local function RunDepositWarband()
 
   if moved > 0 then
     Print("Deposited: " .. tostring(moved) .. " move(s)")
+    for i = 1, #movedLines do
+      Print("  " .. movedLines[i])
+    end
+    if moved > #movedLines then
+      Print("  (and " .. tostring(moved - #movedLines) .. " more)")
+    end
     return true
   end
-  Print("No matching items found in bags.")
+  -- Nothing left to deposit; run a cleanup pass like BankStack /sort account.
+  RunDepositCleanupOncePerReset("warbank", TryAutoSortBankPanel, "account", "daily")
   return false
 end
 
+-- Keep amount (Deposit mode): if bags have less than Keep and the selected/open
+-- bank has stock, withdraw up to the amount needed.
+
+local function CursorHasItemSafe()
+  if type(GetCursorInfo) == "function" then
+    local ok, kind = pcall(GetCursorInfo)
+    return ok and kind == "item"
+  end
+  local cursorHas = _G and rawget(_G, "CursorHasItem")
+  if type(cursorHas) == "function" then
+    local ok, has = pcall(cursorHas)
+    return ok and has == true
+  end
+  return false
+end
+
+local function ClearCursorSafe()
+  if ClearCursor and type(ClearCursor) == "function" then
+    pcall(ClearCursor)
+  end
+end
+
+local function FindBestBagSlotForItem(itemID, maxStack)
+  itemID = tonumber(itemID)
+  maxStack = tonumber(maxStack) or 1
+  if not itemID or itemID <= 0 then return nil end
+  if not maxStack or maxStack < 1 then maxStack = 1 end
+
+  local firstEmptyBag, firstEmptySlot
+  for bag = 0, 6 do
+    local n = 0
+    if C_Container and type(C_Container.GetContainerNumSlots) == "function" then
+      local ok, v = pcall(C_Container.GetContainerNumSlots, bag)
+      n = ok and tonumber(v) or 0
+    end
+    if n and n > 0 then
+      for slot = 1, n do
+        local info = nil
+        if C_Container and type(C_Container.GetContainerItemInfo) == "function" then
+          local ok, v = pcall(C_Container.GetContainerItemInfo, bag, slot)
+          info = ok and v or nil
+        end
+
+        if info and tonumber(info.itemID) == itemID then
+          local count = tonumber(info.stackCount)
+          local locked = info.isLocked
+          if count and count > 0 and count < maxStack and locked ~= true then
+            return bag, slot
+          end
+        end
+
+        if info == nil and not firstEmptyBag then
+          firstEmptyBag, firstEmptySlot = bag, slot
+        end
+      end
+    end
+  end
+  return firstEmptyBag, firstEmptySlot
+end
+
+WithdrawFromContainerBagsToBags = function(sourceBags, itemID, wantCount)
+  if not (C_Container and type(C_Container.GetContainerNumSlots) == "function") then
+    return 0, "No container API"
+  end
+  itemID = tonumber(itemID)
+  wantCount = tonumber(wantCount)
+  if not itemID or itemID <= 0 then return 0 end
+  wantCount = wantCount and math.floor(wantCount) or 0
+  if wantCount <= 0 then return 0 end
+
+  local maxStack = GetItemMaxStack(itemID)
+  local moved = 0
+
+  for i = 1, #sourceBags do
+    local sBag = sourceBags[i]
+    local n = 0
+    local okN, vN = pcall(C_Container.GetContainerNumSlots, sBag)
+    n = okN and tonumber(vN) or 0
+    if n and n > 0 then
+      for sSlot = 1, n do
+        if moved >= wantCount then
+          return moved
+        end
+
+        local info = nil
+        if type(C_Container.GetContainerItemInfo) == "function" then
+          local ok, v = pcall(C_Container.GetContainerItemInfo, sBag, sSlot)
+          info = ok and v or nil
+        end
+        local id = info and tonumber(info.itemID) or nil
+        if id and id == itemID then
+          local count = (info and tonumber(info.stackCount)) or 1
+          local locked = info and info.isLocked or nil
+          if locked ~= true and count > 0 then
+            local need = wantCount - moved
+            local take = (need < count) and need or count
+            if take > 0 then
+              local tBag, tSlot = FindBestBagSlotForItem(itemID, maxStack)
+              if not (tBag and tSlot) then
+                ClearCursorSafe()
+                return moved, "No bag space"
+              end
+
+              if CursorHasItemSafe() then ClearCursorSafe() end
+
+              local okPick, errPick = SplitPickupContainerItemSafe(sBag, sSlot, (take < count) and take or nil)
+              if not okPick then
+                ClearCursorSafe()
+                return moved, "Withdraw pickup failed: " .. tostring(errPick)
+              end
+              if not CursorHasItemSafe() then
+                ClearCursorSafe()
+                return moved, "Withdraw pickup did not put item on cursor"
+              end
+
+              local okPlace, errPlace = pcall(C_Container.PickupContainerItem, tBag, tSlot)
+              if not okPlace then
+                ClearCursorSafe()
+                return moved, "Withdraw place failed: " .. tostring(errPlace)
+              end
+              if CursorHasItemSafe() then
+                ClearCursorSafe()
+                return moved, "Withdraw place was blocked"
+              end
+
+              moved = moved + take
+            end
+          end
+        end
+      end
+    end
+  end
+
+  return moved
+end
+
+GetPersonalBankBagIDs = function()
+  local out = {}
+  local seen = {}
+  local function add(id)
+    id = tonumber(id)
+    if not id then return end
+    if seen[id] then return end
+    seen[id] = true
+    out[#out + 1] = id
+  end
+
+  -- Newer client constants (access via rawget to keep analyzers happy).
+  local e = (Enum and Enum.BagIndex) and Enum.BagIndex or nil
+  if type(e) == "table" then
+    add(rawget(e, "Bank"))
+    add(rawget(e, "ReagentBank"))
+    for i = 1, 7 do
+      add(rawget(e, "BankBag_" .. tostring(i)))
+    end
+  end
+
+  local bankContainer = _G and rawget(_G, "BANK_CONTAINER")
+  if bankContainer ~= nil then
+    add(bankContainer)
+  else
+    add(-1)
+  end
+
+  -- Legacy-ish bank bag ids (best-effort)
+  for id = 5, 11 do
+    add(id)
+  end
+
+  -- Filter to those that actually have slots.
+  if not (C_Container and type(C_Container.GetContainerNumSlots) == "function") then
+    return out
+  end
+  local filtered = {}
+  for i = 1, #out do
+    local bagID = out[i]
+    local ok, n = pcall(C_Container.GetContainerNumSlots, bagID)
+    n = ok and tonumber(n) or 0
+    if n and n > 0 then
+      filtered[#filtered + 1] = bagID
+    end
+  end
+  return filtered
+end
+
+WithdrawFromGuildBankToBags = function(tab, itemID, wantCount)
+  tab = tonumber(tab)
+  itemID = tonumber(itemID)
+  wantCount = tonumber(wantCount)
+  if not tab or tab <= 0 then return 0 end
+  if not itemID or itemID <= 0 then return 0 end
+  wantCount = wantCount and math.floor(wantCount) or 0
+  if wantCount <= 0 then return 0 end
+  if type(GetGuildBankItemLink) ~= "function" then return 0, "No guild bank API" end
+  if type(PickupGuildBankItem) ~= "function" then return 0, "No guild bank API" end
+  if not (C_Container and type(C_Container.PickupContainerItem) == "function") then
+    return 0, "No container pickup API"
+  end
+
+  if QueryGuildBankTabIfNeeded then
+    QueryGuildBankTabIfNeeded(tab)
+  end
+  local maxSlots = _G and rawget(_G, "MAX_GUILDBANK_SLOTS_PER_TAB")
+  maxSlots = tonumber(maxSlots) or 98
+
+  local maxStack = GetItemMaxStack(itemID)
+  local moved = 0
+  for slot = 1, maxSlots do
+    if moved >= wantCount then return moved end
+    local okL, link = pcall(GetGuildBankItemLink, tab, slot)
+    link = okL and link or nil
+    if type(link) == "string" then
+      local id = tonumber(string.match(link, "item:(%d+)"))
+      if id and id == itemID then
+        local okI, _, count, locked = false, nil, nil, nil
+        if type(GetGuildBankItemInfo) == "function" then
+          okI, _, count, locked = pcall(GetGuildBankItemInfo, tab, slot)
+        end
+        count = okI and tonumber(count) or nil
+        locked = okI and locked or nil
+        if locked ~= true and count and count > 0 then
+          local need = wantCount - moved
+          local take = (need < count) and need or count
+          if take > 0 then
+            local tBag, tSlot = FindBestBagSlotForItem(itemID, maxStack)
+            if not (tBag and tSlot) then
+              ClearCursorSafe()
+              return moved, "No bag space"
+            end
+            if CursorHasItemSafe() then ClearCursorSafe() end
+
+            local okPick, errPick
+            if take < count and type(SplitGuildBankItem) == "function" then
+              okPick, errPick = pcall(SplitGuildBankItem, tab, slot, take)
+            else
+              okPick, errPick = pcall(PickupGuildBankItem, tab, slot)
+            end
+            if not okPick then
+              ClearCursorSafe()
+              return moved, "Withdraw pickup failed: " .. tostring(errPick)
+            end
+            if not CursorHasItemSafe() then
+              ClearCursorSafe()
+              return moved, "Withdraw pickup did not put item on cursor"
+            end
+
+            local okPlace, errPlace = pcall(C_Container.PickupContainerItem, tBag, tSlot)
+            if not okPlace then
+              ClearCursorSafe()
+              return moved, "Withdraw place failed: " .. tostring(errPlace)
+            end
+            if CursorHasItemSafe() then
+              ClearCursorSafe()
+              return moved, "Withdraw place was blocked"
+            end
+
+            moved = moved + take
+          end
+        end
+      end
+    end
+  end
+  return moved
+end
+
+local function RunKeepTopUpForTarget(target, targets)
+  if type(targets) ~= "table" then return false end
+  local hasAny = false
+  for _ in pairs(targets) do hasAny = true break end
+  if not hasAny then return false end
+
+  local function resolvedTarget(t)
+    t = tostring(t or "")
+    t = t:lower():gsub("%s+", "")
+    if t == "either" then t = "bank" end
+    if t == "warband" then t = "warbank" end
+    if t ~= "bank" and t ~= "guild" and t ~= "warbank" then t = "" end
+    return t
+  end
+
+  target = resolvedTarget(target)
+  if target == "" then
+    local cfg = DepositCfgAcc()
+    target = resolvedTarget(cfg and cfg.target)
+    if target == "" then target = "bank" end
+  end
+
+  if target == "bank" then
+    if IsWarbankOpen() then target = "warbank"
+    elseif IsGuildBankOpen() then target = "guild"
+    elseif IsPersonalBankOpen() then target = "bank"
+    else return false end
+  end
+
+  local anyMoved = false
+  for itemID in pairs(targets) do
+    itemID = tonumber(itemID)
+    if itemID and itemID > 0 then
+      local keep = GetEffectiveKeepAmount(itemID)
+      if keep > 0 then
+        local have = CountItemInPlayerBags(itemID)
+        if have < keep then
+          local need = keep - have
+          local moved = 0
+          local why
+
+          if target == "warbank" then
+            if not IsWarbankOpen() then
+              return anyMoved
+            end
+
+            local selectedTab = GetSelectedAccountBankTabBagID()
+            local warBags = {}
+            if selectedTab then
+              warBags[1] = selectedTab
+            elseif Enum and Enum.BagIndex then
+              local e = Enum.BagIndex
+              warBags = {
+                rawget(e, "AccountBankTab_1"),
+                rawget(e, "AccountBankTab_2"),
+                rawget(e, "AccountBankTab_3"),
+                rawget(e, "AccountBankTab_4"),
+                rawget(e, "AccountBankTab_5"),
+              }
+            end
+            local src = {}
+            for i = 1, #warBags do
+              local id = warBags[i]
+              if id and IsAccountBankBagID(id) then src[#src + 1] = id end
+            end
+            if #src == 0 then
+              moved, why = 0, "No Warbank tab is available/selected"
+            else
+              moved, why = WithdrawFromContainerBagsToBags(src, itemID, need)
+            end
+          elseif target == "guild" then
+            if not IsGuildBankOpen() then
+              return anyMoved
+            end
+            local tab = GetConfiguredGuildBankTab()
+            moved, why = WithdrawFromGuildBankToBags(tab, itemID, need)
+          else
+            if not IsPersonalBankOpen() then
+              return anyMoved
+            end
+            local src = GetPersonalBankBagIDs()
+            moved, why = WithdrawFromContainerBagsToBags(src, itemID, need)
+          end
+
+          if moved and moved > 0 then
+            anyMoved = true
+          elseif why then
+            -- Don't spam: only warn when Keep is configured and something is actively blocked.
+            Print("Keep withdraw blocked: " .. tostring(why))
+            return anyMoved
+          end
+        end
+      end
+    end
+  end
+
+  return anyMoved
+end
+
 local function RunDeposit(target)
+  -- Hard gate: do nothing at all unless some bank UI is open.
+  if not (IsWarbankOpen() or IsGuildBankOpen() or IsPersonalBankOpen()) then
+    return false
+  end
+
   local function Normalize(t)
     t = tostring(t or "")
     t = t:lower():gsub("%s+", "")
@@ -781,21 +2537,30 @@ local function RunDeposit(target)
     if target == "" then target = "bank" end
   end
 
+  local keepMoved = false
+  do
+    local targets = GetEffectiveDepositItemIDs()
+    keepMoved = RunKeepTopUpForTarget(target, targets) == true
+  end
+  local didDeposit = false
   if target == "guild" then
-    return RunDepositGuild()
+    didDeposit = RunDepositGuild() == true
   elseif target == "warbank" then
-    return RunDepositWarband()
+    didDeposit = RunDepositWarband() == true
   else
     -- Bank: whichever bank is currently open.
     if IsWarbankOpen() then
-      return RunDepositWarband()
+      didDeposit = RunDepositWarband() == true
+    elseif IsGuildBankOpen() then
+      didDeposit = RunDepositGuild() == true
+    elseif IsPersonalBankOpen() then
+      didDeposit = RunDepositPersonalBank() == true
+    else
+      didDeposit = false
     end
-    if IsGuildBankOpen() then
-      return RunDepositGuild()
-    end
-    Print("No bank is open.")
-    return false
   end
+
+  return (keepMoved or didDeposit) and true or false
 end
 
 -- Vendor buy/sell/restock (merchant open)
@@ -844,6 +2609,74 @@ local function GetItemNameSafe(itemID)
     end
   end
   return nil
+end
+
+local function GetItemLinkSafe(itemID)
+  itemID = tonumber(itemID)
+  if not itemID or itemID <= 0 then return nil end
+  if type(GetItemInfo) == "function" then
+    local ok, name, link = pcall(GetItemInfo, itemID)
+    if ok and type(link) == "string" and link ~= "" then
+      return link
+    end
+    if ok and type(name) == "string" and name ~= "" then
+      return name
+    end
+  end
+  return GetItemNameSafe(itemID) or tostring(itemID)
+end
+
+local function StripLinkBrackets(s)
+  if type(s) ~= "string" then return s end
+  -- Item links are usually: |Hitem:...|h[Name]|h
+  s = s:gsub("(|h)%[(.-)%](|h)", "%1%2%3")
+  return s
+end
+
+local function GetClassColoredPlayerName()
+  local n = (UnitName and UnitName("player")) or ""
+  n = tostring(n or "")
+  local short = n:match("^(.-)%-") or n
+  if short == "" then short = "Player" end
+
+  local classFile = nil
+  if type(UnitClass) == "function" then
+    local _, c = UnitClass("player")
+    classFile = c
+  end
+
+  local r, g, b = 1, 1, 1
+  if classFile and type(C_ClassColor) == "table" and type(C_ClassColor.GetClassColor) == "function" then
+    local ok, colorObj = pcall(C_ClassColor.GetClassColor, classFile)
+    if ok and type(colorObj) == "table" then
+      if type(colorObj.GetRGB) == "function" then
+        local rr, gg, bb = colorObj:GetRGB()
+        r, g, b = tonumber(rr) or r, tonumber(gg) or g, tonumber(bb) or b
+      elseif type(colorObj.r) == "number" then
+        r, g, b = colorObj.r or r, colorObj.g or g, colorObj.b or b
+      end
+    end
+  elseif classFile and type(RAID_CLASS_COLORS) == "table" and type(RAID_CLASS_COLORS[classFile]) == "table" then
+    local c = RAID_CLASS_COLORS[classFile]
+    r, g, b = tonumber(c.r) or r, tonumber(c.g) or g, tonumber(c.b) or b
+  end
+
+  local function toHex(x)
+    x = tonumber(x) or 0
+    if x < 0 then x = 0 end
+    if x > 1 then x = 1 end
+    return string.format("%02x", math.floor(x * 255 + 0.5))
+  end
+
+  return "|cff" .. toHex(r) .. toHex(g) .. toHex(b) .. short .. ":|r"
+end
+
+local function FormatGoldOnly(totalCopper)
+  local copper = tonumber(totalCopper) or 0
+  if copper < 0 then copper = 0 end
+  local gold = math.floor(copper / 10000)
+  if gold < 1 then gold = 1 end
+  return tostring(gold) .. "|TInterface\\MoneyFrame\\UI-GoldIcon:0:0:2:0|t"
 end
 
 local function GetRealmRuleTable(cfg, mode)
@@ -1078,18 +2911,31 @@ end
 
 local function IsFoodItemID(itemID)
   if not (C_Item and type(C_Item.GetItemInfoInstant) == "function") then return false end
-  local ok, _, _, _, _, classID, subClassID = pcall(C_Item.GetItemInfoInstant, itemID)
+  local ok, _, _, _, _, _, classID, subClassID = pcall(C_Item.GetItemInfoInstant, itemID)
   if not ok then return false end
   return (tonumber(classID) == 0) and (tonumber(subClassID) == 5)
 end
 
-local function GetItemMinLevel(itemID)
+local function GetItemMinLevel(itemID, link)
   itemID = tonumber(itemID)
   if not itemID then return nil end
   if type(GetItemInfo) == "function" then
-    local _, _, _, _, reqLevel = GetItemInfo(itemID)
+    local _, _, _, ilvl, reqLevel = GetItemInfo(itemID)
     reqLevel = tonumber(reqLevel)
-    return reqLevel
+    if reqLevel and reqLevel > 0 then
+      return reqLevel
+    end
+    ilvl = tonumber(ilvl)
+    if ilvl and ilvl > 0 then
+      return ilvl
+    end
+  end
+  if link and type(GetDetailedItemLevelInfo) == "function" then
+    local okI, ilvl = pcall(GetDetailedItemLevelInfo, link)
+    ilvl = okI and tonumber(ilvl) or nil
+    if ilvl and ilvl > 0 then
+      return ilvl
+    end
   end
   return nil
 end
@@ -1124,7 +2970,12 @@ local function SellOldFoodAtMerchant(levelDiff)
     if not info or info.isLocked then return end
     local itemID = tonumber(info.itemID)
     if not itemID or not IsFoodItemID(itemID) then return end
-    local req = GetItemMinLevel(itemID)
+    local link = nil
+    if C_Container and type(C_Container.GetContainerItemLink) == "function" then
+      local okL, vL = pcall(C_Container.GetContainerItemLink, bag, slot)
+      link = okL and vL or nil
+    end
+    local req = GetItemMinLevel(itemID, link)
     if not req or req <= 0 then return end
     if req > threshold then return end
     local sellPrice = GetItemSellPrice(itemID)
@@ -1138,13 +2989,106 @@ local function SellOldFoodAtMerchant(levelDiff)
 
   for id, cnt in pairs(soldByID) do
     if Print then
-      Print("Sold old food: " .. (GetItemNameSafe(id) or tostring(id)) .. " x" .. tostring(cnt))
+      local perItem = GetItemSellPrice(id)
+      local total = (perItem and perItem > 0) and (perItem * cnt) or nil
+      local moneyText = FormatGoldOnly(total or 0)
+      local itemText = StripLinkBrackets(GetItemLinkSafe(id) or tostring(id))
+      Print(GetClassColoredPlayerName() .. " " .. tostring(moneyText) .. "  Sold  " .. tostring(itemText) .. " x" .. tostring(cnt))
     end
   end
 end
 
+local function IsSellFoodEnabled()
+  EnsureDB()
+  local acc = DepositCfgAcc()
+  local ch = DepositCfgChar()
+  return ((acc and acc.sellFoodEnabledAcc) == true) or ((ch and ch.sellFoodEnabledChar) == true)
+end
+
+local function DebugSellOldFoodAtMerchant(levelDiff, maxLines)
+  local diff = tonumber(levelDiff) or 10
+  if diff < 1 then diff = 1 end
+  if diff > 80 then diff = 80 end
+
+  local pl = type(UnitLevel) == "function" and tonumber(UnitLevel("player")) or nil
+  local threshold = (pl and pl > 1) and (pl - diff) or nil
+
+  local mf = _G and rawget(_G, "MerchantFrame")
+  local merchantShown = (mf and mf.IsShown and mf:IsShown()) and true or false
+
+  Print("Food debug: merchantShown=" .. tostring(merchantShown) .. ", enabled=" .. tostring(IsSellFoodEnabled()) .. ", diff=" .. tostring(diff) .. ", player=" .. tostring(pl) .. ", threshold=" .. tostring(threshold))
+
+  local lines = 0
+  local cap = tonumber(maxLines) or 25
+  if cap < 5 then cap = 5 end
+  if cap > 60 then cap = 60 end
+
+  local counts = { total = 0, food = 0, eligible = 0, locked = 0, noReq = 0, above = 0, noPrice = 0 }
+
+  IterateBagSlots(function(bag, slot)
+    if lines >= cap then return end
+
+    local info = GetBagItemInfo(bag, slot)
+    if not info then return end
+    local itemID = tonumber(info.itemID)
+    if not itemID or itemID <= 0 then return end
+
+    counts.total = counts.total + 1
+    local locked = (info.isLocked == true)
+    if locked then counts.locked = counts.locked + 1 end
+
+    local classID, subClassID = nil, nil
+    if C_Item and type(C_Item.GetItemInfoInstant) == "function" then
+      local ok, _, _, _, _, _, c, s = pcall(C_Item.GetItemInfoInstant, itemID)
+      if ok then classID, subClassID = tonumber(c), tonumber(s) end
+    end
+    local isFood = IsFoodItemID(itemID)
+    if isFood then counts.food = counts.food + 1 end
+    if not isFood then return end
+
+    local link = nil
+    if C_Container and type(C_Container.GetContainerItemLink) == "function" then
+      local okL, vL = pcall(C_Container.GetContainerItemLink, bag, slot)
+      link = okL and vL or nil
+    end
+
+    local req = GetItemMinLevel(itemID, link)
+    if not req or req <= 0 then counts.noReq = counts.noReq + 1 end
+
+    local sellPrice = GetItemSellPrice(itemID)
+    if not sellPrice or sellPrice <= 0 then counts.noPrice = counts.noPrice + 1 end
+
+    local okThreshold = (threshold ~= nil) and (req ~= nil) and (req > 0) and (req <= threshold)
+    if threshold ~= nil and req and req > threshold then counts.above = counts.above + 1 end
+
+    local eligible = (not locked) and okThreshold and (sellPrice and sellPrice > 0)
+    if eligible then counts.eligible = counts.eligible + 1 end
+
+    local name = (GetItemNameSafe and GetItemNameSafe(itemID)) or tostring(itemID)
+    local stack = tonumber(info.stackCount) or 1
+    Print(string.format("Food slot: bag=%d slot=%d id=%d x%d class=%s/%s req=%s price=%s eligible=%s %s", bag, slot, itemID, stack, tostring(classID), tostring(subClassID), tostring(req), tostring(sellPrice), tostring(eligible), name))
+    lines = lines + 1
+  end)
+
+  Print(string.format("Food debug summary: totalItems=%d, food=%d, eligible=%d, locked=%d, noReq=%d, aboveThreshold=%d, noPrice=%d", counts.total, counts.food, counts.eligible, counts.locked, counts.noReq, counts.above, counts.noPrice))
+end
+
+LI.DebugSellOldFoodAtMerchant = DebugSellOldFoodAtMerchant
+
 local function RunMerchantTradeOnce()
   local mode = GetTradeMode()
+
+  local foodEnabled = IsSellFoodEnabled()
+  local foodDiff = (DB and DB.deposit and tonumber(DB.deposit.sellFoodLevelDiff)) or 10
+  foodDiff = foodDiff and math.floor(foodDiff) or 10
+  if foodDiff < 1 then foodDiff = 1 end
+  if foodDiff > 80 then foodDiff = 80 end
+
+  -- Food selling is independent of buy/sell mode; run whenever enabled at merchant.
+  if foodEnabled then
+    SellOldFoodAtMerchant(foodDiff)
+  end
+
   if mode ~= "buy" and mode ~= "sell" then return end
 
   local rules = GetEffectiveTradeRules(mode)
@@ -1158,9 +3102,7 @@ local function RunMerchantTradeOnce()
   end
   if not any then return end
 
-  if mode == "buy" and anyRestock then
-    SellOldFoodAtMerchant(10)
-  end
+LI.RunDeposit = RunDeposit
 
   local usesMana = PlayerUsesMana()
   local ops = 0
@@ -1300,6 +3242,8 @@ local function UpdateDepositButtonVisibility()
   end
   b:Hide()
 end
+
+LI.UpdateDepositButtonVisibility = UpdateDepositButtonVisibility
 
 local function IsMailNotifierEnabled()
   -- Tri-state:
@@ -1603,6 +3547,7 @@ do
       UpdateMailNotifier = UpdateMailNotifier,
       CreateMailNotifier = CreateMailNotifier,
       ApplyMailModelToFrame = ApplyMailModelToFrame,
+      DebugSellOldFoodAtMerchant = DebugSellOldFoodAtMerchant,
     })
   end
 end
@@ -1621,6 +3566,7 @@ end
 local f = CreateFrame("Frame")
 f:RegisterEvent("PLAYER_LOGIN")
 f:RegisterEvent("PLAYER_ENTERING_WORLD")
+f:RegisterEvent("PLAYER_GUILD_UPDATE")
 f:RegisterEvent("MERCHANT_SHOW")
 f:RegisterEvent("MERCHANT_CLOSED")
 f:RegisterEvent("UPDATE_PENDING_MAIL")
@@ -1638,6 +3584,7 @@ f:RegisterEvent("LOOT_READY")
 f:SetScript("OnEvent", function(_, event, arg1)
   EnsureDB()
   if event == "PLAYER_LOGIN" then
+    UpdateSeenGuilds()
     do
       local tabard = _G and rawget(_G, "fr0z3nUI_LootItTabard")
       if tabard and tabard.Init then
@@ -1651,11 +3598,14 @@ f:SetScript("OnEvent", function(_, event, arg1)
       C_Timer.After(0.25, UpdateDepositButtonVisibility)
     end
   elseif event == "PLAYER_ENTERING_WORLD" then
+    UpdateSeenGuilds()
     ApplyFiltersSoon(0.5)
     C_Timer.After(1, UpdateMailNotifier)
     if UpdateDepositButtonVisibility then
       C_Timer.After(0.25, UpdateDepositButtonVisibility)
     end
+  elseif event == "PLAYER_GUILD_UPDATE" then
+    UpdateSeenGuilds()
   elseif event == "MERCHANT_SHOW" then
     RunMerchantTradeOnce()
   elseif event == "MERCHANT_CLOSED" then
@@ -1664,12 +3614,19 @@ f:SetScript("OnEvent", function(_, event, arg1)
     end
   elseif event == "PLAYER_INTERACTION_MANAGER_FRAME_SHOW" or event == "PLAYER_INTERACTION_MANAGER_FRAME_HIDE" then
     local it = (Enum and Enum.PlayerInteractionType) and Enum.PlayerInteractionType or nil
+    local isShow = (event == "PLAYER_INTERACTION_MANAGER_FRAME_SHOW")
+    local isBanker = (it and it.Banker and arg1 == it.Banker) and true or false
     local isAccountBanker = (it and it.AccountBanker and arg1 == it.AccountBanker) and true or false
-    if isAccountBanker then
-      _warbankInteractionOpen = (event == "PLAYER_INTERACTION_MANAGER_FRAME_SHOW")
-      if UpdateDepositButtonVisibility then
-        UpdateDepositButtonVisibility()
-      end
+    local isGuildBanker = (it and it.GuildBanker and arg1 == it.GuildBanker) and true or false
+    if isBanker then
+      _bankInteractionOpen = isShow
+    elseif isAccountBanker then
+      _warbankInteractionOpen = isShow
+    elseif isGuildBanker then
+      _guildbankInteractionOpen = isShow
+    end
+    if (isBanker or isAccountBanker or isGuildBanker) and UpdateDepositButtonVisibility then
+      UpdateDepositButtonVisibility()
     end
   elseif event == "GUILDBANKFRAME_OPENED" or event == "GUILDBANKFRAME_CLOSED" or event == "BANKFRAME_OPENED" or event == "BANKFRAME_CLOSED" then
     if UpdateDepositButtonVisibility then

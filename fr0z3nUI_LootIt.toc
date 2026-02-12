@@ -16,6 +16,5 @@ fr0z3nUI_LootItOther.lua
 fr0z3nUI_LootItLoot.lua
 fr0z3nUI_LootItLootChat.lua
 fr0z3nUI_LootItUIV.lua
-fr0z3nUI_LootItTabardUI.lua
 fr0z3nUI_LootItUI.lua
 fr0z3nUI_LootIt.lua

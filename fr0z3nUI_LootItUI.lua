@@ -352,7 +352,17 @@ do
 
     do
       local mod = fr0z3nUI_LootIt
-      if mod and mod.TabardUI and type(mod.TabardUI.BuildTab) == "function" then
+      local tabMod = _G and rawget(_G, "fr0z3nUI_LootItTabard")
+      if tabMod and type(tabMod.BuildTab) == "function" then
+        tabMod.BuildTab(tabardPanel, {
+          EnsureDB = EnsureDB,
+          GetDB = function() return DB end,
+          GetCharDB = function() return CHARDB end,
+          Clamp = Clamp,
+          SetCheckBoxText = SetCheckBoxText,
+        })
+      elseif mod and mod.TabardUI and type(mod.TabardUI.BuildTab) == "function" then
+        -- Backward-compat: older split UI module.
         mod.TabardUI.BuildTab(tabardPanel, {
           EnsureDB = EnsureDB,
           GetDB = function() return DB end,

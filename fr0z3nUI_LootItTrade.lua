@@ -149,10 +149,18 @@ function LI.Trade.BuildTab(depositPanel)
     placeholder:SetShown((not hasText) and (not focused))
   end
 
-  edit:SetScript("OnEditFocusGained", function() placeholder:Hide() end)
+  local SetStatus = function(_) end
+
+  edit:SetScript("OnEditFocusGained", function()
+    placeholder:Hide()
+    SetStatus("")
+  end)
   edit:SetScript("OnEditFocusLost", function() UpdatePlaceholder() end)
   if edit.HookScript then
-    edit:HookScript("OnTextChanged", function() UpdatePlaceholder() end)
+    edit:HookScript("OnTextChanged", function()
+      UpdatePlaceholder()
+      SetStatus("")
+    end)
   end
 
   local textArea = CreateFrame("Frame", nil, depositPanel)
@@ -212,6 +220,23 @@ function LI.Trade.BuildTab(depositPanel)
   if btnAcc.RegisterForClicks then btnAcc:RegisterForClicks("LeftButtonUp", "RightButtonUp") end
   btnAcc:Disable()
 
+  local statusLabel = depositPanel:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+  statusLabel:SetPoint("TOP", btnAcc, "BOTTOM", 0, -6)
+  statusLabel:SetJustifyH("CENTER")
+  statusLabel:SetText("")
+  statusLabel:Hide()
+
+  SetStatus = function(msg)
+    msg = tostring(msg or "")
+    if msg == "" then
+      statusLabel:SetText("")
+      statusLabel:Hide()
+      return
+    end
+    statusLabel:SetText("|cff00ff00" .. msg .. "|r")
+    statusLabel:Show()
+  end
+
   local bankBtn = CreateFrame("Button", nil, depositPanel, "UIPanelButtonTemplate")
   bankBtn:SetSize(BTN_W, BTN_H)
   bankBtn:SetPoint("BOTTOM", depositPanel, "BOTTOM", -((BTN_W + BTN_GAP) / 2), ROW_Y + BTN_H + 2)
@@ -221,6 +246,151 @@ function LI.Trade.BuildTab(depositPanel)
   guildTabBtn:SetSize(BTN_W, BTN_H)
   guildTabBtn:SetPoint("BOTTOM", depositPanel, "BOTTOM", ((BTN_W + BTN_GAP) / 2), ROW_Y + BTN_H + 2)
   guildTabBtn:SetText("Current")
+  if guildTabBtn.RegisterForClicks then guildTabBtn:RegisterForClicks("LeftButtonUp", "RightButtonUp") end
+
+  -- Guild enable/disable list (account-wide)
+  local guildListBtn = CreateFrame("Button", nil, depositPanel, "UIPanelButtonTemplate")
+  guildListBtn:SetSize(90, 22)
+  guildListBtn:SetPoint("TOP", bankBtn, "BOTTOM", 0, -6)
+  guildListBtn:SetText("Guild")
+
+  local guildPop = CreateFrame("Frame", nil, depositPanel, "BackdropTemplate")
+  -- Pop out from the left side of the window.
+  guildPop:SetPoint("TOPRIGHT", depositPanel, "TOPLEFT", -8, -24)
+  guildPop:SetSize(240, 220)
+  guildPop:SetFrameStrata("DIALOG")
+  guildPop:Hide()
+
+  if guildPop.SetBackdrop then
+    guildPop:SetBackdrop({
+      bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
+      tile = true,
+      tileSize = 32,
+      insets = { left = 8, right = 8, top = 8, bottom = 8 },
+    })
+  end
+
+  local guildPopTitle = guildPop:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+  guildPopTitle:SetPoint("TOPLEFT", guildPop, "TOPLEFT", 14, -12)
+  guildPopTitle:SetText("Detected Guilds")
+
+  local guildPopClose = CreateFrame("Button", nil, guildPop, "UIPanelCloseButton")
+  guildPopClose:SetPoint("TOPRIGHT", guildPop, "TOPRIGHT", -4, -4)
+
+  local listFrame = CreateFrame("Frame", nil, guildPop)
+  listFrame:SetPoint("TOPLEFT", guildPop, "TOPLEFT", 12, -34)
+  listFrame:SetPoint("BOTTOMRIGHT", guildPop, "BOTTOMRIGHT", -12, 12)
+
+  local function GetGuildRecords()
+    local cfg = DepositCfgAcc()
+    if not cfg then return {}, {} end
+    cfg.guildsSeen = (type(cfg.guildsSeen) == "table") and cfg.guildsSeen or {}
+    cfg.guildEnabled = (type(cfg.guildEnabled) == "table") and cfg.guildEnabled or {}
+    return cfg.guildsSeen, cfg.guildEnabled
+  end
+
+  local function BuildGuildList()
+    local seen, enabled = GetGuildRecords()
+
+    guildPop._items = guildPop._items or {}
+    local items = guildPop._items
+
+    local keys = {}
+    for k, v in pairs(seen) do
+      if type(k) == "string" and k ~= "" and type(v) == "table" then
+        keys[#keys + 1] = k
+      end
+    end
+    table.sort(keys, function(a, b)
+      local va, vb = seen[a], seen[b]
+      local na = (type(va.name) == "string" and va.name) or a
+      local nb = (type(vb.name) == "string" and vb.name) or b
+      na = na:lower()
+      nb = nb:lower()
+      if na == nb then
+        return a:lower() < b:lower()
+      end
+      return na < nb
+    end)
+
+    local rowH = 22
+    local maxRows = 8
+    local rows = #keys
+    if rows < 1 then rows = 1 end
+    local visibleRows = rows
+    if visibleRows > maxRows then visibleRows = maxRows end
+
+    for i = 1, #items do
+      items[i]:Hide()
+    end
+
+    if #keys == 0 then
+      local cb = items[1]
+      if not cb then
+        cb = CreateFrame("CheckButton", nil, listFrame, "UICheckButtonTemplate")
+        items[1] = cb
+      end
+      cb:ClearAllPoints()
+      cb:SetPoint("TOPLEFT", listFrame, "TOPLEFT", 0, 0)
+      cb.Text:SetText("No guilds detected yet")
+      cb:SetChecked(true)
+      cb:Disable()
+      cb:Show()
+      guildPop:SetHeight(120)
+      return
+    end
+
+    for i = 1, #keys do
+      local key = keys[i]
+      local rec = seen[key] or {}
+      local name = (type(rec.name) == "string" and rec.name ~= "") and rec.name or key
+      local realm = (type(rec.realm) == "string" and rec.realm ~= "") and rec.realm or ""
+      local label = name
+      if realm ~= "" then
+        label = label .. " (" .. realm .. ")"
+      end
+
+      local cb = items[i]
+      if not cb then
+        cb = CreateFrame("CheckButton", nil, listFrame, "UICheckButtonTemplate")
+        items[i] = cb
+      end
+      cb:Enable()
+      cb:ClearAllPoints()
+      cb:SetPoint("TOPLEFT", listFrame, "TOPLEFT", 0, -((i - 1) * rowH))
+      cb.Text:SetText(label)
+
+      local on = enabled[key]
+      if on == nil then on = true end
+      cb:SetChecked(on == true)
+
+      cb:SetScript("OnClick", function(self)
+        local cfg = DepositCfgAcc()
+        if not cfg then return end
+        cfg.guildEnabled = (type(cfg.guildEnabled) == "table") and cfg.guildEnabled or {}
+        cfg.guildEnabled[key] = (self:GetChecked() == true)
+      end)
+
+      cb:Show()
+    end
+
+    local height = 70 + (visibleRows * rowH)
+    if height < 140 then height = 140 end
+    guildPop:SetHeight(height)
+  end
+
+  guildListBtn:SetScript("OnClick", function()
+    if guildPop:IsShown() then
+      guildPop:Hide()
+      return
+    end
+    BuildGuildList()
+    guildPop:Show()
+  end)
+
+  depositPanel:HookScript("OnHide", function()
+    if guildPop and guildPop.Hide then guildPop:Hide() end
+  end)
 
   -- Buy/Sell mode controls
   local targetBox = CreateFrame("EditBox", nil, depositPanel, "InputBoxTemplate")
@@ -254,6 +424,133 @@ function LI.Trade.BuildTab(depositPanel)
   restockBtn:SetText("Restock")
   restockBtn:Hide()
 
+  local actionBtn = CreateFrame("Button", nil, depositPanel, "UIPanelButtonTemplate")
+  actionBtn:SetSize(90, 22)
+  actionBtn:SetPoint("BOTTOMLEFT", depositPanel, "BOTTOMLEFT", 10, 10)
+  actionBtn:SetText("Deposit")
+  actionBtn:Hide()
+
+  -- Keep amount (Deposit mode): withdraw up to this amount after deposit.
+  local keepBox = CreateFrame("EditBox", nil, depositPanel, "InputBoxTemplate")
+  keepBox:SetSize(44, BTN_H)
+  keepBox:SetAutoFocus(false)
+  keepBox:SetNumeric(true)
+  keepBox:SetMaxLetters(4)
+  keepBox:SetJustifyH("CENTER")
+  if keepBox.SetTextInsets then keepBox:SetTextInsets(6, 6, 0, 0) end
+  do
+    local left = keepBox.Left
+    local middle = keepBox.Middle
+    local right = keepBox.Right
+    if left and left.Hide then left:Hide() end
+    if middle and middle.Hide then middle:Hide() end
+    if right and right.Hide then right:Hide() end
+  end
+  keepBox:Hide()
+
+  -- Stack Pull toggle (Deposit mode): optional workaround to reduce stacking issues.
+  local spBtn = CreateFrame("Button", nil, depositPanel, "UIPanelButtonTemplate")
+  spBtn:SetSize(28, BTN_H)
+  spBtn:SetText("SP")
+  spBtn:Hide()
+
+  local keepPH = depositPanel:CreateFontString(nil, "OVERLAY", "GameFontDisable")
+  keepPH:SetPoint("CENTER", keepBox, "CENTER", 0, 0)
+  keepPH:SetText("Keep")
+  keepPH:SetTextColor(1, 1, 1, 0.35)
+  keepPH:Hide()
+
+  local function UpdateKeepPlaceholder()
+    local txt = keepBox:GetText() or ""
+    local hasText = txt ~= ""
+    local focused = keepBox.HasFocus and keepBox:HasFocus() or false
+    keepPH:SetShown((keepBox.IsShown and keepBox:IsShown() or false) and (not hasText) and (not focused))
+  end
+  keepBox:SetScript("OnEditFocusGained", function() keepPH:Hide() end)
+  keepBox:SetScript("OnEditFocusLost", function() UpdateKeepPlaceholder() end)
+  if keepBox.HookScript then
+    keepBox:HookScript("OnTextChanged", function() UpdateKeepPlaceholder() end)
+  end
+
+  local function ApplyKeepFromBox()
+    local cfg = DepositCfgAcc()
+    if not cfg then return end
+
+    local id = tonumber(edit and edit.GetText and edit:GetText() or "")
+    if not id or id <= 0 then
+      UpdateKeepPlaceholder()
+      return
+    end
+    cfg.keepByItem = (type(cfg.keepByItem) == "table") and cfg.keepByItem or {}
+
+    local v = tonumber(keepBox:GetText() or "")
+    v = v and math.floor(v) or 0
+    if v < 1 then v = 0 end
+    if v > 9999 then v = 9999 end
+    if v == 0 then
+      cfg.keepByItem[id] = nil
+    else
+      cfg.keepByItem[id] = v
+    end
+    if v == 0 then
+      keepBox:SetText("")
+    else
+      keepBox:SetText(tostring(v))
+    end
+    UpdateKeepPlaceholder()
+  end
+
+  keepBox:SetScript("OnEnterPressed", function(self)
+    self:ClearFocus()
+    ApplyKeepFromBox()
+  end)
+  keepBox:SetScript("OnEscapePressed", function(self)
+    self:ClearFocus()
+    ApplyKeepFromBox()
+  end)
+
+  -- Place Guild button above the Deposit button.
+  if guildListBtn and guildListBtn.ClearAllPoints and guildListBtn.SetPoint then
+    guildListBtn:ClearAllPoints()
+    if actionBtn and actionBtn.GetWidth and actionBtn.GetHeight and guildListBtn.SetSize then
+      guildListBtn:SetSize(actionBtn:GetWidth(), actionBtn:GetHeight())
+    end
+    guildListBtn:SetPoint("BOTTOMLEFT", actionBtn, "TOPLEFT", 0, 6)
+  end
+
+  local foodDiffBox = CreateFrame("EditBox", nil, depositPanel, "InputBoxTemplate")
+  foodDiffBox:SetSize(44, BTN_H)
+  foodDiffBox:SetPoint("LEFT", actionBtn, "RIGHT", 6, 0)
+  foodDiffBox:SetAutoFocus(false)
+  foodDiffBox:SetNumeric(true)
+  foodDiffBox:SetMaxLetters(2)
+  foodDiffBox:SetJustifyH("CENTER")
+  if foodDiffBox.SetTextInsets then foodDiffBox:SetTextInsets(6, 6, 0, 0) end
+  do
+    local left = foodDiffBox.Left
+    local middle = foodDiffBox.Middle
+    local right = foodDiffBox.Right
+    if left and left.Hide then left:Hide() end
+    if middle and middle.Hide then middle:Hide() end
+    if right and right.Hide then right:Hide() end
+  end
+  foodDiffBox:Hide()
+
+  local foodDiffPH = depositPanel:CreateFontString(nil, "OVERLAY", "GameFontDisable")
+  foodDiffPH:SetPoint("CENTER", foodDiffBox, "CENTER", 0, 0)
+  foodDiffPH:SetText("10")
+  foodDiffPH:SetTextColor(1, 1, 1, 0.35)
+  foodDiffPH:Hide()
+
+  local function UpdateFoodDiffPlaceholder()
+    local txt = foodDiffBox:GetText() or ""
+    local hasText = txt ~= ""
+    local focused = foodDiffBox.HasFocus and foodDiffBox:HasFocus() or false
+    foodDiffPH:SetShown((foodDiffBox.IsShown and foodDiffBox:IsShown() or false) and (not hasText) and (not focused))
+  end
+  foodDiffBox:SetScript("OnEditFocusGained", function() foodDiffPH:Hide() end)
+  foodDiffBox:SetScript("OnEditFocusLost", function() UpdateFoodDiffPlaceholder() end)
+
   local function SetButtonColor(btn, label, state)
     if not btn then return end
     local s = tostring(state or "inactive")
@@ -284,9 +581,46 @@ function LI.Trade.BuildTab(depositPanel)
   end
 
   Tip(bankBtn, "Deposit Target", "Bank = whichever bank is open", "Cycles: Bank / Guild / Warbank")
-  Tip(guildTabBtn, "Guild Tab", "Current / Tab 1..8", "Disabled on Warbank")
-  Tip(targetBox, "Target (bags)", "Buy: buy up to target", "Sell: sell down to target (0 = sell all)")
-  Tip(restockBtn, "Restock", "When enabled: also sells low-level food (<= player-10)", "Matching food is grouped by tooltip Use: lines")
+  Tip(guildTabBtn, "Guild Tab", "Left-click: cycle tabs (or pick random)", "Right-click: toggle Random; disabled on Warbank")
+  Tip(keepBox, "Keep (Deposit)", "For this item: if bags have less than Keep, withdraw the difference", "Empty/0 disables")
+  Tip(spBtn, "SP (Stack Pull)", "Per-item toggle: pull partial stacks before depositing", "Default: Off")
+  Tip(restockBtn, "Restock", "When enabled: restock matches by Use: lines", "(Lets different foods count toward the same target)")
+  Tip(foodDiffBox, "Food level diff", "Sell old food <= player level - diff", "Default: 10")
+
+  local function IsStackPullEnabledForID(id)
+    id = tonumber(id)
+    if not id or id <= 0 then return false end
+    local cfg = DepositCfgAcc()
+    return (cfg and type(cfg.stackPullByItem) == "table" and cfg.stackPullByItem[id] == true) and true or false
+  end
+
+  local function RefreshSPBtn()
+    if not spBtn then return end
+    local id = tonumber(edit and edit.GetText and edit:GetText() or "")
+    local on = IsStackPullEnabledForID(id)
+    if on then
+      spBtn:SetText("|cff00ff00SP|r")
+    else
+      spBtn:SetText("|cff999999SP|r")
+    end
+  end
+
+  spBtn:SetScript("OnClick", function()
+    local cfg = DepositCfgAcc()
+    if not cfg then return end
+    local id = tonumber(edit and edit.GetText and edit:GetText() or "")
+    if not id or id <= 0 then
+      RefreshSPBtn()
+      return
+    end
+    cfg.stackPullByItem = (type(cfg.stackPullByItem) == "table") and cfg.stackPullByItem or {}
+    if cfg.stackPullByItem[id] == true then
+      cfg.stackPullByItem[id] = nil
+    else
+      cfg.stackPullByItem[id] = true
+    end
+    RefreshSPBtn()
+  end)
 
   local function SetDynamicTip(frame, get)
     if not (frame and frame.SetScript) then return end
@@ -307,6 +641,39 @@ function LI.Trade.BuildTab(depositPanel)
       if GameTooltip and GameTooltip.Hide then GameTooltip:Hide() end
     end)
   end
+
+  SetDynamicTip(actionBtn, function()
+    local mode = GetTradeMode()
+    if mode == "sell" then
+      local cfgAcc = DepositCfgAcc()
+      local cfgChar = DepositCfgChar()
+      local onAcc = (cfgAcc and cfgAcc.sellFoodEnabledAcc == true) and true or false
+      local onChar = (not onAcc) and (cfgChar and cfgChar.sellFoodEnabledChar == true) and true or false
+      local state = onAcc and "On Acc" or (onChar and "On" or "Off")
+      local d = (cfgAcc and tonumber(cfgAcc.sellFoodLevelDiff)) or 10
+      d = d and math.floor(d) or 10
+      if d < 1 then d = 1 end
+      if d > 80 then d = 80 end
+      return "Food selling", "State: " .. state, "Threshold: <= player-" .. tostring(d), "Cycles: Off -> On -> On Acc"
+    end
+    if mode == "deposit" then
+      local cfg = DepositCfgAcc()
+      local on = not (cfg and cfg.showButton == false)
+      return "Deposit", on and "State: On" or "State: Off", "Toggles the on-screen Deposit button", nil
+    end
+    return "Action", "No action for this mode.", nil, nil
+  end)
+
+  SetDynamicTip(targetBox, function()
+    local mode = GetTradeMode()
+    if mode == "buy" then
+      return "Target (Buy)", "Buy up to this count in bags.", "Must be > 0."
+    end
+    if mode == "sell" then
+      return "Target (Sell)", "Sell down to this count in bags.", "0 = sell all."
+    end
+    return "Target", "Used in Buy/Sell modes.", nil
+  end)
 
   local function GetItemNameSafe(id)
     id = tonumber(id)
@@ -555,7 +922,64 @@ function LI.Trade.BuildTab(depositPanel)
     }
   end
 
-  local function UpdateScopeButtons(id)
+  local UpdateScopeButtons
+
+  local function ResetTradeEntry(clearStatus)
+    if clearStatus then
+      SetStatus("")
+    end
+
+    depositPanel._liScopeID = nil
+    depositPanel._pendingRestockID = nil
+    depositPanel._pendingRestock = nil
+
+    if keepBox and keepBox.IsShown and keepBox:IsShown() then
+      if keepBox.ClearFocus then keepBox:ClearFocus() end
+      if ApplyKeepFromBox then
+        pcall(ApplyKeepFromBox)
+      end
+    end
+
+    if edit and edit.SetText then
+      edit:SetText("")
+    end
+    if edit and edit.ClearFocus then
+      edit:ClearFocus()
+    end
+
+    if nameLabel and nameLabel.SetText then
+      nameLabel:SetText("")
+    end
+    if stackLabel and stackLabel.SetText then
+      stackLabel:SetText("")
+    end
+    if reasonLabel and reasonLabel.SetText then
+      reasonLabel:SetText("")
+    end
+
+    if UpdatePlaceholder then
+      pcall(UpdatePlaceholder)
+    end
+    if UpdateKeepPlaceholder then
+      pcall(UpdateKeepPlaceholder)
+    end
+    if UpdateTargetPlaceholder then
+      pcall(UpdateTargetPlaceholder)
+    end
+    if UpdateFoodDiffPlaceholder then
+      pcall(UpdateFoodDiffPlaceholder)
+    end
+
+    if RefreshBankAndTabButtons then
+      pcall(RefreshBankAndTabButtons)
+    end
+
+    if UpdateScopeButtons then
+      UpdateScopeButtons(nil)
+    end
+  end
+
+  UpdateScopeButtons = function(id)
     depositPanel._liScopeID = id
 
     local mode = GetTradeMode()
@@ -566,10 +990,30 @@ function LI.Trade.BuildTab(depositPanel)
       btnAcc:Disable()
       btnChar:Disable()
       btnRealm:Disable()
+      if btnAcc and btnAcc.SetText then btnAcc:SetText("Account") end
+      if btnRealm and btnRealm.SetText then btnRealm:SetText("Realm") end
+      if btnChar and btnChar.SetText then btnChar:SetText("Character") end
       stackLabel:SetText("")
       reasonLabel:SetText("")
       restockBtn:Disable()
+
+      if keepBox and keepBox.SetText then
+        keepBox:SetText("")
+      end
+      if UpdateKeepPlaceholder then
+        pcall(UpdateKeepPlaceholder)
+      end
       return
+    end
+
+    if mode == "deposit" and keepBox and keepBox.SetText then
+      local cfg = DepositCfgAcc()
+      local v = (cfg and type(cfg.keepByItem) == "table") and tonumber(cfg.keepByItem[id]) or 0
+      v = v and math.floor(v) or 0
+      if v < 1 then v = 0 end
+      if v > 9999 then v = 9999 end
+      keepBox:SetText((v > 0) and tostring(v) or "")
+      if UpdateKeepPlaceholder then pcall(UpdateKeepPlaceholder) end
     end
 
     btnAcc:Enable()
@@ -772,7 +1216,7 @@ function LI.Trade.BuildTab(depositPanel)
             Print("Disabled on this character: " .. (GetItemNameSafe(id) or tostring(id)))
           end
         end
-        UpdateScopeButtons(id)
+        ResetTradeEntry(true)
         return
       end
 
@@ -785,7 +1229,7 @@ function LI.Trade.BuildTab(depositPanel)
           st.disableAccTbl[id] = true
           Print("Disabled on this character: " .. (GetItemNameSafe(id) or tostring(id)))
         end
-        UpdateScopeButtons(id)
+        ResetTradeEntry(true)
         return
       end
 
@@ -798,22 +1242,23 @@ function LI.Trade.BuildTab(depositPanel)
           st.disableRealmTbl[id] = true
           Print("Disabled on this character: " .. (GetItemNameSafe(id) or tostring(id)))
         end
-        UpdateScopeButtons(id)
+        ResetTradeEntry(true)
         return
       end
 
       if canAdd == false then
-        UpdateScopeButtons(id)
+        ResetTradeEntry(true)
         return
       end
 
       st.charTbl = EnsureTable(st.charTbl)
       if not AddRule(st.charTbl) then
-        UpdateScopeButtons(id)
+        ResetTradeEntry(true)
         return
       end
       Print("Added to Character " .. GetTradeMode() .. " list: " .. (GetItemNameSafe(id) or tostring(id)))
-      UpdateScopeButtons(id)
+      ResetTradeEntry(false)
+      SetStatus("Successfully added")
     end)
 
     btnAcc:SetScript("OnClick", function(_, mouseButton)
@@ -833,7 +1278,7 @@ function LI.Trade.BuildTab(depositPanel)
             Print("Disabled account-wide: " .. (GetItemNameSafe(id) or tostring(id)))
           end
         end
-        UpdateScopeButtons(id)
+        ResetTradeEntry(true)
         return
       end
 
@@ -845,13 +1290,13 @@ function LI.Trade.BuildTab(depositPanel)
       end
 
       if canAdd == false then
-        UpdateScopeButtons(id)
+        ResetTradeEntry(true)
         return
       end
 
       st.accTbl = EnsureTable(st.accTbl)
       if not AddRule(st.accTbl) then
-        UpdateScopeButtons(id)
+        ResetTradeEntry(true)
         return
       end
 
@@ -859,7 +1304,8 @@ function LI.Trade.BuildTab(depositPanel)
       ClearPerID(st.accDisableRealmTbl)
       ClearPerID(st.disableAccTbl)
       Print("Added to Account " .. GetTradeMode() .. " list: " .. (GetItemNameSafe(id) or tostring(id)))
-      UpdateScopeButtons(id)
+      ResetTradeEntry(false)
+      SetStatus("Successfully added")
     end)
 
     btnRealm:SetScript("OnClick", function(_, mouseButton)
@@ -880,7 +1326,7 @@ function LI.Trade.BuildTab(depositPanel)
             Print("Disabled on this realm: " .. (GetItemNameSafe(id) or tostring(id)))
           end
         end
-        UpdateScopeButtons(id)
+        ResetTradeEntry(true)
         return
       end
 
@@ -893,7 +1339,7 @@ function LI.Trade.BuildTab(depositPanel)
           st.accDisableRealmTbl[id] = true
           Print("Disabled on this realm: " .. (GetItemNameSafe(id) or tostring(id)))
         end
-        UpdateScopeButtons(id)
+        ResetTradeEntry(true)
         return
       end
 
@@ -902,20 +1348,21 @@ function LI.Trade.BuildTab(depositPanel)
       end
 
       if canAdd == false then
-        UpdateScopeButtons(id)
+        ResetTradeEntry(true)
         return
       end
 
       st.realmTbl = EnsureTable(st.realmTbl)
       if not AddRule(st.realmTbl) then
-        UpdateScopeButtons(id)
+        ResetTradeEntry(true)
         return
       end
 
       ClearPerID(st.realmDisabledTbl)
       ClearPerID(st.disableRealmTbl)
       Print("Added to Realm " .. GetTradeMode() .. " list: " .. (GetItemNameSafe(id) or tostring(id)))
-      UpdateScopeButtons(id)
+      ResetTradeEntry(false)
+      SetStatus("Successfully added")
     end)
 
     SetDynamicTip(btnAcc, function()
@@ -1056,11 +1503,6 @@ function LI.Trade.BuildTab(depositPanel)
   RefreshBankAndTabButtons = function()
     local cfg = DepositCfgAcc()
     local t = NormalizeBankTarget(cfg.target)
-    if t == "guild" and not IsGuildBankOpen() then
-      t = "bank"
-    elseif t == "warbank" and not IsWarbankOpen() then
-      t = "bank"
-    end
     cfg.target = t
 
     if cfg.target == "guild" then
@@ -1088,7 +1530,19 @@ function LI.Trade.BuildTab(depositPanel)
     if not v or v < 0 then v = 0 end
     if v > 8 then v = 8 end
     v = math.floor(v)
-    guildTabBtn:SetText((v <= 0) and "Current" or ("Tab " .. tostring(v)))
+
+    local isRandom = false
+    if rk ~= "" and type(cfg.guildTabRandomByRealm) == "table" and cfg.guildTabRandomByRealm[rk] ~= nil then
+      isRandom = (cfg.guildTabRandomByRealm[rk] == true)
+    else
+      isRandom = (cfg.guildTabRandom == true)
+    end
+
+    if isRandom then
+      guildTabBtn:SetText("Random")
+    else
+      guildTabBtn:SetText((v <= 0) and "Current" or ("Tab " .. tostring(v)))
+    end
   end
 
   do
@@ -1133,7 +1587,59 @@ function LI.Trade.BuildTab(depositPanel)
     RefreshBankAndTabButtons()
   end)
 
-  guildTabBtn:SetScript("OnClick", function()
+  local function GetGuildTabCount()
+    local n = (GetNumGuildBankTabs and GetNumGuildBankTabs()) or 8
+    n = tonumber(n) or 8
+    n = math.floor(n)
+    if n < 1 then n = 1 end
+    if n > 8 then n = 8 end
+    return n
+  end
+
+  local function GetRandomFlag(cfg, rk)
+    if rk ~= "" and type(cfg.guildTabRandomByRealm) == "table" and cfg.guildTabRandomByRealm[rk] ~= nil then
+      return (cfg.guildTabRandomByRealm[rk] == true)
+    end
+    return (cfg.guildTabRandom == true)
+  end
+
+  local function SetRandomFlag(cfg, rk, flag)
+    flag = (flag == true) and true or false
+    if rk ~= "" then
+      cfg.guildTabRandomByRealm = (type(cfg.guildTabRandomByRealm) == "table") and cfg.guildTabRandomByRealm or {}
+      cfg.guildTabRandomByRealm[rk] = flag
+    else
+      cfg.guildTabRandom = flag
+    end
+  end
+
+  local function SetGuildTabValue(cfg, rk, v)
+    if rk ~= "" then
+      cfg.guildTabByRealm = (type(cfg.guildTabByRealm) == "table") and cfg.guildTabByRealm or {}
+      cfg.guildTabByRealm[rk] = v
+    else
+      cfg.guildTab = v
+    end
+  end
+
+  local function GetGuildTabValue(cfg, rk)
+    local v = nil
+    if rk ~= "" and cfg.guildTabByRealm and cfg.guildTabByRealm[rk] ~= nil then
+      v = tonumber(cfg.guildTabByRealm[rk])
+    end
+    if v == nil then v = tonumber(cfg.guildTab) or 0 end
+    if not v or v < 0 then v = 0 end
+    if v > 8 then v = 8 end
+    return math.floor(v)
+  end
+
+  local function PickRandomTab(cfg, rk)
+    local n = GetGuildTabCount()
+    local v = math.random(1, n)
+    SetGuildTabValue(cfg, rk, v)
+  end
+
+  guildTabBtn:SetScript("OnClick", function(_, button)
     local cfg = DepositCfgAcc()
     cfg.target = NormalizeBankTarget(cfg.target)
     if cfg.target == "warbank" then
@@ -1142,22 +1648,36 @@ function LI.Trade.BuildTab(depositPanel)
     end
 
     local rk = GetCurrentRealmKey()
-    local v = nil
-    if rk ~= "" and cfg.guildTabByRealm and cfg.guildTabByRealm[rk] ~= nil then
-      v = tonumber(cfg.guildTabByRealm[rk])
-    end
-    if v == nil then v = tonumber(cfg.guildTab) or 0 end
-    if not v or v < 0 then v = 0 end
-    if v > 8 then v = 8 end
-    v = math.floor(v)
-    v = v + 1
-    if v > 8 then v = 0 end
 
-    if rk ~= "" then
-      cfg.guildTabByRealm = (type(cfg.guildTabByRealm) == "table") and cfg.guildTabByRealm or {}
-      cfg.guildTabByRealm[rk] = v
+    local isRandom = GetRandomFlag(cfg, rk)
+    button = tostring(button or "LeftButton")
+
+    if button == "RightButton" then
+      isRandom = not isRandom
+      SetRandomFlag(cfg, rk, isRandom)
+      if isRandom then
+        PickRandomTab(cfg, rk)
+      else
+        SetGuildTabValue(cfg, rk, 0)
+      end
+      RefreshBankAndTabButtons()
+      return
+    end
+
+    if isRandom then
+      PickRandomTab(cfg, rk)
+      RefreshBankAndTabButtons()
+      return
+    end
+
+    local v = GetGuildTabValue(cfg, rk)
+    v = v + 1
+    if v > 8 then
+      -- After Tab 8, enter Random mode.
+      SetRandomFlag(cfg, rk, true)
+      PickRandomTab(cfg, rk)
     else
-      cfg.guildTab = v
+      SetGuildTabValue(cfg, rk, v)
     end
     RefreshBankAndTabButtons()
   end)
@@ -1171,6 +1691,9 @@ function LI.Trade.BuildTab(depositPanel)
     else
       nameLabel:SetText("")
       UpdateScopeButtons(nil)
+    end
+    if RefreshSPBtn then
+      pcall(RefreshSPBtn)
     end
     UpdatePlaceholder()
   end
@@ -1263,6 +1786,7 @@ function LI.Trade.BuildTab(depositPanel)
     if not id then return end
     local mode = GetTradeMode()
     if mode == "deposit" then return end
+    if mode == "sell" then return end
     local stores = GetScopeStores(mode)
 
     local pendingRestockID = depositPanel._pendingRestockID
@@ -1319,18 +1843,516 @@ function LI.Trade.BuildTab(depositPanel)
   depositPanel._RefreshModeUI = function(self)
     local m = GetTradeMode()
     local isDeposit = (m == "deposit")
+    local isSell = (m == "sell")
+    local isBuy = (m == "buy")
     bankBtn:SetShown(isDeposit)
     guildTabBtn:SetShown(isDeposit)
+    keepBox:SetShown(isDeposit)
+    spBtn:SetShown(isDeposit)
     targetBox:SetShown(not isDeposit)
-    restockBtn:SetShown(not isDeposit)
-    if isDeposit then restockBtn:Disable() else restockBtn:Enable() end
+    restockBtn:SetShown(isBuy)
+    if isBuy then restockBtn:Enable() else restockBtn:Disable() end
+    actionBtn:SetShown(isDeposit or isSell)
+    foodDiffBox:SetShown(isSell)
+    UpdateFoodDiffPlaceholder()
     UpdateTargetPlaceholder()
+    UpdateKeepPlaceholder()
+
+    if isDeposit then
+      -- Bank + GBTab above the Character/Realm/Account row, with one button-height gap.
+      local rowY = ROW_Y + (BTN_H * 2)
+      bankBtn:ClearAllPoints()
+      bankBtn:SetPoint("BOTTOMLEFT", depositPanel, "BOTTOMLEFT", 10, rowY)
+      guildTabBtn:ClearAllPoints()
+      guildTabBtn:SetPoint("BOTTOMRIGHT", depositPanel, "BOTTOMRIGHT", -10, rowY)
+      keepBox:ClearAllPoints()
+      -- Keep + SP are centered as a group.
+      local spGap = 4
+      local spW = (spBtn and spBtn.GetWidth and spBtn:GetWidth()) or 28
+      keepBox:SetPoint("BOTTOM", depositPanel, "BOTTOM", -((spW + spGap) / 2), rowY)
+      spBtn:ClearAllPoints()
+      spBtn:SetPoint("LEFT", keepBox, "RIGHT", spGap, 0)
+
+      local cfg = DepositCfgAcc()
+      local id = tonumber(edit and edit.GetText and edit:GetText() or "")
+      local v = (id and id > 0 and cfg and type(cfg.keepByItem) == "table") and tonumber(cfg.keepByItem[id]) or 0
+      v = v and math.floor(v) or 0
+      if v > 0 then
+        keepBox:SetText(tostring(v))
+      else
+        keepBox:SetText("")
+      end
+      UpdateKeepPlaceholder()
+      RefreshSPBtn()
+    end
+
+    if isSell then
+      local cfgAcc = DepositCfgAcc()
+      local cfgChar = DepositCfgChar()
+      local onAcc = (cfgAcc and cfgAcc.sellFoodEnabledAcc == true) and true or false
+      local onChar = (not onAcc) and (cfgChar and cfgChar.sellFoodEnabledChar == true) and true or false
+      actionBtn:SetText(onAcc and "On Acc" or (onChar and "On" or "Off"))
+      local d = (cfgAcc and tonumber(cfgAcc.sellFoodLevelDiff)) or 10
+      d = d and math.floor(d) or 10
+      if d < 1 then d = 1 end
+      if d > 80 then d = 80 end
+      foodDiffBox:SetText(tostring(d))
+    else
+      local cfg = DepositCfgAcc()
+      local on = not (cfg and cfg.showButton == false)
+      actionBtn:SetText(on and "|cffffd100Deposit|r" or "|cffd9d9d9Deposit|r")
+    end
 
     local id = GetCurrentID()
     if id then
       UpdateScopeButtons(id)
     else
       UpdateScopeButtons(nil)
+    end
+  end
+
+  local function SetSellFoodLevelDiffFromBox()
+    local cfg = DepositCfgAcc()
+    local d = tonumber(foodDiffBox:GetText() or "")
+    d = d and math.floor(d) or nil
+    if not d then
+      d = (cfg and tonumber(cfg.sellFoodLevelDiff)) or 10
+      d = d and math.floor(d) or 10
+    end
+    if d < 1 then d = 1 end
+    if d > 80 then d = 80 end
+    if cfg then
+      cfg.sellFoodLevelDiff = d
+    end
+    foodDiffBox:SetText(tostring(d))
+    UpdateFoodDiffPlaceholder()
+  end
+
+  foodDiffBox:SetScript("OnEnterPressed", function(self)
+    self:ClearFocus()
+    SetSellFoodLevelDiffFromBox()
+  end)
+  foodDiffBox:SetScript("OnEscapePressed", function(self)
+    self:ClearFocus()
+    SetSellFoodLevelDiffFromBox()
+  end)
+
+  actionBtn:SetScript("OnClick", function()
+    local mode = GetTradeMode()
+    if mode == "deposit" then
+      local cfg = DepositCfgAcc()
+      if not cfg then return end
+      cfg.showButton = (cfg.showButton == false) and true or false
+      if LI and type(LI.UpdateDepositButtonVisibility) == "function" then
+        LI.UpdateDepositButtonVisibility()
+      end
+      if depositPanel and depositPanel._RefreshModeUI then
+        depositPanel:_RefreshModeUI()
+      end
+      return
+    end
+
+    if mode ~= "sell" then return end
+
+    SetSellFoodLevelDiffFromBox()
+
+    local cfgAcc = DepositCfgAcc()
+    local cfgChar = DepositCfgChar()
+    if not (cfgAcc and cfgChar) then return end
+
+    local onAcc = (cfgAcc.sellFoodEnabledAcc == true)
+    local onChar = (not onAcc) and (cfgChar.sellFoodEnabledChar == true)
+
+    if (not onAcc) and (not onChar) then
+      cfgChar.sellFoodEnabledChar = true
+      cfgAcc.sellFoodEnabledAcc = false
+      Print("Food selling: On (this character)")
+    elseif onChar then
+      cfgChar.sellFoodEnabledChar = false
+      cfgAcc.sellFoodEnabledAcc = true
+      Print("Food selling: On Acc")
+    else
+      cfgAcc.sellFoodEnabledAcc = false
+      cfgChar.sellFoodEnabledChar = false
+      Print("Food selling: Off")
+    end
+
+    if depositPanel and depositPanel._RefreshModeUI then
+      depositPanel:_RefreshModeUI()
+    end
+  end)
+
+  -- Items list popout (Trade tab): lets you delete rules without having the item.
+  do
+    local parent = depositPanel.GetParent and depositPanel:GetParent() or nil
+    local reloadBtn = parent and parent._reloadBtn
+
+    if parent and reloadBtn and reloadBtn.SetPoint then
+      local itemsBtn = CreateFrame("Button", nil, depositPanel, "UIPanelButtonTemplate")
+      itemsBtn:SetSize(90, 22)
+      itemsBtn:SetPoint("BOTTOMRIGHT", reloadBtn, "TOPRIGHT", 0, 6)
+      itemsBtn:SetText("Item")
+
+      local itemPop = CreateFrame("Frame", nil, depositPanel, "BackdropTemplate")
+      local POP_W, POP_H = 320, 360
+      local POP_TOP_PAD = -10
+      local POP_BOTTOM_PAD = 10
+      local POP_X_PAD = -6
+
+      local anchor = parent or depositPanel
+
+      itemPop:SetPoint("TOPLEFT", anchor, "TOPRIGHT", POP_X_PAD, POP_TOP_PAD)
+      itemPop:SetPoint("BOTTOMLEFT", anchor, "BOTTOMRIGHT", POP_X_PAD, POP_BOTTOM_PAD)
+      itemPop:SetWidth(0)
+      itemPop:SetClipsChildren(true)
+      itemPop:Hide()
+
+      if itemPop.SetBackdrop then
+        itemPop:SetBackdrop({
+          bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
+          tile = true,
+          tileSize = 32,
+          insets = { left = 8, right = 8, top = 8, bottom = 8 },
+        })
+      end
+
+      local title = itemPop:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+      title:SetPoint("TOPLEFT", itemPop, "TOPLEFT", 14, -12)
+      title:SetText("Items")
+
+      local subtitle = itemPop:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+      subtitle:SetPoint("TOPLEFT", title, "BOTTOMLEFT", 0, -2)
+      subtitle:SetText("")
+
+      local keepLine = itemPop:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+      keepLine:SetPoint("TOPLEFT", subtitle, "BOTTOMLEFT", 0, -2)
+      keepLine:SetText("")
+      keepLine:Hide()
+
+      local listContainer = CreateFrame("Frame", nil, itemPop)
+      listContainer:SetPoint("TOPLEFT", itemPop, "TOPLEFT", 12, -56)
+      listContainer:SetPoint("BOTTOMRIGHT", itemPop, "BOTTOMRIGHT", -12, 12)
+
+      local scroll = CreateFrame("ScrollFrame", nil, itemPop, "UIPanelScrollFrameTemplate")
+      scroll:SetPoint("TOPLEFT", listContainer, "TOPLEFT", 0, 0)
+      scroll:SetPoint("BOTTOMRIGHT", listContainer, "BOTTOMRIGHT", 0, 0)
+
+      -- Hide the visible scrollbar/slider but keep scroll functionality.
+      if scroll.ScrollBar then
+        if scroll.ScrollBar.ScrollUpButton then scroll.ScrollBar.ScrollUpButton:Hide() end
+        if scroll.ScrollBar.ScrollDownButton then scroll.ScrollBar.ScrollDownButton:Hide() end
+        scroll.ScrollBar:Hide()
+        scroll.ScrollBar.Show = function() end
+      end
+
+      scroll:EnableMouseWheel(true)
+      scroll:SetScript("OnMouseWheel", function(self, delta)
+        local cur = self:GetVerticalScroll() or 0
+        local range = self:GetVerticalScrollRange() or 0
+        local step = 28
+        local next = cur - (delta * step)
+        if next < 0 then next = 0 end
+        if next > range then next = range end
+        self:SetVerticalScroll(next)
+      end)
+
+      local content = CreateFrame("Frame", nil, scroll)
+      content:SetPoint("TOPLEFT", scroll, "TOPLEFT", 0, 0)
+      content:SetSize(1, 1)
+      content:SetWidth(POP_W - 24)
+      scroll:SetScrollChild(content)
+
+      itemPop._rows = itemPop._rows or {}
+
+      local BuildItemsList
+
+      -- Slide animation: expand/collapse width while keeping the left edge attached
+      -- to the main Trade panel.
+      local function StopSlide()
+        itemPop._slideActive = false
+        itemPop:SetScript("OnUpdate", nil)
+      end
+
+      local function SlideToW(targetW, onDone)
+        targetW = tonumber(targetW) or 0
+        if targetW < 0 then targetW = 0 end
+        if targetW > POP_W then targetW = POP_W end
+
+        local from = tonumber(itemPop._slideCurW)
+        if from == nil then
+          from = itemPop:IsShown() and POP_W or 0
+        end
+        local to = targetW
+        if from == to then
+          if type(onDone) == "function" then pcall(onDone) end
+          return
+        end
+
+        itemPop._slideActive = true
+        itemPop._slideFromW = from
+        itemPop._slideToW = to
+        itemPop._slideStart = GetTime()
+        itemPop._slideDur = 0.18
+
+        itemPop:SetScript("OnUpdate", function(self)
+          if not self._slideActive then return end
+          local now = GetTime()
+          local t = (now - (self._slideStart or now)) / (self._slideDur or 0.18)
+          if t >= 1 then
+            self._slideCurW = self._slideToW or to
+            self:SetWidth(self._slideCurW)
+            StopSlide()
+            if type(onDone) == "function" then pcall(onDone) end
+            return
+          end
+
+          if t < 0 then t = 0 end
+          local e = t * t * (3 - 2 * t)
+          local w = (self._slideFromW or from) + ((self._slideToW or to) - (self._slideFromW or from)) * e
+          self._slideCurW = w
+          self:SetWidth(w)
+        end)
+      end
+
+      local function SlideShow()
+        if itemPop._slideActive then StopSlide() end
+        itemPop:Show()
+        itemPop._slideCurW = 0
+        itemPop:SetWidth(0)
+        if content and content.SetWidth then
+          content:SetWidth(POP_W - 24)
+        end
+        BuildItemsList()
+        SlideToW(POP_W)
+      end
+
+      local function SlideHide()
+        if not itemPop:IsShown() then return end
+        if itemPop._slideActive then StopSlide() end
+        SlideToW(0, function()
+          itemPop:Hide()
+        end)
+      end
+
+      local function ClearInTable(t, id)
+        if type(t) == "table" then t[id] = nil end
+      end
+
+      local function DeleteIDFromCurrentMode(id)
+        id = tonumber(id)
+        if not id or id <= 0 then return end
+
+        local mode = GetTradeMode()
+        local st = GetScopeStores(mode)
+
+        -- Remove rules.
+        ClearInTable(st.accTbl, id)
+        ClearInTable(st.charTbl, id)
+        ClearInTable(st.realmTbl, id)
+
+        -- Remove disable flags.
+        ClearInTable(st.accDisabledTbl, id)
+        ClearInTable(st.accDisableRealmTbl, id)
+        ClearInTable(st.disableAccTbl, id)
+        ClearInTable(st.realmDisabledTbl, id)
+        ClearInTable(st.disableRealmTbl, id)
+        ClearInTable(st.charDisabledTbl, id)
+
+        -- Pending restock UI state.
+        if depositPanel._pendingRestockID == id then
+          depositPanel._pendingRestockID = nil
+          depositPanel._pendingRestock = nil
+        end
+
+        -- Per-item keep: only clear when removing a Deposit rule.
+        if mode == "deposit" then
+          local cfg = DepositCfgAcc()
+          if cfg and type(cfg.keepByItem) == "table" then
+            cfg.keepByItem[id] = nil
+          end
+        end
+      end
+
+      local function HasRule(tbl, id)
+        if type(tbl) ~= "table" then return false end
+        if GetTradeMode() == "deposit" then
+          return (tbl[id] == true)
+        end
+        return (tbl[id] ~= nil)
+      end
+
+      BuildItemsList = function()
+        local mode = GetTradeMode()
+        local st = GetScopeStores(mode)
+
+        local ids = {}
+        local info = {}
+
+        local function mark(id, scope)
+          id = tonumber(id)
+          if not id or id <= 0 then return end
+          ids[id] = true
+          info[id] = info[id] or { acc = false, realm = false, char = false }
+          info[id][scope] = true
+        end
+
+        if type(st.accTbl) == "table" then
+          for id in pairs(st.accTbl) do
+            if HasRule(st.accTbl, id) then mark(id, "acc") end
+          end
+        end
+        if type(st.realmTbl) == "table" then
+          for id in pairs(st.realmTbl) do
+            if HasRule(st.realmTbl, id) then mark(id, "realm") end
+          end
+        end
+        if type(st.charTbl) == "table" then
+          for id in pairs(st.charTbl) do
+            if HasRule(st.charTbl, id) then mark(id, "char") end
+          end
+        end
+
+        local list = {}
+        for id in pairs(ids) do
+          list[#list + 1] = id
+        end
+        table.sort(list, function(a, b)
+          local na = GetItemNameSafe(a) or ""
+          local nb = GetItemNameSafe(b) or ""
+          na = na:lower()
+          nb = nb:lower()
+          if na == nb then
+            return a < b
+          end
+          if na == "" then return false end
+          if nb == "" then return true end
+          return na < nb
+        end)
+
+        local modeLabel = (mode == "buy") and "Buy" or ((mode == "sell") and "Sell" or "Deposit")
+        subtitle:SetText(modeLabel .. " rules: " .. tostring(#list))
+
+        keepLine:SetText("")
+        keepLine:Hide()
+
+        local rowH = 22
+        local pad = 2
+
+        for i = 1, #itemPop._rows do
+          itemPop._rows[i]:Hide()
+        end
+
+        if #list == 0 then
+          local row = itemPop._rows[1]
+          if not row then
+            row = CreateFrame("Frame", nil, content)
+            row:SetHeight(rowH)
+            row.txt = row:CreateFontString(nil, "OVERLAY", "GameFontDisable")
+            row.txt:SetPoint("LEFT", row, "LEFT", 0, 0)
+            row.txt:SetPoint("RIGHT", row, "RIGHT", 0, 0)
+            row.txt:SetJustifyH("LEFT")
+            itemPop._rows[1] = row
+          end
+          row:ClearAllPoints()
+          row:SetPoint("TOPLEFT", content, "TOPLEFT", 0, 0)
+          row:SetPoint("TOPRIGHT", content, "TOPRIGHT", 0, 0)
+          row.txt:SetText("No items in this list")
+          row:Show()
+          content:SetHeight(rowH)
+          return
+        end
+
+        for i = 1, #list do
+          local id = list[i]
+          local row = itemPop._rows[i]
+          if not row then
+            row = CreateFrame("Frame", nil, content)
+            row:SetHeight(rowH)
+
+            row.txt = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+            row.txt:SetPoint("LEFT", row, "LEFT", 0, 0)
+            row.txt:SetJustifyH("LEFT")
+            row.txt:SetWordWrap(false)
+
+            row.del = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
+            row.del:SetSize(38, 18)
+            row.del:SetPoint("RIGHT", row, "RIGHT", 0, 0)
+            row.del:SetText("Del")
+
+            row.edit = CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
+            row.edit:SetSize(38, 18)
+            row.edit:SetPoint("RIGHT", row.del, "LEFT", -2, 0)
+            row.edit:SetText("Edit")
+
+            row.txt:SetPoint("RIGHT", row.edit, "LEFT", -6, 0)
+
+            itemPop._rows[i] = row
+          end
+
+          row:ClearAllPoints()
+          row:SetPoint("TOPLEFT", content, "TOPLEFT", 0, -((i - 1) * (rowH + pad)))
+          row:SetPoint("TOPRIGHT", content, "TOPRIGHT", 0, -((i - 1) * (rowH + pad)))
+
+          local name = GetItemNameSafe(id) or ("ID " .. tostring(id))
+          local flags = info[id] or {}
+          local scopeTxt = (flags.acc and "A" or "-") .. (flags.realm and "R" or "-") .. (flags.char and "C" or "-")
+          local keepTxt = ""
+          if mode == "deposit" then
+            local cfg = DepositCfgAcc()
+            local k = (cfg and type(cfg.keepByItem) == "table") and tonumber(cfg.keepByItem[id]) or 0
+            k = k and math.floor(k) or 0
+            if k < 1 then k = 0 end
+            if k > 9999 then k = 9999 end
+            keepTxt = "  K:" .. tostring(k)
+          end
+          row.txt:SetText(name .. " (" .. tostring(id) .. ")  [" .. scopeTxt .. "]" .. keepTxt)
+
+          row.del:SetScript("OnClick", function()
+            DeleteIDFromCurrentMode(id)
+            BuildItemsList()
+            local cur = tonumber(edit and edit.GetText and edit:GetText() or "")
+            if cur == id then
+              ResetTradeEntry(true)
+            else
+              if UpdateScopeButtons then
+                local keepID = tonumber(edit and edit.GetText and edit:GetText() or "")
+                UpdateScopeButtons(keepID)
+              end
+            end
+          end)
+
+          row.edit:SetScript("OnClick", function()
+            if edit and edit.SetText then
+              edit:SetText(tostring(id))
+            end
+            if edit and edit.ClearFocus then
+              edit:ClearFocus()
+            end
+            DoValidate()
+          end)
+
+          row:Show()
+        end
+
+        content:SetHeight(#list * (rowH + pad))
+      end
+
+      itemsBtn:SetScript("OnClick", function()
+        if itemPop:IsShown() then
+          SlideHide()
+        else
+          SlideShow()
+        end
+      end)
+
+      depositPanel:HookScript("OnHide", function()
+        if itemPop then
+          StopSlide()
+          itemPop._slideCurW = 0
+          if itemPop.SetWidth then itemPop:SetWidth(0) end
+          if itemPop.Hide then itemPop:Hide() end
+        end
+      end)
     end
   end
 
