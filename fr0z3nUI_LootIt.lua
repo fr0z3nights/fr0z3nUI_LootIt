@@ -2,6 +2,17 @@ local ADDON = ...
 
 local PREFIX = "|cff00ccff[LI]|r "
 
+local LI = fr0z3nUI_LootIt or {}
+fr0z3nUI_LootIt = LI
+LI.PREFIX = PREFIX
+
+local function Print(msg)
+  local frame = DEFAULT_CHAT_FRAME
+  if frame and frame.AddMessage then
+    frame:AddMessage(PREFIX .. tostring(msg or ""))
+  end
+end
+
 -- WoW globals (shadowed to locals so diagnostics stay clean)
 local UISpecialFrames = _G and rawget(_G, "UISpecialFrames")
 local NUM_CHAT_WINDOWS = _G and rawget(_G, "NUM_CHAT_WINDOWS")
@@ -38,6 +49,9 @@ local ADDON_LINK_ALIASES = (type(rawget(_G, "fr0z3nUI_LootIt_AddonAliases")) == 
 -- Built-in currency aliases shipped with the addon.
 -- Keyed by currencyID; values are display-only text (link remains the original currency).
 local ADDON_CURRENCY_ALIASES = (type(rawget(_G, "fr0z3nUI_LootIt_AddonCurrencyAliases")) == "table") and rawget(_G, "fr0z3nUI_LootIt_AddonCurrencyAliases") or {}
+
+LI.AddonLinkAliases = ADDON_LINK_ALIASES
+LI.AddonCurrencyAliases = ADDON_CURRENCY_ALIASES
 
 local DEFAULTS = {
   enabled = true,
@@ -122,6 +136,23 @@ local DEFAULTS = {
     },
     tabardMap = {},
   },
+
+  -- Deposit helper (bank open + command/button pressed).
+  deposit = {
+    tradeMode = "deposit", -- deposit | buy | sell
+    target = "bank", -- bank | guild | warbank
+    guildTab = 0, -- legacy fallback; 0=current tab; 1..8 specific tab
+    guildTabByRealm = {}, -- [realm] = 0..8
+    showButton = true,
+    itemsAcc = {}, -- [itemID] = true
+    itemsRealm = {}, -- [realm] = { [itemID] = true }
+
+    -- Vendor buy/sell rules (stored as: [itemID] = { count=<number>, restock=<bool?> } )
+    buyItemsAcc = {},
+    buyItemsRealm = {}, -- [realm] = { [itemID] = rule }
+    sellItemsAcc = {},
+    sellItemsRealm = {}, -- [realm] = { [itemID] = rule }
+  },
 }
 
 fr0z3nUI_LootItDB = fr0z3nUI_LootItDB or nil
@@ -169,6 +200,52 @@ local function EnsureDB()
   if type(CHARDB.currencyAliases) ~= "table" then CHARDB.currencyAliases = {} end
   if type(CHARDB.currencyAliasDisabledChar) ~= "table" then CHARDB.currencyAliasDisabledChar = {} end
 
+  -- Deposit config (account list + per-character list/overrides).
+  if type(DB.deposit) ~= "table" then DB.deposit = {} end
+  if DB.deposit.tradeMode == nil then DB.deposit.tradeMode = "deposit" end
+  if type(DB.deposit.itemsAcc) ~= "table" then DB.deposit.itemsAcc = {} end
+  if type(DB.deposit.itemsRealm) ~= "table" then DB.deposit.itemsRealm = {} end
+  if type(DB.deposit.guildTabByRealm) ~= "table" then DB.deposit.guildTabByRealm = {} end
+  if type(DB.deposit.buyItemsAcc) ~= "table" then DB.deposit.buyItemsAcc = {} end
+  if type(DB.deposit.buyItemsRealm) ~= "table" then DB.deposit.buyItemsRealm = {} end
+  if type(DB.deposit.sellItemsAcc) ~= "table" then DB.deposit.sellItemsAcc = {} end
+  if type(DB.deposit.sellItemsRealm) ~= "table" then DB.deposit.sellItemsRealm = {} end
+  if DB.deposit.target == nil then DB.deposit.target = "bank" end
+  if DB.deposit.guildTab == nil then DB.deposit.guildTab = 0 end
+  if DB.deposit.showButton == nil then DB.deposit.showButton = true end
+
+  -- The config UI no longer exposes toggling this; keep the on-screen button on.
+  DB.deposit.showButton = true
+
+  do
+    local m = tostring(DB.deposit.tradeMode or ""):lower():gsub("%s+", "")
+    if m ~= "deposit" and m ~= "buy" and m ~= "sell" then
+      m = "deposit"
+    end
+    DB.deposit.tradeMode = m
+  end
+
+  -- Migration: previous targets were guild|warband|either.
+  do
+    local t = tostring(DB.deposit.target or "")
+    t = t:lower():gsub("%s+", "")
+    if t == "either" then t = "bank" end
+    if t == "warband" then t = "warbank" end
+    if t == "warbank" or t == "guild" or t == "bank" then
+      DB.deposit.target = t
+    else
+      DB.deposit.target = "bank"
+    end
+  end
+
+  if type(CHARDB.deposit) ~= "table" then CHARDB.deposit = {} end
+  if type(CHARDB.deposit.itemsChar) ~= "table" then CHARDB.deposit.itemsChar = {} end
+  if type(CHARDB.deposit.disableAcc) ~= "table" then CHARDB.deposit.disableAcc = {} end
+  if type(CHARDB.deposit.buyItemsChar) ~= "table" then CHARDB.deposit.buyItemsChar = {} end
+  if type(CHARDB.deposit.buyDisableAcc) ~= "table" then CHARDB.deposit.buyDisableAcc = {} end
+  if type(CHARDB.deposit.sellItemsChar) ~= "table" then CHARDB.deposit.sellItemsChar = {} end
+  if type(CHARDB.deposit.sellDisableAcc) ~= "table" then CHARDB.deposit.sellDisableAcc = {} end
+
   if DB and type(DB.other) ~= "table" then
     DB.other = {}
   end
@@ -198,6 +275,27 @@ local function EnsureDB()
 
   -- Mail notifier config is per-character (enabled remains account-wide + char override).
   do
+    -- Migration (2026-02-12): reset per-character mail settings to defaults on next load.
+    -- IMPORTANT: Older versions stored mail notifier config account-wide; we must ensure
+    -- the reset is not immediately overwritten by that legacy migration.
+    if CHARDB then
+      -- First-time reset.
+      if CHARDB._m20260212_mailReset ~= true then
+        CHARDB.mailNotifyEnabledOverride = nil
+        CHARDB.mailNotify = { _migratedFromAcc = true, _resetToDefaults = true }
+        CHARDB._m20260212_mailReset = true
+      end
+
+      -- Repair: earlier builds cleared mailNotify, then re-imported from account DB.
+      -- If that happened, apply the intended reset once.
+      if CHARDB._m20260212_mailReset == true then
+        if type(CHARDB.mailNotify) ~= "table" or CHARDB.mailNotify._resetToDefaults ~= true then
+          CHARDB.mailNotifyEnabledOverride = nil
+          CHARDB.mailNotify = { _migratedFromAcc = true, _resetToDefaults = true }
+        end
+      end
+    end
+
     if type(CHARDB.mailNotify) ~= "table" then
       CHARDB.mailNotify = {}
     end
@@ -242,6 +340,16 @@ local function EnsureDB()
   end
 end
 
+LI.EnsureDB = EnsureDB
+LI.GetDB = function()
+  EnsureDB()
+  return DB
+end
+LI.GetCharDB = function()
+  EnsureDB()
+  return CHARDB
+end
+
 local function IsIgnoredItemID(itemID)
   return (DB and type(DB.ignoredItemIDs) == "table" and DB.ignoredItemIDs[itemID] == true) and true or false
 end
@@ -251,6 +359,889 @@ local function IsItemLevelEnabled()
     return (CHARDB.showItemLevel == true)
   end
   return (DB and DB.showItemLevel ~= false) and true or false
+end
+
+-- Deposit helpers
+local function DepositCfgAcc()
+  EnsureDB()
+  DB.deposit = (type(DB.deposit) == "table") and DB.deposit or {}
+  if DB.deposit.tradeMode == nil then DB.deposit.tradeMode = "deposit" end
+  DB.deposit.itemsAcc = (type(DB.deposit.itemsAcc) == "table") and DB.deposit.itemsAcc or {}
+  DB.deposit.itemsRealm = (type(DB.deposit.itemsRealm) == "table") and DB.deposit.itemsRealm or {}
+  DB.deposit.guildTabByRealm = (type(DB.deposit.guildTabByRealm) == "table") and DB.deposit.guildTabByRealm or {}
+  DB.deposit.buyItemsAcc = (type(DB.deposit.buyItemsAcc) == "table") and DB.deposit.buyItemsAcc or {}
+  DB.deposit.buyItemsRealm = (type(DB.deposit.buyItemsRealm) == "table") and DB.deposit.buyItemsRealm or {}
+  DB.deposit.sellItemsAcc = (type(DB.deposit.sellItemsAcc) == "table") and DB.deposit.sellItemsAcc or {}
+  DB.deposit.sellItemsRealm = (type(DB.deposit.sellItemsRealm) == "table") and DB.deposit.sellItemsRealm or {}
+  return DB.deposit
+end
+
+LI.DepositCfgAcc = DepositCfgAcc
+
+local function GetCurrentRealmKey()
+  local rn = (type(GetRealmName) == "function") and GetRealmName() or nil
+  rn = (type(rn) == "string" and rn ~= "") and rn or ""
+  return rn
+end
+
+local function DepositCfgRealm()
+  local cfg = DepositCfgAcc()
+  local rk = GetCurrentRealmKey()
+  if rk == "" then
+    return nil, nil
+  end
+  cfg.itemsRealm = (type(cfg.itemsRealm) == "table") and cfg.itemsRealm or {}
+  cfg.itemsRealm[rk] = (type(cfg.itemsRealm[rk]) == "table") and cfg.itemsRealm[rk] or {}
+  return cfg.itemsRealm[rk], rk
+end
+
+local function DepositCfgChar()
+  EnsureDB()
+  CHARDB.deposit = (type(CHARDB.deposit) == "table") and CHARDB.deposit or {}
+  CHARDB.deposit.itemsChar = (type(CHARDB.deposit.itemsChar) == "table") and CHARDB.deposit.itemsChar or {}
+  CHARDB.deposit.disableAcc = (type(CHARDB.deposit.disableAcc) == "table") and CHARDB.deposit.disableAcc or {}
+  CHARDB.deposit.buyItemsChar = (type(CHARDB.deposit.buyItemsChar) == "table") and CHARDB.deposit.buyItemsChar or {}
+  CHARDB.deposit.buyDisableAcc = (type(CHARDB.deposit.buyDisableAcc) == "table") and CHARDB.deposit.buyDisableAcc or {}
+  CHARDB.deposit.sellItemsChar = (type(CHARDB.deposit.sellItemsChar) == "table") and CHARDB.deposit.sellItemsChar or {}
+  CHARDB.deposit.sellDisableAcc = (type(CHARDB.deposit.sellDisableAcc) == "table") and CHARDB.deposit.sellDisableAcc or {}
+  return CHARDB.deposit
+end
+
+LI.DepositCfgChar = DepositCfgChar
+
+local function GetEffectiveDepositItemIDs()
+  local acc = DepositCfgAcc()
+  local ch = DepositCfgChar()
+  local out = {}
+  for id, on in pairs(acc.itemsAcc or {}) do
+    id = tonumber(id)
+    if id and id > 0 and on == true and not (ch.disableAcc and ch.disableAcc[id] == true) then
+      out[id] = true
+    end
+  end
+  for id, on in pairs(ch.itemsChar or {}) do
+    id = tonumber(id)
+    if id and id > 0 and on == true then
+      out[id] = true
+    end
+  end
+
+  do
+    local realmItems = nil
+    realmItems = (type(acc.itemsRealm) == "table") and acc.itemsRealm[GetCurrentRealmKey()] or nil
+    if type(realmItems) == "table" then
+      for id, on in pairs(realmItems) do
+        id = tonumber(id)
+        if id and id > 0 and on == true then
+          out[id] = true
+        end
+      end
+    end
+  end
+  return out
+end
+
+local function IsGuildBankOpen()
+  local f = _G and rawget(_G, "GuildBankFrame")
+  if f and f.IsShown and f:IsShown() then
+    return true
+  end
+  return false
+end
+
+local _warbankInteractionOpen = false
+
+local function GetWarbankFrame()
+  local candidates = {
+    "AccountBankFrame",
+    "AccountBankPanel",
+    "BankFrame",
+    "WarbandBankFrame",
+    "WarbandBankPanel",
+    "WarbandBank",
+  }
+  for _, k in ipairs(candidates) do
+    local f = _G and rawget(_G, k)
+    if f and f.IsShown and f:IsShown() then
+      return f
+    end
+  end
+  return nil
+end
+
+local function IsWarbankOpen()
+  if _warbankInteractionOpen == true then
+    return true
+  end
+  return (GetWarbankFrame() ~= nil)
+end
+
+local function GetConfiguredGuildBankTab()
+  local cfg = DepositCfgAcc()
+  local want = nil
+  do
+    local rk = GetCurrentRealmKey()
+    local tbr = (type(cfg.guildTabByRealm) == "table") and cfg.guildTabByRealm or nil
+    want = (rk ~= "" and tbr and tonumber(tbr[rk])) or nil
+  end
+  if want == nil then
+    want = tonumber(cfg.guildTab) or 0
+  end
+  if want and want > 0 then
+    return math.floor(want)
+  end
+  if type(GetCurrentGuildBankTab) == "function" then
+    local ok, t = pcall(GetCurrentGuildBankTab)
+    t = ok and tonumber(t) or nil
+    if t and t > 0 then
+      return math.floor(t)
+    end
+  end
+  return 1
+end
+
+local function FindFirstEmptyGuildBankSlot(tab)
+  tab = tonumber(tab)
+  if not tab or tab <= 0 then return nil end
+  local maxSlots = _G and rawget(_G, "MAX_GUILDBANK_SLOTS_PER_TAB")
+  maxSlots = tonumber(maxSlots) or 98
+  if type(GetGuildBankItemLink) ~= "function" then
+    return nil
+  end
+  for slot = 1, maxSlots do
+    local ok, link = pcall(GetGuildBankItemLink, tab, slot)
+    if ok and not link then
+      return slot
+    end
+  end
+  return nil
+end
+
+local function DepositToGuildBankOnce(bag, slot, tab, bankSlot)
+  if not (C_Container and type(C_Container.PickupContainerItem) == "function") then
+    return false
+  end
+  if type(PickupGuildBankItem) ~= "function" then
+    return false
+  end
+
+  local clear = _G and rawget(_G, "ClearCursor")
+  local cursorHas = _G and rawget(_G, "CursorHasItem")
+
+  if type(clear) == "function" then pcall(clear) end
+
+  local okPick = pcall(C_Container.PickupContainerItem, bag, slot)
+  if not okPick then
+    if type(clear) == "function" then pcall(clear) end
+    return false
+  end
+  if type(cursorHas) == "function" then
+    local okCur, has = pcall(cursorHas)
+    if okCur and not has then
+      if type(clear) == "function" then pcall(clear) end
+      return false
+    end
+  end
+
+  local okDrop = pcall(PickupGuildBankItem, tab, bankSlot)
+  if not okDrop then
+    if type(clear) == "function" then pcall(clear) end
+    return false
+  end
+  if type(clear) == "function" then pcall(clear) end
+  return true
+end
+
+local function RunDepositGuild()
+  if not IsGuildBankOpen() then
+    Print("Guild bank is not open.")
+    return false
+  end
+
+  local targets = GetEffectiveDepositItemIDs()
+  local hasAny = false
+  for _ in pairs(targets) do hasAny = true break end
+  if not hasAny then
+    Print("Deposit list is empty.")
+    return false
+  end
+
+  local tab = GetConfiguredGuildBankTab()
+  local moved = 0
+  local maxMoves = 200
+
+  for bag = 0, 6 do
+    local n = 0
+    if C_Container and type(C_Container.GetContainerNumSlots) == "function" then
+      local ok, v = pcall(C_Container.GetContainerNumSlots, bag)
+      n = ok and tonumber(v) or 0
+    end
+    if n and n > 0 then
+      for slot = 1, n do
+        if moved >= maxMoves then break end
+
+        local info = nil
+        if C_Container and type(C_Container.GetContainerItemInfo) == "function" then
+          local ok, v = pcall(C_Container.GetContainerItemInfo, bag, slot)
+          info = ok and v or nil
+        end
+        local itemID = info and tonumber(info.itemID) or nil
+        if itemID and targets[itemID] == true then
+          local bankSlot = FindFirstEmptyGuildBankSlot(tab)
+          if not bankSlot then
+            Print("Guild bank tab is full.")
+            return moved > 0
+          end
+          local okMove = DepositToGuildBankOnce(bag, slot, tab, bankSlot)
+          if okMove then
+            moved = moved + 1
+          else
+            Print("Deposit blocked; try clicking Deposit again.")
+            return moved > 0
+          end
+        end
+      end
+    end
+    if moved >= maxMoves then break end
+  end
+
+  if moved > 0 then
+    Print("Deposited: " .. tostring(moved) .. " move(s)")
+    return true
+  end
+  Print("No matching items found in bags.")
+  return false
+end
+
+local function WarbandDepositCapability()
+  -- Retail always has Warband Bank; we keep a best-effort callable detector for the eventual mover.
+  local candidates = {
+    { tbl = _G and rawget(_G, "C_AccountBank"), fn = "DepositItem" },
+    { tbl = _G and rawget(_G, "C_Bank"), fn = "DepositItem" },
+    { tbl = _G and rawget(_G, "C_Bank"), fn = "DepositToAccountBank" },
+  }
+  for _, c in ipairs(candidates) do
+    if type(c.tbl) == "table" and type(c.tbl[c.fn]) == "function" then
+      return true, c.tbl, c.fn
+    end
+  end
+  -- Treat as supported even if we didn't find a callable (API naming can change).
+  return true, nil, nil
+end
+
+local function GetWarbankDepositCallable()
+  local cap, tbl, fn = WarbandDepositCapability()
+  if not cap then return nil, nil, nil end
+  if type(tbl) == "table" and type(fn) == "string" and type(tbl[fn]) == "function" then
+    return tbl[fn], fn
+  end
+  return nil, nil
+end
+
+local function CreateItemLocationFromBagSlot(bag, slot)
+  if not (bag and slot) then return nil end
+  local il = _G and rawget(_G, "ItemLocation")
+  if type(il) == "table" then
+    if type(il.CreateFromBagAndSlot) == "function" then
+      local ok, loc = pcall(il.CreateFromBagAndSlot, bag, slot)
+      if ok then return loc end
+    end
+    -- Some mixin-style APIs expect self as the first arg.
+    if type(il.CreateFromBagAndSlot) == "function" then
+      local ok, loc = pcall(il.CreateFromBagAndSlot, il, bag, slot)
+      if ok then return loc end
+    end
+  end
+  return nil
+end
+
+local function DepositToWarbankOnce(bag, slot)
+  local f, fnName = GetWarbankDepositCallable()
+  if type(f) ~= "function" then
+    return false, "No deposit API"
+  end
+
+  -- Try common signatures (API differs by build).
+  local loc = CreateItemLocationFromBagSlot(bag, slot)
+  local bankTypeAccount = (Enum and Enum.BankType) and Enum.BankType.Account or nil
+
+  local function tryCall(...)
+    local ok, res = pcall(f, ...)
+    if ok and res ~= false then
+      return true
+    end
+    return false
+  end
+
+  if bankTypeAccount ~= nil then
+    if tryCall(bankTypeAccount, bag, slot) then return true end
+    if loc ~= nil and tryCall(bankTypeAccount, loc) then return true end
+  end
+
+  if tryCall(bag, slot) then return true end
+  if loc ~= nil and tryCall(loc) then return true end
+
+  return false, tostring(fnName or "deposit")
+end
+
+local function RunDepositWarband()
+  if not IsWarbankOpen() then
+    Print("WarBank is not open.")
+    return false
+  end
+
+  local targets = GetEffectiveDepositItemIDs()
+  local hasAny = false
+  for _ in pairs(targets) do hasAny = true break end
+  if not hasAny then
+    Print("Deposit list is empty.")
+    return false
+  end
+
+  local moved = 0
+  local maxMoves = 200
+  for bag = 0, 6 do
+    local n = 0
+    if C_Container and type(C_Container.GetContainerNumSlots) == "function" then
+      local ok, v = pcall(C_Container.GetContainerNumSlots, bag)
+      n = ok and tonumber(v) or 0
+    end
+    if n and n > 0 then
+      for slot = 1, n do
+        if moved >= maxMoves then break end
+
+        local info = nil
+        if C_Container and type(C_Container.GetContainerItemInfo) == "function" then
+          local ok, v = pcall(C_Container.GetContainerItemInfo, bag, slot)
+          info = ok and v or nil
+        end
+        local itemID = info and tonumber(info.itemID) or nil
+        if itemID and targets[itemID] == true then
+          local okMove = DepositToWarbankOnce(bag, slot)
+          if okMove then
+            moved = moved + 1
+          else
+            Print("Deposit blocked; try clicking Deposit again.")
+            return moved > 0
+          end
+        end
+      end
+    end
+    if moved >= maxMoves then break end
+  end
+
+  if moved > 0 then
+    Print("Deposited: " .. tostring(moved) .. " move(s)")
+    return true
+  end
+  Print("No matching items found in bags.")
+  return false
+end
+
+local function RunDeposit(target)
+  local function Normalize(t)
+    t = tostring(t or "")
+    t = t:lower():gsub("%s+", "")
+    if t == "either" then t = "bank" end
+    if t == "warband" then t = "warbank" end
+    if t ~= "bank" and t ~= "guild" and t ~= "warbank" then
+      t = ""
+    end
+    return t
+  end
+
+  target = Normalize(target)
+  if target == "" then
+    local cfg = DepositCfgAcc()
+    target = Normalize(cfg.target)
+    if target == "" then target = "bank" end
+  end
+
+  if target == "guild" then
+    return RunDepositGuild()
+  elseif target == "warbank" then
+    return RunDepositWarband()
+  else
+    -- Bank: whichever bank is currently open.
+    if IsWarbankOpen() then
+      return RunDepositWarband()
+    end
+    if IsGuildBankOpen() then
+      return RunDepositGuild()
+    end
+    Print("No bank is open.")
+    return false
+  end
+end
+
+-- Vendor buy/sell/restock (merchant open)
+local function NormalizeTradeMode(mode)
+  local m = tostring(mode or ""):lower():gsub("%s+", "")
+  if m ~= "deposit" and m ~= "buy" and m ~= "sell" then
+    m = "deposit"
+  end
+  return m
+end
+
+local function GetTradeMode()
+  local cfg = DepositCfgAcc()
+  return NormalizeTradeMode(cfg and cfg.tradeMode)
+end
+
+local function NormalizeRule(v)
+  if v == nil then return nil end
+  if type(v) == "number" then
+    return { count = math.floor(v) }
+  end
+  if type(v) == "table" then
+    local c = tonumber(v.count)
+    if c == nil then c = tonumber(v[1]) end
+    c = c and math.floor(c) or nil
+    local r = (v.restock == true)
+    if c == nil and r ~= true then return nil end
+    return { count = c, restock = r }
+  end
+  return nil
+end
+
+local function GetItemNameSafe(itemID)
+  itemID = tonumber(itemID)
+  if not itemID or itemID <= 0 then return nil end
+  if C_Item and type(C_Item.GetItemNameByID) == "function" then
+    local ok, name = pcall(C_Item.GetItemNameByID, itemID)
+    if ok and type(name) == "string" and name ~= "" then
+      return name
+    end
+  end
+  if type(GetItemInfo) == "function" then
+    local name = GetItemInfo(itemID)
+    if type(name) == "string" and name ~= "" then
+      return name
+    end
+  end
+  return nil
+end
+
+local function GetRealmRuleTable(cfg, mode)
+  local rk = GetCurrentRealmKey()
+  if rk == "" then return nil, nil end
+  if mode == "buy" then
+    cfg.buyItemsRealm = (type(cfg.buyItemsRealm) == "table") and cfg.buyItemsRealm or {}
+    cfg.buyItemsRealm[rk] = (type(cfg.buyItemsRealm[rk]) == "table") and cfg.buyItemsRealm[rk] or {}
+    return cfg.buyItemsRealm[rk], rk
+  end
+  if mode == "sell" then
+    cfg.sellItemsRealm = (type(cfg.sellItemsRealm) == "table") and cfg.sellItemsRealm or {}
+    cfg.sellItemsRealm[rk] = (type(cfg.sellItemsRealm[rk]) == "table") and cfg.sellItemsRealm[rk] or {}
+    return cfg.sellItemsRealm[rk], rk
+  end
+  cfg.itemsRealm = (type(cfg.itemsRealm) == "table") and cfg.itemsRealm or {}
+  cfg.itemsRealm[rk] = (type(cfg.itemsRealm[rk]) == "table") and cfg.itemsRealm[rk] or {}
+  return cfg.itemsRealm[rk], rk
+end
+
+local function GetScopeStores(mode)
+  local cfg = DepositCfgAcc()
+  local ch = DepositCfgChar()
+  local realmTbl, realmKey = GetRealmRuleTable(cfg, mode)
+  if mode == "buy" then
+    return cfg.buyItemsAcc, realmTbl, realmKey, ch.buyItemsChar, ch.buyDisableAcc
+  end
+  if mode == "sell" then
+    return cfg.sellItemsAcc, realmTbl, realmKey, ch.sellItemsChar, ch.sellDisableAcc
+  end
+  return cfg.itemsAcc, realmTbl, realmKey, ch.itemsChar, ch.disableAcc
+end
+
+local function GetEffectiveTradeRules(mode)
+  mode = NormalizeTradeMode(mode)
+  local accTbl, realmTbl, _, charTbl, disableAccTbl = GetScopeStores(mode)
+  local out = {}
+
+  local function setFrom(tbl, isAccount)
+    if type(tbl) ~= "table" then return end
+    for id, v in pairs(tbl) do
+      id = tonumber(id)
+      if id and id > 0 then
+        if isAccount and type(disableAccTbl) == "table" and disableAccTbl[id] == true then
+          -- skip
+        else
+          if mode == "deposit" then
+            if v == true then
+              out[id] = { on = true }
+            end
+          else
+            local r = NormalizeRule(v)
+            if r and r.count ~= nil then
+              out[id] = { count = r.count, restock = r.restock == true }
+            end
+          end
+        end
+      end
+    end
+  end
+
+  -- Priority: Account -> Realm -> Character
+  setFrom(accTbl, true)
+  setFrom(realmTbl, false)
+  setFrom(charTbl, false)
+  return out
+end
+
+local function IterateBagSlots(cb)
+  for bag = 0, 6 do
+    local n = 0
+    if C_Container and type(C_Container.GetContainerNumSlots) == "function" then
+      local ok, v = pcall(C_Container.GetContainerNumSlots, bag)
+      n = ok and tonumber(v) or 0
+    end
+    if n and n > 0 then
+      for slot = 1, n do
+        cb(bag, slot)
+      end
+    end
+  end
+end
+
+local function GetBagItemInfo(bag, slot)
+  if C_Container and type(C_Container.GetContainerItemInfo) == "function" then
+    local ok, v = pcall(C_Container.GetContainerItemInfo, bag, slot)
+    return ok and v or nil
+  end
+  return nil
+end
+
+local function UseContainerItemSafe(bag, slot)
+  if C_Container and type(C_Container.UseContainerItem) == "function" then
+    pcall(C_Container.UseContainerItem, bag, slot)
+    return
+  end
+  local uci = _G and _G["UseContainerItem"]
+  if type(uci) == "function" then
+    pcall(uci, bag, slot)
+  end
+end
+
+local function CountItemInBags(itemID)
+  itemID = tonumber(itemID)
+  if not itemID or itemID <= 0 then return 0 end
+  local total = 0
+  IterateBagSlots(function(bag, slot)
+    local info = GetBagItemInfo(bag, slot)
+    if info and tonumber(info.itemID) == itemID then
+      local stack = tonumber(info.stackCount)
+      total = total + (stack or 1)
+    end
+  end)
+  return total
+end
+
+local function NormalizeUseText(s)
+  if type(s) ~= "string" then return nil end
+  local t = s:lower()
+  t = t:gsub("^use:%s*", "")
+  t = t:gsub("%d+", "")
+  t = t:gsub("[%p%c]", " ")
+  t = t:gsub("%s+", " ")
+  t = t:gsub("^%s+", "")
+  t = t:gsub("%s+$", "")
+  if t == "" then return nil end
+  return t
+end
+
+local function GetUseKeyForItemID(itemID)
+  itemID = tonumber(itemID)
+  if not itemID or itemID <= 0 then return nil end
+
+  local useLines = {}
+  local hasMana = false
+
+  if C_TooltipInfo and type(C_TooltipInfo.GetHyperlink) == "function" then
+    local ok, tip = pcall(C_TooltipInfo.GetHyperlink, "item:" .. tostring(itemID))
+    if ok and type(tip) == "table" and type(tip.lines) == "table" then
+      for _, line in ipairs(tip.lines) do
+        local left = (type(line) == "table") and line.leftText or nil
+        if type(left) == "string" and left:find("^Use:", 1) then
+          local norm = NormalizeUseText(left)
+          if norm then
+            useLines[#useLines + 1] = norm
+            if norm:find("mana", 1, true) then hasMana = true end
+          end
+        end
+      end
+    end
+  end
+
+  if #useLines == 0 then
+    return nil
+  end
+  return table.concat(useLines, " ") .. "|mana:" .. (hasMana and "1" or "0")
+end
+
+local function PlayerUsesMana()
+  if type(UnitPowerType) ~= "function" then return false end
+  local pt = UnitPowerType("player")
+  return (pt == 0)
+end
+
+local function CountEquivalentByUseKeyInBags(useKey)
+  if type(useKey) ~= "string" or useKey == "" then return 0 end
+  local total = 0
+  IterateBagSlots(function(bag, slot)
+    local info = GetBagItemInfo(bag, slot)
+    local itemID = info and tonumber(info.itemID) or nil
+    if itemID then
+      local k = GetUseKeyForItemID(itemID)
+      if k and k == useKey then
+        local stack = info and tonumber(info.stackCount) or nil
+        total = total + (stack or 1)
+      end
+    end
+  end)
+  return total
+end
+
+local function GetMerchantIndexForItemID(itemID)
+  itemID = tonumber(itemID)
+  if not itemID or itemID <= 0 then return nil end
+  if type(GetMerchantNumItems) ~= "function" then return nil end
+  local n = tonumber(GetMerchantNumItems()) or 0
+  for i = 1, n do
+    local link = type(GetMerchantItemLink) == "function" and GetMerchantItemLink(i) or nil
+    if type(link) == "string" then
+      local id = link:match("Hitem:(%d+):")
+      id = id and tonumber(id) or nil
+      if id == itemID then
+        return i
+      end
+    end
+  end
+  return nil
+end
+
+local function IsFoodItemID(itemID)
+  if not (C_Item and type(C_Item.GetItemInfoInstant) == "function") then return false end
+  local ok, _, _, _, _, classID, subClassID = pcall(C_Item.GetItemInfoInstant, itemID)
+  if not ok then return false end
+  return (tonumber(classID) == 0) and (tonumber(subClassID) == 5)
+end
+
+local function GetItemMinLevel(itemID)
+  itemID = tonumber(itemID)
+  if not itemID then return nil end
+  if type(GetItemInfo) == "function" then
+    local _, _, _, _, reqLevel = GetItemInfo(itemID)
+    reqLevel = tonumber(reqLevel)
+    return reqLevel
+  end
+  return nil
+end
+
+local function GetItemSellPrice(itemID)
+  itemID = tonumber(itemID)
+  if not itemID or itemID <= 0 then return nil end
+  if type(GetItemInfo) == "function" then
+    local sellPrice = select(11, GetItemInfo(itemID))
+    sellPrice = tonumber(sellPrice)
+    return sellPrice
+  end
+  return nil
+end
+
+local function SellOldFoodAtMerchant(levelDiff)
+  local diff = tonumber(levelDiff) or 10
+  if diff < 1 then diff = 1 end
+  if diff > 80 then diff = 80 end
+
+  local pl = type(UnitLevel) == "function" and tonumber(UnitLevel("player")) or nil
+  if not pl or pl <= 1 then return end
+  local threshold = pl - diff
+
+  local soldByID = {}
+  local ops = 0
+  local maxOps = 200
+
+  IterateBagSlots(function(bag, slot)
+    if ops >= maxOps then return end
+    local info = GetBagItemInfo(bag, slot)
+    if not info or info.isLocked then return end
+    local itemID = tonumber(info.itemID)
+    if not itemID or not IsFoodItemID(itemID) then return end
+    local req = GetItemMinLevel(itemID)
+    if not req or req <= 0 then return end
+    if req > threshold then return end
+    local sellPrice = GetItemSellPrice(itemID)
+    if not sellPrice or sellPrice <= 0 then return end
+
+    local stack = tonumber(info.stackCount) or 1
+    UseContainerItemSafe(bag, slot)
+    soldByID[itemID] = (soldByID[itemID] or 0) + stack
+    ops = ops + 1
+  end)
+
+  for id, cnt in pairs(soldByID) do
+    if Print then
+      Print("Sold old food: " .. (GetItemNameSafe(id) or tostring(id)) .. " x" .. tostring(cnt))
+    end
+  end
+end
+
+local function RunMerchantTradeOnce()
+  local mode = GetTradeMode()
+  if mode ~= "buy" and mode ~= "sell" then return end
+
+  local rules = GetEffectiveTradeRules(mode)
+  if type(rules) ~= "table" then return end
+
+  local any = false
+  local anyRestock = false
+  for _, r in pairs(rules) do
+    any = true
+    if r and r.restock == true then anyRestock = true end
+  end
+  if not any then return end
+
+  if mode == "buy" and anyRestock then
+    SellOldFoodAtMerchant(10)
+  end
+
+  local usesMana = PlayerUsesMana()
+  local ops = 0
+  local maxOps = 200
+
+  if mode == "buy" then
+    for itemID, r in pairs(rules) do
+      if ops >= maxOps then break end
+      local target = r and tonumber(r.count) or nil
+      if target and target > 0 then
+        local current = 0
+        if r.restock == true then
+          local key = GetUseKeyForItemID(itemID)
+          if key then
+            local hasMana = (key:sub(-7) == "|mana:1")
+            if (not usesMana) and hasMana then
+              -- Non-mana classes: treat mana food as a different pool; do not restock it implicitly.
+              current = CountItemInBags(itemID)
+            else
+              current = CountEquivalentByUseKeyInBags(key)
+            end
+          else
+            current = CountItemInBags(itemID)
+          end
+        else
+          current = CountItemInBags(itemID)
+        end
+
+        local need = target - current
+        if need > 0 then
+          local idx = GetMerchantIndexForItemID(itemID)
+          if idx and type(BuyMerchantItem) == "function" then
+            local name, _, _, _, numAvailable = nil, nil, nil, nil, nil
+            if type(GetMerchantItemInfo) == "function" then
+              name, _, _, _, numAvailable = GetMerchantItemInfo(idx)
+            end
+            local avail = tonumber(numAvailable)
+            if avail == nil or avail < 0 then avail = need end
+            if avail <= 0 then
+              -- out of stock
+            else
+              local buyCount = need
+              if buyCount > avail then buyCount = avail end
+              if buyCount > 0 then
+                pcall(BuyMerchantItem, idx, buyCount)
+                ops = ops + 1
+                if Print then
+                  Print("Buying: " .. tostring(buyCount) .. "x " .. (name or (GetItemNameSafe(itemID) or tostring(itemID))))
+                end
+              end
+            end
+          else
+            if Print then
+              Print("Cannot buy (not sold by this merchant): " .. (GetItemNameSafe(itemID) or tostring(itemID)))
+            end
+          end
+        end
+      end
+    end
+    return
+  end
+
+  -- Sell mode
+  for itemID, r in pairs(rules) do
+    if ops >= maxOps then break end
+    local target = r and tonumber(r.count) or 0
+    if target < 0 then target = 0 end
+    target = math.floor(target)
+
+    local current = CountItemInBags(itemID)
+    local toSell = current - target
+    if toSell > 0 then
+      local sold = 0
+      IterateBagSlots(function(bag, slot)
+        if ops >= maxOps then return end
+        if sold >= toSell then return end
+        local info = GetBagItemInfo(bag, slot)
+        if not info or info.isLocked then return end
+        if tonumber(info.itemID) ~= itemID then return end
+        local sellPrice = GetItemSellPrice(itemID)
+        if not sellPrice or sellPrice <= 0 then return end
+
+        local stack = tonumber(info.stackCount) or 1
+        UseContainerItemSafe(bag, slot)
+        sold = sold + stack
+        ops = ops + 1
+      end)
+      if Print then
+        Print("Selling: " .. tostring(math.min(sold, toSell)) .. "x " .. (GetItemNameSafe(itemID) or tostring(itemID)))
+      end
+    end
+  end
+end
+
+local DepositButton
+local function EnsureDepositButton()
+  if DepositButton then return DepositButton end
+
+  local b = CreateFrame("Button", "fr0z3nUI_LootItDepositButton", UIParent, "UIPanelButtonTemplate")
+  b:SetSize(74, 22)
+  b:SetText("Deposit")
+  b:Hide()
+  b:SetScript("OnClick", function()
+    RunDeposit(nil)
+  end)
+
+  DepositButton = b
+  return b
+end
+
+local function UpdateDepositButtonVisibility()
+  local b = EnsureDepositButton()
+  local cfg = DepositCfgAcc()
+  if not (cfg and cfg.showButton ~= false) then
+    b:Hide()
+    return
+  end
+
+  local wb = GetWarbankFrame()
+  if wb then
+    if b.ClearAllPoints and b.SetPoint then
+      b:ClearAllPoints()
+      b:SetPoint("TOPRIGHT", wb, "TOPLEFT", -8, -10)
+    end
+    b:Show()
+    return
+  end
+
+  if IsGuildBankOpen() then
+    local g = _G and rawget(_G, "GuildBankFrame")
+    if g and b.ClearAllPoints and b.SetPoint then
+      b:ClearAllPoints()
+      b:SetPoint("TOPRIGHT", g, "TOPLEFT", -8, -10)
+    end
+    b:Show()
+    return
+  end
+  b:Hide()
 end
 
 local function IsMailNotifierEnabled()
@@ -269,86 +1260,7 @@ local function MailNotifyCfg()
   return (CHARDB and type(CHARDB.mailNotify) == "table") and CHARDB.mailNotify or nil
 end
 
-local function CaptureEnabled()
-  return (DB and DB.debugCapture) == true
-end
-
-local function CaptureGetLog()
-  EnsureDB()
-  if not CHARDB then return nil end
-  if type(CHARDB.debugCaptureLog) ~= "table" then
-    CHARDB.debugCaptureLog = {}
-  end
-  return CHARDB.debugCaptureLog
-end
-
-local function CaptureNowString()
-  if type(date) == "function" then
-    return date("%H:%M:%S")
-  end
-  if type(time) == "function" then
-    return tostring(time())
-  end
-  return ""
-end
-
-local function CaptureExtractLink(msg)
-  if type(msg) ~= "string" then return nil end
-  return msg:match("(|c%x%x%x%x%x%x%x%x|Hitem:.-|h%[.-%]|h|r)")
-    or msg:match("(|Hitem:.-|h%[.-%]|h)")
-    or msg:match("(|c%x%x%x%x%x%x%x%x|Hcurrency:.-|h%[.-%]|h|r)")
-    or msg:match("(|Hcurrency:.-|h%[.-%]|h)")
-end
-
-local function CaptureItemIDFromLink(link)
-  if type(link) ~= "string" then return nil end
-  local id = link:match("Hitem:(%d+):")
-  return id and tonumber(id) or nil
-end
-
-local function CaptureAppend(kind, data)
-  if not CaptureEnabled() then return end
-  local log = CaptureGetLog()
-  if not log then return end
-
-  local entry = (type(data) == "table") and data or { msg = tostring(data or "") }
-  entry.t = entry.t or CaptureNowString()
-  entry.kind = tostring(kind or entry.kind or "CAP")
-  log[#log + 1] = entry
-
-  local maxN = tonumber(DB and DB.debugCaptureMax) or 200
-  if maxN < 20 then maxN = 20 end
-  if maxN > 500 then maxN = 500 end
-  while #log > maxN do
-    table.remove(log, 1)
-  end
-end
-
-local function CaptureChatIn(eventName, msg, author)
-  if not CaptureEnabled() then return end
-  local link = CaptureExtractLink(msg)
-  CaptureAppend("CHAT_IN", {
-    event = tostring(eventName or ""),
-    author = (type(author) == "string") and author or nil,
-    msg = msg,
-    hasItemLink = (type(msg) == "string" and msg:find("|Hitem:", 1, true) ~= nil) or false,
-    hasCurrencyLink = (type(msg) == "string" and msg:find("|Hcurrency:", 1, true) ~= nil) or false,
-    link = link,
-    itemID = CaptureItemIDFromLink(link),
-  })
-end
-
-local function CaptureChatOut(eventName, out, meta)
-  if not CaptureEnabled() then return end
-  local entry = (type(meta) == "table") and meta or {}
-  entry.event = tostring(eventName or "")
-  entry.out = out
-  CaptureAppend("CHAT_OUT", entry)
-end
-
-local pendingAsyncLoot = {}
-
-local function Print(msg)
+Print = function(msg)
   local frame
   if DB and type(DB.outputChatFrame) == "number" then
     frame = _G and _G["ChatFrame" .. DB.outputChatFrame]
@@ -364,7 +1276,8 @@ local function Print(msg)
     end
 
     local final = (prefix ~= "") and (prefix .. text) or text
-    if CaptureEnabled() then
+    local lootChat = LI and LI.LootChat
+    if lootChat and lootChat.CaptureEnabled and lootChat.CaptureEnabled() then
       local e = {
         msg = final,
         raw = text,
@@ -374,12 +1287,16 @@ local function Print(msg)
       if (DB and DB.debugCaptureStacks) and type(debugstack) == "function" then
         e.stack = debugstack(2, 10, 10)
       end
-      CaptureAppend("PRINT", e)
+      if lootChat.CaptureAppend then
+        lootChat.CaptureAppend("PRINT", e)
+      end
     end
 
     frame:AddMessage(final)
   end
 end
+
+LI.Print = Print
 
 local function PrintToChatFrame(msg, chatFrameID)
   local frame
@@ -392,7 +1309,8 @@ local function PrintToChatFrame(msg, chatFrameID)
   end
   if frame and frame.AddMessage then
     local text = tostring(msg or "")
-    if CaptureEnabled() then
+    local lootChat = LI and LI.LootChat
+    if lootChat and lootChat.CaptureEnabled and lootChat.CaptureEnabled() then
       local e = {
         msg = text,
         outputChatFrame = tonumber(chatFrameID) or nil,
@@ -400,7 +1318,9 @@ local function PrintToChatFrame(msg, chatFrameID)
       if (DB and DB.debugCaptureStacks) and type(debugstack) == "function" then
         e.stack = debugstack(2, 10, 10)
       end
-      CaptureAppend("PRINT", e)
+      if lootChat.CaptureAppend then
+        lootChat.CaptureAppend("PRINT", e)
+      end
     end
     frame:AddMessage(text)
   end
@@ -414,5906 +1334,231 @@ local function SetCheckBoxText(cb, text)
   end
 end
 
+LI.SetCheckBoxText = SetCheckBoxText
+
 local function SetCheckBoxChecked(cb, checked)
   if cb and cb.SetChecked then
     cb:SetChecked(checked and true or false)
   end
 end
 
-local function EscapeLuaPattern(text)
-  text = tostring(text or "")
-  return (text:gsub("([%(%)%.%+%-%*%?%[%]%^%$%%])", "%%%1"))
+LI.SetCheckBoxChecked = SetCheckBoxChecked
+
+local function GetLootChatModule()
+  return LI and LI.LootChat
 end
 
-local function GlobalStringToPattern(globalString)
-  if type(globalString) ~= "string" or globalString == "" then return nil end
-
-  -- Preserve tokens first, then escape everything, then restore tokens.
-  local s = globalString
-  s = s:gsub("%%s", "\0S\0")
-  s = s:gsub("%%d", "\0D\0")
-
-  s = EscapeLuaPattern(s)
-
-  -- Use non-greedy captures; some loot strings contain multiple %s tokens.
-  s = s:gsub("\0S\0", "(.-)")
-  s = s:gsub("\0D\0", "(%d+)")
-
-  return "^" .. s .. "$"
+do
+  local lootChat = GetLootChatModule()
+  if lootChat and type(lootChat.SetEnv) == "function" then
+    lootChat.SetEnv({
+      EnsureDB = EnsureDB,
+      GetDB = function() return DB end,
+      GetCharDB = function() return CHARDB end,
+      IsEnabled = IsEnabled,
+      IsIgnoredItemID = IsIgnoredItemID,
+      IsItemLevelEnabled = IsItemLevelEnabled,
+      ADDON_LINK_ALIASES = ADDON_LINK_ALIASES,
+      ADDON_CURRENCY_ALIASES = ADDON_CURRENCY_ALIASES,
+      DEFAULTS = DEFAULTS,
+      Print = Print,
+      PrintToChatFrame = PrintToChatFrame,
+    })
+  end
 end
 
-local LOOT_PATTERNS = nil
-local LOOT_PREFIXES = nil
-local LOOT_GROUP_PATTERNS = nil
-local RECEIVE_ITEM_PATTERNS = nil
-
-local LOOT_PATTERN_KEYS
-local LOOT_GROUP_PATTERN_KEYS
-
-local function BuildLootPatterns()
-  local patterns = {}
-  local prefixes = {}
-  local groupPatterns = {}
-  local receiveItemPatterns = {}
-
-  local keys = {
-    "LOOT_ITEM_SELF",
-    "LOOT_ITEM_SELF_MULTIPLE",
-    "LOOT_ITEM_PUSHED_SELF",
-    "LOOT_ITEM_PUSHED_SELF_MULTIPLE",
-    "LOOT_ITEM_CREATED_SELF",
-    "LOOT_ITEM_CREATED_SELF_MULTIPLE",
-    -- Purchases/rewards can use "You receive item: ..." strings instead of "You receive loot: ...".
-    "YOU_RECEIVE_ITEM",
-    "YOU_RECEIVE_ITEM_MULTIPLE",
-    "LOOT_ITEM_BONUS_ROLL_SELF",
-    "LOOT_ITEM_BONUS_ROLL_SELF_MULTIPLE",
-  }
-
-  for _, k in ipairs(keys) do
-    local gs = _G and rawget(_G, k)
-    local pat = GlobalStringToPattern(gs)
-    if pat then
-      patterns[#patterns + 1] = pat
-
-      if k == "YOU_RECEIVE_ITEM" or k == "YOU_RECEIVE_ITEM_MULTIPLE" then
-        receiveItemPatterns[#receiveItemPatterns + 1] = pat
-      end
-
-      -- Some sources omit trailing punctuation (notably the final '.'), which can
-      -- cause anchored GlobalString patterns to miss lines like:
-      --   "You receive item: [Chest of Gold]"
-      -- Keep this relaxation narrowly scoped to the receive-item strings.
-      if k == "YOU_RECEIVE_ITEM" or k == "YOU_RECEIVE_ITEM_MULTIPLE" then
-        -- Convert a trailing "%." right before the end-anchor into an optional dot.
-        -- Example: "^You receive item: (.-)%.$" -> "^You receive item: (.-)%.?$"
-        local alt = pat:gsub("%%%.%$", "%%.?$")
-        if alt ~= pat then
-          patterns[#patterns + 1] = alt
-          receiveItemPatterns[#receiveItemPatterns + 1] = alt
-        end
-      end
-    end
-
-    if type(gs) == "string" and gs ~= "" then
-      -- Extract localized prefix up to the first %s or %d token, e.g. "You receive loot: "
-      local prefix = gs:match("^(.-)%%[sd]")
-      if prefix and prefix ~= "" then
-        prefixes[#prefixes + 1] = prefix
-      end
-    end
+local function CaptureAppend(kind, data)
+  local lootChat = GetLootChatModule()
+  if lootChat and lootChat.CaptureAppend then
+    return lootChat.CaptureAppend(kind, data)
   end
-
-  for _, k in ipairs(LOOT_GROUP_PATTERN_KEYS) do
-    local gs = _G and rawget(_G, k)
-    local pat = GlobalStringToPattern(gs)
-    if pat then
-      groupPatterns[#groupPatterns + 1] = pat
-    end
-  end
-
-  LOOT_PATTERNS = patterns
-  LOOT_PREFIXES = prefixes
-  LOOT_GROUP_PATTERNS = groupPatterns
-  RECEIVE_ITEM_PATTERNS = receiveItemPatterns
 end
-
-LOOT_PATTERN_KEYS = {
-  "LOOT_ITEM_SELF",
-  "LOOT_ITEM_SELF_MULTIPLE",
-  "LOOT_ITEM_PUSHED_SELF",
-  "LOOT_ITEM_PUSHED_SELF_MULTIPLE",
-  "LOOT_ITEM_CREATED_SELF",
-  "LOOT_ITEM_CREATED_SELF_MULTIPLE",
-  "YOU_RECEIVE_ITEM",
-  "YOU_RECEIVE_ITEM_MULTIPLE",
-  "LOOT_ITEM_BONUS_ROLL_SELF",
-  "LOOT_ITEM_BONUS_ROLL_SELF_MULTIPLE",
-}
-
-LOOT_GROUP_PATTERN_KEYS = {
-  "LOOT_ITEM",
-  "LOOT_ITEM_MULTIPLE",
-  "LOOT_ITEM_PUSHED",
-  "LOOT_ITEM_PUSHED_MULTIPLE",
-  "LOOT_ITEM_CREATED",
-  "LOOT_ITEM_CREATED_MULTIPLE",
-  "LOOT_ITEM_BONUS_ROLL",
-  "LOOT_ITEM_BONUS_ROLL_MULTIPLE",
-}
-
-local function StripRealmFromName(name)
-  if type(name) ~= "string" then return name end
-  return name:match("^([^%-]+)") or name
-end
-
-local function IsItemLink(text)
-  return type(text) == "string" and text:find("|Hitem:", 1, true) ~= nil
-end
-
-local function ColorizeByClass(classFile, text)
-  if type(text) ~= "string" then
-    text = tostring(text or "")
-  end
-  if not classFile or classFile == "" then
-    return text
-  end
-
-  if C_ClassColor and C_ClassColor.GetClassColor then
-    local color = C_ClassColor.GetClassColor(classFile)
-    if color and color.WrapTextInColorCode then
-      return color:WrapTextInColorCode(text)
-    end
-  end
-
-  local rc = RAID_CLASS_COLORS and RAID_CLASS_COLORS[classFile]
-  if rc and rc.colorStr then
-    return "|c" .. rc.colorStr .. text .. "|r"
-  end
-
-  return text
-end
-
-local function GetGroupUnitForShortName(shortName)
-  if type(shortName) ~= "string" or shortName == "" then return nil end
-
-  if IsInRaid and IsInRaid() then
-    local count = (GetNumGroupMembers and GetNumGroupMembers()) or 0
-    for i = 1, count do
-      local unit = "raid" .. i
-      local unitName = UnitName and UnitName(unit)
-      unitName = StripRealmFromName(unitName)
-      if unitName == shortName then
-        return unit
-      end
-    end
-  elseif IsInGroup and IsInGroup() then
-    local count = (GetNumSubgroupMembers and GetNumSubgroupMembers()) or 0
-    for i = 1, count do
-      local unit = "party" .. i
-      local unitName = UnitName and UnitName(unit)
-      unitName = StripRealmFromName(unitName)
-      if unitName == shortName then
-        return unit
-      end
-    end
-  end
-
-  return nil
-end
-
-local function GetClassColoredName(fullOrShortName)
-  local shortName = StripRealmFromName(fullOrShortName)
-  if not shortName or shortName == "" then
-    return ""
-  end
-
-  local myName = StripRealmFromName((UnitName and UnitName("player")) or "")
-  if myName ~= "" and shortName == myName then
-    local classFile
-    if UnitClass then
-      _, classFile = UnitClass("player")
-    end
-    return ColorizeByClass(classFile, shortName)
-  end
-
-  local unit = GetGroupUnitForShortName(shortName)
-  if unit then
-    local classFile
-    if UnitClass then
-      _, classFile = UnitClass(unit)
-    end
-    return ColorizeByClass(classFile, shortName)
-  end
-
-  return shortName
-end
-
-local function IsInAnyGroup()
-  -- Some edge cases can report "in group" while effectively solo.
-  -- Require evidence of other members.
-  if IsInRaid and IsInRaid() then
-    local n = (GetNumGroupMembers and GetNumGroupMembers()) or 0
-    return (tonumber(n) or 0) > 1
-  end
-  if IsInGroup and IsInGroup() then
-    local sub = (GetNumSubgroupMembers and GetNumSubgroupMembers())
-    if (tonumber(sub) or 0) > 0 then
-      return true
-    end
-    local n = (GetNumGroupMembers and GetNumGroupMembers()) or 0
-    return (tonumber(n) or 0) > 1
-  end
-  return false
-end
-
-local function ExtractLinkFallback(msg)
-  if type(msg) ~= "string" then return nil end
-  return msg:match("(|c%x+|Hitem:.-|h%[.-%]|h|r)")
-    or msg:match("(|Hitem:.-|h%[.-%]|h)")
-end
-
-local function NormalizeItemLink(link)
-  if type(link) ~= "string" or link == "" then return link end
-  if link:match("^|c%x%x%x%x%x%x%x%x|Hitem:") then
-    return link
-  end
-
-  -- Some chat events can provide non-hyperlinked bracket text like "[Chest of Gold]".
-  -- Try to resolve the display name into a real item hyperlink so aliases/ilvl work.
-  do
-    local name = link
-    local bracketName = link:match("^%[([^%]]+)%]$")
-    if bracketName and bracketName ~= "" then
-      name = bracketName
-    end
-
-    if name and not name:match("|Hitem:") then
-      if C_Item and C_Item.GetItemInfo then
-        local _, itemLink = C_Item.GetItemInfo(name)
-        if type(itemLink) == "string" and itemLink ~= "" then
-          return itemLink
-        end
-      end
-    end
-  end
-
-  if link:match("|Hitem:") then
-    if C_Item and C_Item.GetItemInfo then
-      local _, itemLink = C_Item.GetItemInfo(link)
-      if type(itemLink) == "string" and itemLink ~= "" then
-        return itemLink
-      end
-    end
-  end
-
-  return link
-end
-
-local function StripDisplayedLinkBrackets(link)
-  if type(link) ~= "string" or link == "" then return link end
-  -- Convert |h[Name]|h -> |hName|h (still clickable, just no inner brackets)
-  return link:gsub("|h%[([^%]]+)%]|h", "|h%1|h")
-end
-
-local function GetItemIDFromLink(link)
-  if type(link) ~= "string" or link == "" then return nil end
-  local id = link:match("|Hitem:(%d+)")
-  if not id then return nil end
-  return tonumber(id)
-end
-
-local function GetCurrencyIDFromLink(link)
-  if type(link) ~= "string" or link == "" then return nil end
-  local id = link:match("|Hcurrency:(%d+)")
-  if not id then return nil end
-  return tonumber(id)
-end
-
-local function ApplyItemLinkAlias(link)
-  if type(link) ~= "string" or link == "" then return link end
-  local id = GetItemIDFromLink(link)
-  if not id then return link end
-
-  local alias
-
-  local charDisabled = (CHARDB and type(CHARDB.linkAliasDisabledChar) == "table" and CHARDB.linkAliasDisabledChar[id] == true)
-  local acctDisabled = (DB and type(DB.linkAliasDisabledAccount) == "table" and DB.linkAliasDisabledAccount[id] == true)
-  local addonDisabled = (DB and type(DB.linkAliasDisabledAddon) == "table" and DB.linkAliasDisabledAddon[id] == true)
-
-  -- Per-character disable suppresses ALL alias sources for this item.
-  if charDisabled then
-    return link
-  end
-
-  if (not charDisabled) and CHARDB and type(CHARDB.linkAliases) == "table" then
-    alias = CHARDB.linkAliases[id]
-  end
-  if (type(alias) ~= "string" or alias == "") and (not acctDisabled) and DB and type(DB.linkAliases) == "table" then
-    alias = DB.linkAliases[id]
-  end
-  if (type(alias) ~= "string" or alias == "") and (not addonDisabled) then
-    alias = ADDON_LINK_ALIASES[id]
-  end
-  if type(alias) ~= "string" or alias == "" then
-    return link
-  end
-
-  -- Replace the displayed text, preserving the hyperlink.
-  local out = link
-  out = out:gsub("(|Hitem:[^|]+|h)%[([^%]]+)%](|h)", "%1" .. alias .. "%3", 1)
-  out = out:gsub("(|Hitem:[^|]+|h)([^|]+)(|h)", "%1" .. alias .. "%3", 1)
-  return out
-end
-
-local function ApplyCurrencyLinkAlias(link)
-  if type(link) ~= "string" or link == "" then return link end
-  local id = GetCurrencyIDFromLink(link)
-  if not id then return link end
-
-  local alias
-
-  local charDisabled = (CHARDB and type(CHARDB.currencyAliasDisabledChar) == "table" and CHARDB.currencyAliasDisabledChar[id] == true)
-  local acctDisabled = (DB and type(DB.currencyAliasDisabledAccount) == "table" and DB.currencyAliasDisabledAccount[id] == true)
-  local addonDisabled = (DB and type(DB.currencyAliasDisabledAddon) == "table" and DB.currencyAliasDisabledAddon[id] == true)
-
-  if charDisabled then
-    return link
-  end
-
-  if (not charDisabled) and CHARDB and type(CHARDB.currencyAliases) == "table" then
-    alias = CHARDB.currencyAliases[id]
-  end
-  if (type(alias) ~= "string" or alias == "") and (not acctDisabled) and DB and type(DB.currencyAliases) == "table" then
-    alias = DB.currencyAliases[id]
-  end
-  if (type(alias) ~= "string" or alias == "") and (not addonDisabled) then
-    alias = ADDON_CURRENCY_ALIASES[id]
-  end
-  if type(alias) ~= "string" or alias == "" then
-    return link
-  end
-
-  local out = link
-  out = out:gsub("(|Hcurrency:[^|]+|h)%[([^%]]+)%](|h)", "%1" .. alias .. "%3", 1)
-  out = out:gsub("(|Hcurrency:[^|]+|h)([^|]+)(|h)", "%1" .. alias .. "%3", 1)
-  return out
-end
-
-local function GetEquippableItemLevelSuffix(link)
-  if type(link) ~= "string" or link == "" then return nil end
-
-  local isEquippable
-  if C_Item and C_Item.IsEquippableItem then
-    isEquippable = C_Item.IsEquippableItem(link)
-  end
-  if not isEquippable then
-    return nil
-  end
-
-  local equipLoc
-  if C_Item and C_Item.GetItemInfoInstant then
-    local _, _, _, e = C_Item.GetItemInfoInstant(link)
-    equipLoc = e
-  end
-  if not equipLoc or equipLoc == "" then
-    return nil
-  end
-
-  -- Fallback: parse the localized tooltip "Item Level" line.
-  -- This can be more reliable than link-based APIs for some upgraded/scaled items.
-  if _G and CreateFrame and UIParent then
-    if not (_G and rawget(_G, "fr0z3nUI_LootItScanTooltip")) then
-      local tt = CreateFrame("GameTooltip", "fr0z3nUI_LootItScanTooltip", UIParent, "GameTooltipTemplate")
-      tt:SetOwner(UIParent, "ANCHOR_NONE")
-      tt:Hide()
-    end
-
-    local tt = _G and rawget(_G, "fr0z3nUI_LootItScanTooltip")
-    if tt and tt.SetOwner and tt.SetHyperlink and tt.NumLines then
-      tt:ClearLines()
-      tt:SetOwner(UIParent, "ANCHOR_NONE")
-      tt:SetHyperlink(link)
-
-      local pat = GlobalStringToPattern((_G and rawget(_G, "ITEM_LEVEL")) or "")
-      local nLines = tt:NumLines() or 0
-      for i = 2, nLines do
-        local fs = _G["fr0z3nUI_LootItScanTooltipTextLeft" .. i]
-        local text = fs and fs.GetText and fs:GetText()
-        if type(text) == "string" and text ~= "" then
-          local lvl
-          if pat then
-            lvl = tonumber((text:match(pat)))
-          end
-          if not lvl then
-            lvl = tonumber(text:match("(%d+)$"))
-          end
-          if lvl and lvl > 0 then
-            tt:Hide()
-            return lvl
-          end
-        end
-      end
-      tt:Hide()
-    end
-  end
-
-  return nil
-end
-
-local function ExtractCurrencyLinkFallback(msg)
-  if type(msg) ~= "string" then return nil end
-  return msg:match("(|c%x+|Hcurrency:.-|h%[.-%]|h|r)")
-    or msg:match("(|Hcurrency:.-|h%[.-%]|h)")
-end
-
-local function ExtractAchievementLinkFallback(msg)
-  if type(msg) ~= "string" then return nil end
-  return msg:match("(|c%x+|Hachievement:.-|h%[.-%]|h|r)")
-    or msg:match("(|Hachievement:.-|h%[.-%]|h)")
-end
-
-local function AppendSuffixInsideColorReset(text, suffix)
-  if type(text) ~= "string" then
-    text = tostring(text or "")
-  end
-  suffix = tostring(suffix or "")
-  if suffix == "" then
-    return text
-  end
-  if text:sub(-2) == "|r" then
-    return text:sub(1, -3) .. suffix .. "|r"
-  end
-  return text .. suffix
-end
-
-local function FormatSelfLine(text)
-  -- Always show your name in groups; the toggle only affects solo output.
-  if IsInAnyGroup() or (DB and DB.showSelfNameAlways) then
-    local me = GetClassColoredName(UnitName and UnitName("player"))
-    if me and me ~= "" then
-      return string.format("%s %s", AppendSuffixInsideColorReset(me, ":"), text)
-    end
-  end
-  return text
-end
-
-local LOOT_COMBINE_DELAY = 0.25
-local lootCombineParts
-local lootCombineGen = 0
-local lootCombineLootOpen = false
 
 local function LootCombineEnabled()
-  local n = DB and tonumber(DB.lootCombineCount) or 1
-  return (n and n > 1)
-end
-
-local function LootCombineMode()
-  local mode = DB and tostring(DB.lootCombineMode or "loot") or "loot"
-  mode = mode:lower()
-  if mode ~= "loot" and mode ~= "timer" then
-    mode = "loot"
-  end
-  return mode
+  local lootChat = GetLootChatModule()
+  return (lootChat and lootChat.LootCombineEnabled and lootChat.LootCombineEnabled()) and true or false
 end
 
 local function LootCombineFlush()
-  if not lootCombineParts or #lootCombineParts == 0 then return end
-  local msg = table.concat(lootCombineParts, "|cff15AB0D,|r ")
-  for i = #lootCombineParts, 1, -1 do
-    lootCombineParts[i] = nil
+  local lootChat = GetLootChatModule()
+  if lootChat and lootChat.LootCombineFlush then
+    return lootChat.LootCombineFlush()
   end
-  Print(FormatSelfLine(msg))
 end
 
 local function LootCombineCancelTimers()
-  lootCombineGen = (lootCombineGen or 0) + 1
+  local lootChat = GetLootChatModule()
+  if lootChat and lootChat.LootCombineCancelTimers then
+    return lootChat.LootCombineCancelTimers()
+  end
 end
 
 local function LootCombineWindowStart()
-  if not LootCombineEnabled() then return end
-  if LootCombineMode() ~= "loot" then return end
-  lootCombineLootOpen = true
-  LootCombineCancelTimers()
+  local lootChat = GetLootChatModule()
+  if lootChat and lootChat.LootCombineWindowStart then
+    return lootChat.LootCombineWindowStart()
+  end
 end
 
 local function LootCombineWindowEnd()
-  if not lootCombineLootOpen then return end
-  lootCombineLootOpen = false
-  LootCombineCancelTimers()
-  LootCombineFlush()
-end
-
-local function LootCombineAdd(part)
-  if not LootCombineEnabled() then
-    Print(FormatSelfLine(part))
-    return
-  end
-
-  local maxN = tonumber(DB.lootCombineCount) or 1
-  if maxN < 2 then
-    Print(FormatSelfLine(part))
-    return
-  end
-  if maxN > 25 then maxN = 25 end
-
-  if not lootCombineParts then lootCombineParts = {} end
-  lootCombineParts[#lootCombineParts + 1] = part
-
-  if #lootCombineParts >= maxN then
-    LootCombineFlush()
-    return
-  end
-
-  local mode = LootCombineMode()
-  if mode == "timer" then
-    LootCombineCancelTimers()
-    local gen = lootCombineGen
-    if C_Timer and C_Timer.After then
-      C_Timer.After(LOOT_COMBINE_DELAY, function()
-        if gen ~= lootCombineGen then return end
-        LootCombineFlush()
-      end)
-    end
-  else
-    -- Loot-window mode: hold until LOOT_CLOSED. If LOOT_CLOSED never arrives (edge cases),
-    -- use a longer fallback flush when we aren't in an open loot window.
-    if not lootCombineLootOpen then
-      LootCombineCancelTimers()
-      local gen = lootCombineGen
-      if C_Timer and C_Timer.After then
-        C_Timer.After(1.25, function()
-          if gen ~= lootCombineGen then return end
-          LootCombineFlush()
-        end)
-      end
-    end
-  end
-end
-
--- Delay-print aggregation (separate from loot-combine):
--- Used to suppress spam for specific itemIDs and reprint once with a summed xN.
-local delayPrintBuckets
-
-local function GetDelayPrintSecondsForItemID(itemID)
-  if not (DB and DB.delayPrint and DB.delayPrint.enabled) then return nil end
-  if not (itemID and itemID > 0) then return nil end
-  local t = DB.delayPrint.itemSeconds
-  if type(t) ~= "table" then return nil end
-  local sec = tonumber(t[itemID])
-  if not sec or sec <= 0 then return nil end
-  if sec > 3600 then sec = 3600 end
-  return sec
-end
-
-local function FormatLootItemPartFromLink(link, totalQty)
-  if type(link) ~= "string" or link == "" then return nil end
-  link = NormalizeItemLink(link)
-  link = ApplyItemLinkAlias(link)
-
-  local displayLink = StripDisplayedLinkBrackets(link)
-  local out = displayLink
-  local n = tonumber(totalQty)
-  if n and n > 1 then
-    out = string.format("%s x%d", displayLink, n)
-  end
-
-  if IsItemLevelEnabled() then
-    local ilvl = GetEquippableItemLevelSuffix(link)
-    if ilvl then
-      local color = link:match("^(|c%x%x%x%x%x%x%x%x)")
-      local ilvlText = color and (color .. tostring(ilvl) .. "|r") or tostring(ilvl)
-      out = out .. " " .. ilvlText
-    end
-  end
-
-  return out
-end
-
-local function DelayPrintFlushBucket(secKey)
-  if not delayPrintBuckets then return end
-  local b = delayPrintBuckets[secKey]
-  if not (b and b.order and b.items) then return end
-  if #b.order == 0 then return end
-
-  local parts = {}
-  for i = 1, #b.order do
-    local id = b.order[i]
-    local it = b.items[id]
-    if it and it.link and it.qty and it.qty > 0 then
-      local part = FormatLootItemPartFromLink(it.link, it.qty)
-      if part then
-        parts[#parts + 1] = part
-      end
-    end
-  end
-
-  -- Clear bucket.
-  b.items = {}
-  b.order = {}
-  b.gen = (b.gen or 0) + 1
-
-  if #parts > 0 then
-    local msg = table.concat(parts, "|cff15AB0D,|r ")
-    Print(FormatSelfLine(msg))
+  local lootChat = GetLootChatModule()
+  if lootChat and lootChat.LootCombineWindowEnd then
+    return lootChat.LootCombineWindowEnd()
   end
 end
 
 local function DelayPrintFlushAll()
-  if not delayPrintBuckets then return end
-  for secKey in pairs(delayPrintBuckets) do
-    DelayPrintFlushBucket(secKey)
+  local lootChat = GetLootChatModule()
+  if lootChat and lootChat.DelayPrintFlushAll then
+    return lootChat.DelayPrintFlushAll()
   end
-end
-
-local function DelayPrintAddItem(itemID, link, qty, sec)
-  if not (sec and sec > 0) then return false end
-  if not (C_Timer and C_Timer.After) then
-    -- No timers available; fall back to immediate printing.
-    local part = FormatLootItemPartFromLink(link, qty)
-    if part then
-      Print(FormatSelfLine(part))
-      return true
-    end
-    return false
-  end
-
-  local secKey = tostring(sec)
-  if not delayPrintBuckets then delayPrintBuckets = {} end
-  if not delayPrintBuckets[secKey] then
-    delayPrintBuckets[secKey] = { items = {}, order = {}, gen = 0 }
-  end
-  local b = delayPrintBuckets[secKey]
-  b.gen = (b.gen or 0) + 1
-  local myGen = b.gen
-
-  local n = tonumber(qty) or 1
-  if n < 1 then n = 1 end
-
-  local it = b.items[itemID]
-  if not it then
-    it = { link = link, qty = 0 }
-    b.items[itemID] = it
-    b.order[#b.order + 1] = itemID
-  else
-    -- Prefer the most recent link, in case it was upgraded/normalized.
-    it.link = link or it.link
-  end
-  it.qty = (tonumber(it.qty) or 0) + n
-
-  C_Timer.After(sec, function()
-    -- Debounce: only flush if nothing else arrived since scheduling.
-    if not delayPrintBuckets then return end
-    local cur = delayPrintBuckets[secKey]
-    if not cur then return end
-    if cur.gen ~= myGen then return end
-    DelayPrintFlushBucket(secKey)
-  end)
-
-  return true
-end
-
-local function ShouldSuppressTabardIlvlSuffix(link)
-  local minIlvl = DB and tonumber(DB.ignoreTabardLootBelowIlvl) or 0
-  if not minIlvl or minIlvl <= 0 then return false end
-
-  if not (C_Item and C_Item.GetItemInfoInstant) then return false end
-  local _, _, _, equipLoc = C_Item.GetItemInfoInstant(link)
-  if equipLoc ~= "INVTYPE_TABARD" then return false end
-
-  local ilvl = GetEquippableItemLevelSuffix(link)
-  return (ilvl and ilvl > 0 and ilvl < minIlvl) and true or false
-end
-
-local function FormatOtherLine(name, text)
-  local colored = GetClassColoredName(name or "")
-  if colored and colored ~= "" then
-    return string.format("%s %s", AppendSuffixInsideColorReset(colored, ":"), text)
-  end
-  return text
-end
-
-local CURRENCY_PATTERNS
-local CURRENCY_PREFIXES
-
-local CURRENCY_PATTERN_KEYS = {
-  -- Retail GlobalStrings (localization-safe):
-  "CURRENCY_GAINED",
-  "CURRENCY_GAINED_MULTIPLE",
-  -- Some clients/locales may also expose these variants; harmless if nil.
-  "CURRENCY_GAINED_SELF",
-  "CURRENCY_GAINED_SELF_MULTIPLE",
-}
-
-local function BuildCurrencyPatterns()
-  local patterns = {}
-  local prefixes = {}
-
-  for _, k in ipairs(CURRENCY_PATTERN_KEYS) do
-    local gs = _G and rawget(_G, k)
-    local pat = GlobalStringToPattern(gs)
-    if pat then
-      patterns[#patterns + 1] = pat
-    end
-    if type(gs) == "string" and gs ~= "" then
-      local prefix = gs:match("^(.-)%%[sd]")
-      if prefix and prefix ~= "" then
-        prefixes[#prefixes + 1] = prefix
-      end
-    end
-  end
-
-  CURRENCY_PATTERNS = patterns
-  CURRENCY_PREFIXES = prefixes
-end
-
-local function OnCurrencyChat(_, _, msg, ...)
-  if not IsEnabled() then return false end
-  if type(msg) ~= "string" or msg == "" then return false end
-
-  CaptureChatIn("CHAT_MSG_CURRENCY", msg)
-
-  if not CURRENCY_PATTERNS then BuildCurrencyPatterns() end
-
-  local link, qty
-  for _, pat in ipairs(CURRENCY_PATTERNS or {}) do
-    local a, b = msg:match(pat)
-    if a then
-      if b then
-        local aIsLink = type(a) == "string" and a:find("|Hcurrency:", 1, true) ~= nil
-        local bIsLink = type(b) == "string" and b:find("|Hcurrency:", 1, true) ~= nil
-
-        -- Some locales/globalstrings put %d before %s, so captures can be swapped.
-        if aIsLink and not bIsLink then
-          link, qty = a, b
-        elseif bIsLink and not aIsLink then
-          link, qty = b, a
-        else
-          -- Fallback: pick the one that looks numeric as qty.
-          if tonumber(a) and not tonumber(b) then
-            qty = a
-          elseif tonumber(b) and not tonumber(a) then
-            qty = b
-          end
-          link = ExtractCurrencyLinkFallback(msg) or a
-        end
-      else
-        link = a
-      end
-      break
-    end
-  end
-
-  if not link then
-    link = ExtractCurrencyLinkFallback(msg)
-  end
-  if not link then
-    return false
-  end
-
-  -- Quantity fallback: some clients/locales don't expose a %d token for currency gain.
-  -- Try to parse a trailing multiplier near the currency token.
-  if not qty then
-    local escaped = EscapeLuaPattern(link)
-    qty = msg:match(escaped .. "%s*[x×]%s*(%d+)")
-      or msg:match(escaped .. "[\r\n ]*[x×]%s*(%d+)")
-      or msg:match("%s*[x×]%s*(%d+)%s*%.?$")
-  end
-
-  -- Prefer constructing a canonical currency hyperlink so color/clickability is consistent.
-  local n = tonumber(qty)
-  local currencyID = GetCurrencyIDFromLink(link)
-  if currencyID and C_CurrencyInfo and C_CurrencyInfo.GetCurrencyLink then
-    local built = C_CurrencyInfo.GetCurrencyLink(currencyID, (n and n > 0) and n or 0)
-    if type(built) == "string" and built ~= "" then
-      link = built
-    end
-  end
-
-  local handled = false
-  if DB.echoItem then
-    local out = ApplyCurrencyLinkAlias(link)
-    out = StripDisplayedLinkBrackets(out)
-    if n and n > 1 then
-      out = string.format("%s x%d", out, n)
-    end
-    if LootCombineEnabled() then
-      if DB and DB.lootCombineIncludeCurrency then
-        LootCombineAdd(out)
-        handled = true
-      end
-    else
-      Print(FormatSelfLine(out))
-      handled = true
-    end
-
-    CaptureChatOut("CHAT_MSG_CURRENCY", out, {
-      handled = handled,
-      combine = LootCombineEnabled() and true or false,
-      includeCurrency = (DB and DB.lootCombineIncludeCurrency) and true or false,
-      qty = n,
-      currencyID = currencyID,
-    })
-  end
-
-  -- Only suppress the original system line when we actually output (or buffer) a replacement.
-  -- This avoids "missing" currency lines when loot-combine is enabled but currency is excluded.
-  return (handled and DB.hideLootText) and true or false
-end
-
-local MONEY_PATTERNS
-local MONEY_PREFIXES
-
-local MONEY_PATTERN_KEYS = {
-  "LOOT_MONEY",
-  "LOOT_MONEY_SPLIT",
-}
-
-local function BuildMoneyPatterns()
-  local patterns = {}
-  local prefixes = {}
-
-  for _, k in ipairs(MONEY_PATTERN_KEYS) do
-    local gs = _G and rawget(_G, k)
-    local pat = GlobalStringToPattern(gs)
-    if pat then
-      patterns[#patterns + 1] = pat
-    end
-    if type(gs) == "string" and gs ~= "" then
-      local prefix = gs:match("^(.-)%%[sd]")
-      if prefix and prefix ~= "" then
-        prefixes[#prefixes + 1] = prefix
-      end
-    end
-  end
-
-  MONEY_PATTERNS = patterns
-  MONEY_PREFIXES = prefixes
-end
-
-local function ParseCoinsFromMoneyMessage(msg)
-  if type(msg) ~= "string" or msg == "" then return nil end
-
-  local function numBeforeTexture(textureNeedle)
-    local s = msg:match("([%d,]+)%s*|T.-" .. textureNeedle .. ".-|t")
-    if not s then return nil end
-    s = s:gsub(",", "")
-    return tonumber(s)
-  end
-
-  local gold = numBeforeTexture("UI%-GoldIcon")
-  local silver = numBeforeTexture("UI%-SilverIcon")
-  local copper = numBeforeTexture("UI%-CopperIcon")
-
-  -- Some clients/sources emit money text without textures (e.g. "5 gold").
-  -- Try a lightweight localized word/symbol parse as fallback.
-  if not (gold or silver or copper) then
-    local lower = msg:lower()
-
-    local function numBeforeToken(token)
-      if type(token) ~= "string" or token == "" then return nil end
-      local n = lower:match("([%d,]+)%s*" .. EscapeLuaPattern(token:lower()))
-      if not n then return nil end
-      n = n:gsub(",", "")
-      return tonumber(n)
-    end
-
-    gold = numBeforeToken((_G and rawget(_G, "GOLD")) or "gold")
-      or numBeforeToken((_G and rawget(_G, "GOLD_AMOUNT_SYMBOL")) or "g")
-    silver = numBeforeToken((_G and rawget(_G, "SILVER")) or "silver")
-      or numBeforeToken((_G and rawget(_G, "SILVER_AMOUNT_SYMBOL")) or "s")
-    copper = numBeforeToken((_G and rawget(_G, "COPPER")) or "copper")
-      or numBeforeToken((_G and rawget(_G, "COPPER_AMOUNT_SYMBOL")) or "c")
-  end
-
-  return {
-    gold = gold or 0,
-    silver = silver or 0,
-    copper = copper or 0,
-  }
-end
-
-local function FormatMoney(coins)
-  if type(coins) ~= "table" then return nil end
-  local m = (DB and type(DB.money) == "table") and DB.money or DEFAULTS.money
-
-  local parts = {}
-  if m.gold and (tonumber(coins.gold) or 0) > 0 then
-    parts[#parts + 1] = tostring(coins.gold) .. "|TInterface\\MoneyFrame\\UI-GoldIcon:0:0:2:0|t"
-  end
-  if m.silver and (tonumber(coins.silver) or 0) > 0 then
-    parts[#parts + 1] = tostring(coins.silver) .. "|TInterface\\MoneyFrame\\UI-SilverIcon:0:0:2:0|t"
-  end
-  if m.copper and (tonumber(coins.copper) or 0) > 0 then
-    parts[#parts + 1] = tostring(coins.copper) .. "|TInterface\\MoneyFrame\\UI-CopperIcon:0:0:2:0|t"
-  end
-
-  if #parts == 0 then
-    return nil
-  end
-
-  return table.concat(parts, " ")
-end
-
-local function IsLikelyMoneyMessage(msg)
-  if type(msg) ~= "string" or msg == "" then return false end
-
-  -- Fast path: coin textures are present in the chat message.
-  if msg:find("UI%-GoldIcon") or msg:find("UI%-SilverIcon") or msg:find("UI%-CopperIcon") then
-    return true
-  end
-
-  local lower = msg:lower()
-
-  -- Prefer matching the full localized string (LOOT_MONEY / LOOT_MONEY_SPLIT),
-  -- but keep additional heuristics for edge cases.
-  if not MONEY_PATTERNS then BuildMoneyPatterns() end
-
-  for _, pat in ipairs(MONEY_PATTERNS or {}) do
-    if msg:match(pat) then
-      return true
-    end
-  end
-
-  for _, prefix in ipairs(MONEY_PREFIXES or {}) do
-    if msg:sub(1, #prefix) == prefix then
-      return true
-    end
-  end
-
-  -- Fallback: explicit money words (localized when possible).
-  local function hasToken(token)
-    if type(token) ~= "string" or token == "" then return false end
-    return lower:find(token:lower(), 1, true) ~= nil
-  end
-  if hasToken((_G and rawget(_G, "GOLD")) or "gold") or hasToken((_G and rawget(_G, "SILVER")) or "silver") or hasToken((_G and rawget(_G, "COPPER")) or "copper") then
-    return true
-  end
-
-  -- Fallback: symbol forms, but only when a number precedes the symbol.
-  -- (Important: don't treat plain 'g'/'s'/'c' letters as money; that would match normal loot lines.)
-  local function hasNumberBeforeToken(token)
-    if type(token) ~= "string" or token == "" then return false end
-    return lower:match("[%d,]+%s*" .. EscapeLuaPattern(token:lower())) ~= nil
-  end
-  if hasNumberBeforeToken((_G and rawget(_G, "GOLD_AMOUNT_SYMBOL")) or "g")
-    or hasNumberBeforeToken((_G and rawget(_G, "SILVER_AMOUNT_SYMBOL")) or "s")
-    or hasNumberBeforeToken((_G and rawget(_G, "COPPER_AMOUNT_SYMBOL")) or "c") then
-    return true
-  end
-
-  return false
-end
-
-local function OnMoneyChat(_, _, msg, ...)
-  if not IsEnabled() then return false end
-  if type(msg) ~= "string" or msg == "" then return false end
-
-  CaptureChatIn("CHAT_MSG_MONEY", msg)
-
-  if not IsLikelyMoneyMessage(msg) then return false end
-
-  local handled = false
-  if DB.echoItem then
-    local coins = ParseCoinsFromMoneyMessage(msg)
-    local out = FormatMoney(coins)
-    if out then
-      if LootCombineEnabled() then
-        if DB and DB.lootCombineIncludeGold then
-          LootCombineAdd(out)
-          handled = true
-        end
-      else
-        Print(FormatSelfLine(out))
-        handled = true
-      end
-
-      CaptureChatOut("CHAT_MSG_MONEY", out, {
-        handled = handled,
-        combine = LootCombineEnabled() and true or false,
-        includeGold = (DB and DB.lootCombineIncludeGold) and true or false,
-        gold = coins and coins.gold or nil,
-        silver = coins and coins.silver or nil,
-        copper = coins and coins.copper or nil,
-      })
-    end
-  end
-
-  -- Only suppress the original system line when we actually output (or buffer) a replacement.
-  -- This avoids "missing" money lines when loot-combine is enabled but gold is excluded.
-  return (handled and DB.hideLootText) and true or false
-end
-
-local function OnSystemChat(_, _, msg, ...)
-  if not IsEnabled() then return false end
-  if type(msg) ~= "string" or msg == "" then return false end
-
-  CaptureChatIn("CHAT_MSG_SYSTEM", msg)
-
-  -- Some sources emit money rewards as system lines like "Received 1000 Gold.".
-  -- Route them through our money formatter so they don't leak.
-  if IsLikelyMoneyMessage(msg) then
-    local handled = false
-    if DB and DB.echoItem then
-      local coins = ParseCoinsFromMoneyMessage(msg)
-      local out = FormatMoney(coins)
-      if out then
-        if LootCombineEnabled() then
-          if DB and DB.lootCombineIncludeGold then
-            LootCombineAdd(out)
-            handled = true
-          end
-        else
-          Print(FormatSelfLine(out))
-          handled = true
-        end
-
-        CaptureChatOut("CHAT_MSG_SYSTEM", out, {
-          handled = handled,
-          rewrittenMoney = true,
-          combine = LootCombineEnabled() and true or false,
-          includeGold = (DB and DB.lootCombineIncludeGold) and true or false,
-          gold = coins and coins.gold or nil,
-          silver = coins and coins.silver or nil,
-          copper = coins and coins.copper or nil,
-        })
-      end
-    end
-
-    return (handled and DB and DB.hideLootText) and true or false
-  end
-
-  if not LOOT_PATTERNS then BuildLootPatterns() end
-
-  local link, qty
-  for _, pat in ipairs(RECEIVE_ITEM_PATTERNS or {}) do
-    local a, b = msg:match(pat)
-    if a then
-      link = a
-      qty = b
-      break
-    end
-  end
-
-  if CaptureEnabled() then
-    CaptureAppend("MATCH", {
-      event = "CHAT_MSG_SYSTEM",
-      link = link,
-      qty = qty,
-      hasItemLink = (msg:find("|Hitem:", 1, true) ~= nil) or false,
-    })
-  end
-
-  if not link then
-    link = ExtractLinkFallback(msg)
-  end
-  if not link then
-    return false
-  end
-
-  if DB and DB.echoItem then
-    link = NormalizeItemLink(link)
-    local ignoredID = CaptureItemIDFromLink(link)
-    if ignoredID and IsIgnoredItemID(ignoredID) then
-      CaptureChatOut("CHAT_MSG_SYSTEM", link, {
-        handled = true,
-        ignored = true,
-        qty = tonumber(qty),
-        itemID = ignoredID,
-      })
-      return true
-    end
-
-    do
-      local n = tonumber(qty)
-      local delaySec = GetDelayPrintSecondsForItemID(ignoredID)
-      if delaySec then
-        if DelayPrintAddItem(ignoredID, link, n, delaySec) then
-          CaptureChatOut("CHAT_MSG_SYSTEM", link, {
-            handled = true,
-            delayed = true,
-            delaySec = delaySec,
-            qty = n,
-            itemID = ignoredID,
-          })
-          return true
-        end
-      end
-    end
-
-    link = ApplyItemLinkAlias(link)
-    local displayLink = StripDisplayedLinkBrackets(link)
-    local out = displayLink
-    local n = tonumber(qty)
-    if n and n > 1 then
-      out = string.format("%s x%d", displayLink, n)
-    end
-
-    if IsItemLevelEnabled() then
-      local ilvl = GetEquippableItemLevelSuffix(link)
-      if ilvl then
-        local color = link:match("^(|c%x%x%x%x%x%x%x%x)")
-        local ilvlText
-        if color then
-          ilvlText = color .. tostring(ilvl) .. "|r"
-        else
-          ilvlText = tostring(ilvl)
-        end
-        out = out .. " " .. ilvlText
-      end
-    end
-
-    LootCombineAdd(out)
-
-    CaptureChatOut("CHAT_MSG_SYSTEM", out, {
-      handled = true,
-      combine = LootCombineEnabled() and true or false,
-      qty = tonumber(qty),
-      itemID = CaptureItemIDFromLink(link),
-    })
-  end
-
-  return (DB and DB.hideLootText) and true or false
-end
-
-local function OnLootChat(_, _, msg, author, ...)
-  if not IsEnabled() then return false end
-  if type(msg) ~= "string" or msg == "" then return false end
-
-  CaptureChatIn("CHAT_MSG_LOOT", msg, author)
-
-  if not LOOT_PATTERNS then BuildLootPatterns() end
-
-  -- Some rewards (e.g. end-of-dungeon) can arrive as CHAT_MSG_LOOT but contain currency links.
-  -- Rewrite them using the same path as CHAT_MSG_CURRENCY so we don't leak default loot text.
-  if msg:find("|Hcurrency:", 1, true) then
-    local handled = false
-
-    local link = (ExtractCurrencyLinkFallback and ExtractCurrencyLinkFallback(msg))
-      or msg:match("(|Hcurrency:%d+.-|h.-|h)")
-      or msg:match("(|c%x%x%x%x%x%x%x%x|Hcurrency:%d+.-|h.-|h|r)")
-
-    if link and DB and DB.echoItem then
-      local qty
-      local escaped = EscapeLuaPattern(link)
-      qty = msg:match(escaped .. "%s*[x×]%s*(%d+)")
-        or msg:match(escaped .. "[\r\n ]*[x×]%s*(%d+)")
-        or msg:match("%s*[x×]%s*(%d+)%s*%.?$")
-
-      local n = tonumber(qty)
-      local currencyID = (GetCurrencyIDFromLink and GetCurrencyIDFromLink(link)) or nil
-      if currencyID and C_CurrencyInfo and C_CurrencyInfo.GetCurrencyLink then
-        local built = C_CurrencyInfo.GetCurrencyLink(currencyID, (n and n > 0) and n or 0)
-        if type(built) == "string" and built ~= "" then
-          link = built
-        end
-      end
-
-      local out = (ApplyCurrencyLinkAlias and ApplyCurrencyLinkAlias(link)) or link
-      out = StripDisplayedLinkBrackets(out)
-      if n and n > 1 then
-        out = string.format("%s x%d", out, n)
-      end
-
-      if LootCombineEnabled() then
-        if DB and DB.lootCombineIncludeCurrency then
-          LootCombineAdd(out)
-          handled = true
-        end
-      else
-        Print(FormatSelfLine(out))
-        handled = true
-      end
-
-      CaptureChatOut("CHAT_MSG_LOOT", out, {
-        handled = handled,
-        rewrittenCurrency = true,
-        combine = LootCombineEnabled() and true or false,
-        includeCurrency = (DB and DB.lootCombineIncludeCurrency) and true or false,
-        qty = n,
-        currencyID = currencyID,
-      })
-    end
-
-    return (handled and DB and DB.hideLootText) and true or false
-  end
-
-  -- Some loot sources emit a standalone header line like "You receive loot:" with no link,
-  -- followed by separate item lines. Hiding it avoids the brief "addon turned off" look.
-  if (DB and DB.hideLootText) and (LOOT_PREFIXES and #LOOT_PREFIXES > 0) then
-    local hasItem = msg:find("|Hitem:", 1, true) ~= nil
-    local hasCurrency = msg:find("|Hcurrency:", 1, true) ~= nil
-    if (not hasItem) and (not hasCurrency) and (not IsLikelyMoneyMessage(msg)) then
-      local function Trim(s)
-        if type(s) ~= "string" then return "" end
-        s = s:gsub("^%s+", "")
-        s = s:gsub("%s+$", "")
-        return s
-      end
-
-      local tmsg = Trim(msg)
-      for _, prefix in ipairs(LOOT_PREFIXES) do
-        if tmsg == Trim(prefix) then
-          return true
-        end
-      end
-    end
-  end
-
-  -- Some clients/sources emit coin loot via CHAT_MSG_LOOT instead of CHAT_MSG_MONEY.
-  -- Catch and filter it here so "You loot X gold/silver/copper" doesn't leak through.
-  if IsLikelyMoneyMessage(msg) then
-    local handled = false
-    if DB.echoItem then
-      local coins = ParseCoinsFromMoneyMessage(msg)
-      local out = FormatMoney(coins)
-      if out then
-        if LootCombineEnabled() and (DB and DB.lootCombineIncludeGold) then
-          LootCombineAdd(out)
-          handled = true
-        else
-          Print(FormatSelfLine(out))
-          handled = true
-        end
-
-        CaptureChatOut("CHAT_MSG_LOOT", out, {
-          handled = handled,
-          rewrittenMoney = true,
-          combine = LootCombineEnabled() and true or false,
-          includeGold = (DB and DB.lootCombineIncludeGold) and true or false,
-          gold = coins and coins.gold or nil,
-          silver = coins and coins.silver or nil,
-          copper = coins and coins.copper or nil,
-        })
-      end
-    end
-    return (handled and DB.hideLootText) and true or false
-  end
-
-  local isSelfLoot = false
-  local playerName
-  local link, qty
-
-  -- Prefer matching the self-loot patterns directly. Relying on extracted localized
-  -- prefixes is fragile across client versions/locales.
-  for _, pat in ipairs(LOOT_PATTERNS or {}) do
-    local a, b = msg:match(pat)
-    if a then
-      isSelfLoot = true
-      if b then
-        link, qty = a, b
-      else
-        link = a
-      end
-      break
-    end
-  end
-
-  -- If it wasn't a self-loot line, try group/other-player patterns.
-  if not link then
-    for _, pat in ipairs(LOOT_GROUP_PATTERNS or {}) do
-      local a, b, c = msg:match(pat)
-      if a and b then
-        if IsItemLink(a) and not IsItemLink(b) then
-          link, playerName, qty = a, b, c
-        elseif IsItemLink(b) and not IsItemLink(a) then
-          playerName, link, qty = a, b, c
-        else
-          playerName, link, qty = a, b, c
-        end
-        break
-      end
-    end
-
-    -- Some loot lines may not include the looter name in the localized string,
-    -- but the chat event can still provide an author. Use that as fallback.
-    if (not playerName or playerName == "") and type(author) == "string" and author ~= "" then
-      playerName = author
-    end
-  end
-
-  if not link then
-    link = ExtractLinkFallback(msg)
-  end
-
-  if CaptureEnabled() then
-    CaptureAppend("MATCH", {
-      event = "CHAT_MSG_LOOT",
-      isSelfLoot = isSelfLoot and true or false,
-      link = link,
-      qty = qty,
-      hasItemLink = (msg:find("|Hitem:", 1, true) ~= nil) or false,
-    })
-  end
-  if not link then
-    return false
-  end
-
-  do
-    local ignoredID = CaptureItemIDFromLink(link)
-    if ignoredID and IsIgnoredItemID(ignoredID) then
-      CaptureChatOut("CHAT_MSG_LOOT", link, {
-        handled = true,
-        ignored = true,
-        isSelfLoot = isSelfLoot and true or false,
-        player = (not isSelfLoot) and playerName or nil,
-        qty = tonumber(qty),
-        itemID = ignoredID,
-      })
-      return true
-    end
-  end
-
-  -- Some loot lines can contain a bracketed item name without a hyperlink, e.g.
-  --   "You receive item: [Chest of Gold]"
-  -- In those cases we can't apply aliases/ilvl or even reliably suppress the original line.
-  -- For known problematic items, resolve by itemID asynchronously and re-print.
-  do
-    local bracketName = (type(link) == "string") and link:match("^%[([^%]]+)%]$") or nil
-    if bracketName and not link:find("|Hitem:", 1, true) then
-      local knownItemID = nil
-      if bracketName == "Chest of Gold" then
-        knownItemID = 226814
-      end
-
-      if knownItemID and IsIgnoredItemID(knownItemID) then
-        CaptureChatOut("CHAT_MSG_LOOT", "[" .. bracketName .. "]", { handled = true, ignored = true, async = true, itemID = knownItemID, from = bracketName })
-        return true
-      end
-
-      if knownItemID and Item and (Item.CreateFromItemID or Item.createFromItemID) then
-        local n = tonumber(qty)
-        if not n or n < 1 then n = 1 end
-
-        local key = tostring(knownItemID) .. ":" .. tostring(n)
-        if not pendingAsyncLoot[key] then
-          pendingAsyncLoot[key] = true
-
-          local itemObj = (Item.CreateFromItemID and Item:CreateFromItemID(knownItemID))
-            or (Item.createFromItemID and Item:createFromItemID(knownItemID))
-
-          local function finalize(withLink)
-            pendingAsyncLoot[key] = nil
-            EnsureDB()
-            if not (IsEnabled() and DB and DB.echoItem) then return end
-
-            if IsIgnoredItemID(knownItemID) then
-              CaptureChatOut("CHAT_MSG_LOOT", "[" .. bracketName .. "]", { handled = true, ignored = true, async = true, itemID = knownItemID, from = bracketName })
-              return
-            end
-
-            local resolved = withLink
-            if type(resolved) ~= "string" or resolved == "" then
-              resolved = "[" .. bracketName .. "]"
-            end
-
-            resolved = NormalizeItemLink(resolved)
-            resolved = ApplyItemLinkAlias(resolved)
-            local displayLink = StripDisplayedLinkBrackets(resolved)
-            local out = displayLink
-            if n and n > 1 then
-              out = string.format("%s x%d", displayLink, n)
-            end
-
-            if IsItemLevelEnabled() then
-              local ilvl = GetEquippableItemLevelSuffix(resolved)
-              if ilvl then
-                local color = resolved:match("^(|c%x%x%x%x%x%x%x%x)")
-                local ilvlText = color and (color .. tostring(ilvl) .. "|r") or tostring(ilvl)
-                out = out .. " " .. ilvlText
-              end
-            end
-
-            LootCombineAdd(out)
-            CaptureChatOut("CHAT_MSG_LOOT", out, { handled = true, async = true, itemID = knownItemID, from = bracketName })
-          end
-
-          if itemObj and itemObj.ContinueOnItemLoad then
-            itemObj:ContinueOnItemLoad(function()
-              local itemLink = (itemObj.GetItemLink and itemObj:GetItemLink()) or nil
-              finalize(itemLink)
-            end)
-
-            -- Safety fallback: if something goes wrong, print the plain name shortly after.
-            if C_Timer and C_Timer.After then
-              C_Timer.After(1.0, function()
-                if pendingAsyncLoot[key] then
-                  finalize(nil)
-                end
-              end)
-            end
-
-            return (DB and DB.hideLootText) and true or false
-          end
-        end
-      end
-    end
-  end
-
-  if DB.echoItem then
-    link = NormalizeItemLink(link)
-    local n = tonumber(qty)
-    do
-      local ignoredID = CaptureItemIDFromLink(link)
-      if ignoredID and IsIgnoredItemID(ignoredID) then
-        CaptureChatOut("CHAT_MSG_LOOT", link, {
-          handled = true,
-          ignored = true,
-          isSelfLoot = isSelfLoot and true or false,
-          player = (not isSelfLoot) and playerName or nil,
-          qty = tonumber(qty),
-          itemID = ignoredID,
-          combine = LootCombineEnabled() and true or false,
-        })
-        return true
-      end
-    end
-
-    if isSelfLoot then
-      local itemID = CaptureItemIDFromLink(link)
-      local delaySec = GetDelayPrintSecondsForItemID(itemID)
-      if delaySec then
-        if DelayPrintAddItem(itemID, link, n, delaySec) then
-          CaptureChatOut("CHAT_MSG_LOOT", link, {
-            handled = true,
-            delayed = true,
-            delaySec = delaySec,
-            isSelfLoot = true,
-            qty = n,
-            itemID = itemID,
-          })
-          return true
-        end
-      end
-    end
-
-    link = ApplyItemLinkAlias(link)
-    local displayLink = StripDisplayedLinkBrackets(link)
-    local out = displayLink
-    if n and n > 1 then
-      out = string.format("%s x%d", displayLink, n)
-    end
-
-    if IsItemLevelEnabled() then
-      local ilvl = GetEquippableItemLevelSuffix(link)
-      if ilvl then
-        local color = link:match("^(|c%x%x%x%x%x%x%x%x)")
-        local ilvlText
-        if color then
-          ilvlText = color .. tostring(ilvl) .. "|r"
-        else
-          ilvlText = tostring(ilvl)
-        end
-
-        out = out .. " " .. ilvlText
-      end
-    end
-
-    if isSelfLoot then
-      LootCombineAdd(out)
-    else
-      Print(FormatOtherLine(playerName, out))
-    end
-
-    CaptureChatOut("CHAT_MSG_LOOT", out, {
-      handled = true,
-      isSelfLoot = isSelfLoot and true or false,
-      player = (not isSelfLoot) and playerName or nil,
-      qty = tonumber(qty),
-      itemID = CaptureItemIDFromLink(link),
-      combine = LootCombineEnabled() and true or false,
-    })
-  end
-
-  return DB.hideLootText and true or false
-end
-
-local function OnAchievementChat(_, _, msg, author, ...)
-  if not (DB and DB.other and DB.other.achievement and DB.other.achievement.enabled) then
-    return false
-  end
-  if type(msg) ~= "string" or msg == "" then
-    return false
-  end
-
-  local link = ExtractAchievementLinkFallback(msg)
-  if not link then
-    return false
-  end
-
-  local name = StripRealmFromName(author)
-  if type(name) ~= "string" or name == "" then
-    name = "Character"
-  end
-
-  local displayLink = StripDisplayedLinkBrackets(link)
-  local out = string.format("%s: earned %s!", name, displayLink)
-
-  local outFrame = (DB.other and DB.other.outputChatFrame) or (DB and DB.outputChatFrame) or 1
-  PrintToChatFrame(out, outFrame)
-
-  return true
 end
 
 local function ApplyFilters()
-  -- These globals can be nil at addon load time depending on UI load order.
-  -- Resolve them lazily here so the addon still works reliably.
-  if not ChatFrame_AddMessageEventFilter then
-    ChatFrame_AddMessageEventFilter = _G and rawget(_G, "ChatFrame_AddMessageEventFilter")
-  end
-  if not ChatFrame_RemoveMessageEventFilter then
-    ChatFrame_RemoveMessageEventFilter = _G and rawget(_G, "ChatFrame_RemoveMessageEventFilter")
-  end
-  if not (ChatFrame_AddMessageEventFilter and ChatFrame_RemoveMessageEventFilter) then return end
-
-  ChatFrame_RemoveMessageEventFilter("CHAT_MSG_LOOT", OnLootChat)
-  ChatFrame_RemoveMessageEventFilter("CHAT_MSG_CURRENCY", OnCurrencyChat)
-  ChatFrame_RemoveMessageEventFilter("CHAT_MSG_MONEY", OnMoneyChat)
-  ChatFrame_RemoveMessageEventFilter("CHAT_MSG_SYSTEM", OnSystemChat)
-  ChatFrame_RemoveMessageEventFilter("CHAT_MSG_ACHIEVEMENT", OnAchievementChat)
-  ChatFrame_RemoveMessageEventFilter("CHAT_MSG_GUILD_ACHIEVEMENT", OnAchievementChat)
-  if IsEnabled() then
-    ChatFrame_AddMessageEventFilter("CHAT_MSG_LOOT", OnLootChat)
-    ChatFrame_AddMessageEventFilter("CHAT_MSG_CURRENCY", OnCurrencyChat)
-    ChatFrame_AddMessageEventFilter("CHAT_MSG_MONEY", OnMoneyChat)
-    ChatFrame_AddMessageEventFilter("CHAT_MSG_SYSTEM", OnSystemChat)
-  end
-  if DB and DB.other and DB.other.achievement and DB.other.achievement.enabled then
-    ChatFrame_AddMessageEventFilter("CHAT_MSG_ACHIEVEMENT", OnAchievementChat)
-    ChatFrame_AddMessageEventFilter("CHAT_MSG_GUILD_ACHIEVEMENT", OnAchievementChat)
+  local lootChat = GetLootChatModule()
+  if lootChat and lootChat.ApplyFilters then
+    return lootChat.ApplyFilters()
   end
 end
 
 local function ApplyFiltersSoon(delaySeconds)
-  if not (C_Timer and C_Timer.After) then return end
-  local d = tonumber(delaySeconds) or 0
-  if d < 0 then d = 0 end
-  C_Timer.After(d, function()
-    EnsureDB()
-    ApplyFilters()
-  end)
+  local lootChat = GetLootChatModule()
+  if lootChat and lootChat.ApplyFiltersSoon then
+    return lootChat.ApplyFiltersSoon(delaySeconds)
+  end
 end
 
 local function GetSupportedMessageLines()
-  local lines = {}
-  lines[#lines + 1] = "Supported message events:"
-  lines[#lines + 1] = ""
-  lines[#lines + 1] = "CHAT_MSG_LOOT"
-  lines[#lines + 1] = "  - Filters only self loot lines (localized via GlobalStrings)"
-  lines[#lines + 1] = "  - GlobalString keys:"
-  for _, k in ipairs(LOOT_PATTERN_KEYS) do
-    lines[#lines + 1] = "    - " .. k
+  local lootChat = GetLootChatModule()
+  if lootChat and lootChat.GetSupportedMessageLines then
+    return lootChat.GetSupportedMessageLines()
   end
-  lines[#lines + 1] = ""
-  lines[#lines + 1] = "  - Also handles group loot lines (other players)"
-  lines[#lines + 1] = "  - Reprints as 'Name: [Item]' (realm suffix removed)"
-  lines[#lines + 1] = "  - GlobalString keys:"
-  for _, k in ipairs(LOOT_GROUP_PATTERN_KEYS) do
-    lines[#lines + 1] = "    - " .. k
-  end
-  lines[#lines + 1] = ""
-  lines[#lines + 1] = "Notes:"
-  lines[#lines + 1] = "  - This does not block loot itself, only chat text."
-  lines[#lines + 1] = "  - Loot distribution is unchanged; only chat text is filtered."
-  lines[#lines + 1] = ""
-  lines[#lines + 1] = "CHAT_MSG_ACHIEVEMENT / CHAT_MSG_GUILD_ACHIEVEMENT"
-  lines[#lines + 1] = "  - Optional: rewrites to 'Name: earned Link!'"
-  lines[#lines + 1] = "  - Realm removed; achievement link brackets removed"
-  lines[#lines + 1] = ""
-  lines[#lines + 1] = "CHAT_MSG_CURRENCY"
-  lines[#lines + 1] = "  - Filters 'You receive currency: ...' (self)"
-  lines[#lines + 1] = "  - GlobalString keys:"
-  for _, k in ipairs(CURRENCY_PATTERN_KEYS) do
-    lines[#lines + 1] = "    - " .. k
-  end
-
-  lines[#lines + 1] = ""
-  lines[#lines + 1] = "CHAT_MSG_MONEY"
-  lines[#lines + 1] = "  - Filters 'You loot ...' money lines (self)"
-  lines[#lines + 1] = "  - Reprints selected coins (gold/silver/copper)"
-  lines[#lines + 1] = "  - GlobalString keys:"
-  for _, k in ipairs(MONEY_PATTERN_KEYS) do
-    lines[#lines + 1] = "    - " .. k
-  end
-
-  lines[#lines + 1] = ""
-  lines[#lines + 1] = "CHAT_MSG_SYSTEM"
-  lines[#lines + 1] = "  - Filters 'You receive item: ...' reward lines when they show up as system messages"
-  lines[#lines + 1] = "  - GlobalString keys:"
-  lines[#lines + 1] = "    - YOU_RECEIVE_ITEM"
-  lines[#lines + 1] = "    - YOU_RECEIVE_ITEM_MULTIPLE"
-  return lines
+  return {}
 end
 
-local ConfigUI
+-- UI (config window shell) moved to fr0z3nUI_LootItUI.lua
 
-local function IsMailEditorOpen()
-  if not (ConfigUI and ConfigUI.IsShown and ConfigUI:IsShown()) then return false end
-  return (ConfigUI._activeTab == "mail")
-end
-
--- Forward declarations (CreateConfigUI references these).
+-- Forward declarations (modules/CLI reference these)
 local CreateMailNotifier
 local UpdateMailNotifier
-
 local ApplyMailModelToFrame
-
-local MailNotifier
-
 local ApplyMailNotifierInteractivity
 local ModelGetRotation
 local ModelSetRotation
 local ModelApplyZoom
 local ModelApplyAnimation
 
-local OpenMailModelPicker
+local function IsMailEditorOpen()
+  local ui = LI and LI.UI
+  if ui and ui.IsMailEditorOpen then
+    return ui.IsMailEditorOpen() and true or false
+  end
+  return false
+end
 
 local function CreateConfigUI()
-  if ConfigUI then return ConfigUI end
-
-  local frame = CreateFrame("Frame", "fr0z3nUI_LootIt_Config", UIParent, "BasicFrameTemplateWithInset")
-
-  -- Allow closing with Escape.
-  if type(UISpecialFrames) == "table" then
-    local name = "fr0z3nUI_LootIt_Config"
-    local exists = false
-    for i = 1, #UISpecialFrames do
-      if UISpecialFrames[i] == name then exists = true break end
-    end
-    if not exists and tinsert then tinsert(UISpecialFrames, name) end
+  local ui = LI and LI.UI
+  if ui and ui.CreateConfigUI then
+    return ui.CreateConfigUI()
   end
-
-  frame:SetSize(480, 400)
-  frame:SetMovable(true)
-  frame:EnableMouse(true)
-  frame:RegisterForDrag("LeftButton")
-  frame:SetScript("OnDragStart", frame.StartMoving)
-  frame:SetScript("OnDragStop", function(self)
-    self:StopMovingOrSizing()
-    if DB and DB.ui then
-      local point, _, _, x, y = self:GetPoint(1)
-      DB.ui.point = point or "CENTER"
-      DB.ui.x = x or 0
-      DB.ui.y = y or 0
-    end
-  end)
-
-  local titleFS = frame.TitleText
-  if not (titleFS and titleFS.SetText and titleFS.SetPoint) then
-    titleFS = frame:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
-  end
-  frame._titleFS = titleFS
-
-  titleFS:SetText("|cff00ccff[FLI]|r LootIt")
-  titleFS:ClearAllPoints()
-  titleFS:SetPoint("TOPLEFT", frame, "TOPLEFT", 12, -6)
-  if titleFS.Hide then titleFS:Hide() end
-
-  local function GetEnableMode()
-    EnsureDB()
-    if CHARDB and CHARDB.enabledOverride == true then return "on" end
-    if CHARDB and CHARDB.enabledOverride == false then return "off" end
-    if DB and DB.enabled then return "acc" end
-    return "off"
-  end
-
-  local function SetEnableMode(mode)
-    EnsureDB()
-    mode = tostring(mode or ""):lower()
-    if mode == "on" then
-      CHARDB.enabledOverride = true
-    elseif mode == "acc" then
-      CHARDB.enabledOverride = nil
-      DB.enabled = true
-    else -- off
-      CHARDB.enabledOverride = false
-    end
-    ApplyFilters()
-  end
-
-  local mailNotifyLabel
-  local mailNotifyModeBtn
-  local mailCombat
-
-  local function GetMailNotifyMode()
-    EnsureDB()
-    if CHARDB and CHARDB.mailNotifyEnabledOverride == true then return "on" end
-    if CHARDB and CHARDB.mailNotifyEnabledOverride == false then return "off" end
-    if DB and DB.mailNotify and DB.mailNotify.enabled then return "acc" end
-    return "off"
-  end
-
-  local function SetMailNotifyMode(mode)
-    EnsureDB()
-    DB.mailNotify = DB.mailNotify or {}
-    mode = tostring(mode or ""):lower()
-    if mode == "on" then
-      CHARDB.mailNotifyEnabledOverride = true
-    elseif mode == "acc" then
-      CHARDB.mailNotifyEnabledOverride = nil
-      DB.mailNotify.enabled = true
-    else -- off
-      CHARDB.mailNotifyEnabledOverride = false
-    end
-    UpdateMailNotifier()
-  end
-
-  local function RefreshMailNotifyModeButton()
-    if not (mailNotifyModeBtn and mailNotifyModeBtn.SetText) then return end
-    local m = GetMailNotifyMode()
-    mailNotifyModeBtn:SetText((m == "on") and "On" or ((m == "acc") and "On Acc" or "Off"))
-  end
-
-  local function IsMailCombatOn()
-    local mn = MailNotifyCfg()
-    return (mn and mn.showInCombat ~= false) and true or false
-  end
-
-  local function RefreshMailCombatButton()
-    if not (mailCombatBtn and mailCombatBtn.GetFontString) then return end
-    local fs = mailCombatBtn:GetFontString()
-    if fs and fs.SetText then
-      fs:SetText("Combat")
-      if IsMailCombatOn() then
-        fs:SetTextColor(1.0, 0.82, 0.0, 1)
-      else
-        fs:SetTextColor(0.55, 0.55, 0.55, 1)
-      end
-    end
-  end
-
-  local enableModeBtn = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
-  enableModeBtn:SetSize(90, 20)
-  enableModeBtn:SetScript("OnClick", function()
-    local cur = GetEnableMode()
-    local nextMode = (cur == "off") and "on" or ((cur == "on") and "acc" or "off")
-    SetEnableMode(nextMode)
-    -- Refresh text immediately.
-    local m = GetEnableMode()
-    enableModeBtn:SetText((m == "on") and "On" or ((m == "acc") and "On Acc" or "Off"))
-  end)
-
-  local sub = frame:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
-  sub:SetPoint("TOPLEFT", frame.InsetBg, "TOPLEFT", 10, -10)
-  sub:SetJustifyH("LEFT")
-  sub:SetText("")
-
-  -- Tabs
-  local tabLoot = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
-  tabLoot:SetSize(120, 22)
-  tabLoot:SetPoint("TOPLEFT", frame, "TOPLEFT", 12, -6)
-  tabLoot:SetText("|cff00ccff[FLI]|r LootIt")
-
-  local tabAlias = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
-  tabAlias:SetSize(70, 22)
-  tabAlias:SetPoint("LEFT", tabLoot, "RIGHT", 10, 0)
-  tabAlias:SetText("Alias")
-
-  local tabOther = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
-  tabOther:SetSize(70, 22)
-  tabOther:SetPoint("LEFT", tabAlias, "RIGHT", 10, 0)
-  tabOther:SetText("Other")
-
-  local tabMail = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
-  tabMail:SetSize(70, 22)
-  tabMail:SetPoint("LEFT", tabOther, "RIGHT", 10, 0)
-  tabMail:SetText("Mail")
-
-  local tabTabard = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
-  tabTabard:SetSize(70, 22)
-  tabTabard:SetPoint("LEFT", tabMail, "RIGHT", 10, 0)
-  tabTabard:SetText("Tabard")
-
-  local lootPanel = CreateFrame("Frame", nil, frame)
-  lootPanel:SetPoint("TOPLEFT", frame.InsetBg, "TOPLEFT", 0, -24)
-  lootPanel:SetPoint("BOTTOMRIGHT", frame.InsetBg, "BOTTOMRIGHT", 0, 0)
-
-  -- Show the global enable-mode control only on the Loot tab.
-  enableModeBtn:SetParent(lootPanel)
-  enableModeBtn:ClearAllPoints()
-  enableModeBtn:SetPoint("TOPRIGHT", lootPanel, "TOPRIGHT", -10, -6)
-  do
-    local m = GetEnableMode()
-    enableModeBtn:SetText((m == "on") and "On" or ((m == "acc") and "On Acc" or "Off"))
-  end
-
-  local mailPanel = CreateFrame("Frame", nil, frame)
-  mailPanel:SetPoint("TOPLEFT", frame.InsetBg, "TOPLEFT", 0, -24)
-  mailPanel:SetPoint("BOTTOMRIGHT", frame.InsetBg, "BOTTOMRIGHT", 0, 0)
-
-  local aliasPanel = CreateFrame("Frame", nil, frame)
-  aliasPanel:SetPoint("TOPLEFT", frame.InsetBg, "TOPLEFT", 0, -24)
-  aliasPanel:SetPoint("BOTTOMRIGHT", frame.InsetBg, "BOTTOMRIGHT", 0, 0)
-
-  local otherPanel = CreateFrame("Frame", nil, frame)
-  otherPanel:SetPoint("TOPLEFT", frame.InsetBg, "TOPLEFT", 0, -24)
-  otherPanel:SetPoint("BOTTOMRIGHT", frame.InsetBg, "BOTTOMRIGHT", 0, 0)
-
-  local tabardPanel = CreateFrame("Frame", nil, frame)
-  tabardPanel:SetPoint("TOPLEFT", frame.InsetBg, "TOPLEFT", 0, -24)
-  tabardPanel:SetPoint("BOTTOMRIGHT", frame.InsetBg, "BOTTOMRIGHT", 0, 0)
-
-  local function SelectTab(which)
-    which = tostring(which or "loot"):lower()
-    local isLoot = (which == "loot")
-    local isAlias = (which == "alias")
-    local isOther = (which == "other")
-    local isMail = (which == "mail")
-    local isTabard = (which == "tabard")
-
-    lootPanel:SetShown(isLoot)
-    aliasPanel:SetShown(isAlias)
-    otherPanel:SetShown(isOther)
-    mailPanel:SetShown(isMail)
-    tabardPanel:SetShown(isTabard)
-
-    if enableModeBtn and enableModeBtn.SetShown then
-      enableModeBtn:SetShown(isLoot)
-    end
-
-    local function StyleTab(btn, active)
-      if not (btn and btn.GetFontString and btn.IsEnabled and btn.SetEnabled) then return end
-      btn:SetEnabled(true)
-      local fs = btn:GetFontString()
-      if fs and fs.SetTextColor then
-        if active then
-          fs:SetTextColor(1.0, 0.82, 0.0, 1)
-        else
-          fs:SetTextColor(0.70, 0.70, 0.70, 1)
-        end
-      end
-    end
-
-    StyleTab(tabLoot, isLoot)
-    StyleTab(tabAlias, isAlias)
-    StyleTab(tabOther, isOther)
-    StyleTab(tabMail, isMail)
-    StyleTab(tabTabard, isTabard)
-
-    frame._activeTab = isLoot and "loot" or (isAlias and "alias" or (isOther and "other" or (isMail and "mail" or "tabard")))
-
-    ApplyMailNotifierInteractivity()
-  end
-
-  frame.SelectTab = SelectTab
-
-  tabLoot:SetScript("OnClick", function() SelectTab("loot") end)
-  tabAlias:SetScript("OnClick", function() SelectTab("alias") end)
-  tabOther:SetScript("OnClick", function() SelectTab("other") end)
-  tabMail:SetScript("OnClick", function() SelectTab("mail") end)
-  tabTabard:SetScript("OnClick", function() SelectTab("tabard") end)
-
-  -- Tabard tab
-  local tabardTitle = tabardPanel:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-  tabardTitle:SetPoint("TOPLEFT", tabardPanel, "TOPLEFT", 10, -10)
-  tabardTitle:SetText("Tabard")
-
-  local function GetTabardEnableMode()
-    local mod = _G and rawget(_G, "fr0z3nUI_LootItTabard")
-    if mod and mod.GetEnableMode then
-      return mod.GetEnableMode()
-    end
-    EnsureDB()
-    if CHARDB and CHARDB.tabardEnabledOverride == true then return "on" end
-    if CHARDB and CHARDB.tabardEnabledOverride == false then return "off" end
-    if DB and DB.tabard and DB.tabard.enabled then return "acc" end
-    return "off"
-  end
-
-  local function SetTabardEnableMode(mode)
-    local mod = _G and rawget(_G, "fr0z3nUI_LootItTabard")
-    if mod and mod.SetEnableMode then
-      mod.SetEnableMode(mode)
-      return
-    end
-    EnsureDB()
-    DB.tabard = (type(DB.tabard) == "table") and DB.tabard or {}
-    mode = tostring(mode or ""):lower()
-    if mode == "on" then
-      CHARDB.tabardEnabledOverride = true
-    elseif mode == "acc" then
-      CHARDB.tabardEnabledOverride = nil
-      DB.tabard.enabled = true
-    else
-      CHARDB.tabardEnabledOverride = false
-    end
-  end
-
-  local tabardEnableLabel = tabardPanel:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
-  tabardEnableLabel:SetPoint("TOPLEFT", tabardTitle, "BOTTOMLEFT", 0, -14)
-  tabardEnableLabel:SetText("Enable")
-
-  local tabardEnableModeBtn = CreateFrame("Button", nil, tabardPanel, "UIPanelButtonTemplate")
-  tabardEnableModeBtn:SetSize(90, 20)
-  tabardEnableModeBtn:SetPoint("LEFT", tabardEnableLabel, "RIGHT", 12, 0)
-
-  local function RefreshTabardEnableModeButton()
-    if not (tabardEnableModeBtn and tabardEnableModeBtn.SetText) then return end
-    local m = GetTabardEnableMode()
-    tabardEnableModeBtn:SetText((m == "on") and "On" or ((m == "acc") and "On Acc" or "Off"))
-  end
-
-  tabardEnableModeBtn:SetScript("OnClick", function()
-    local cur = GetTabardEnableMode()
-    local nextMode = (cur == "off") and "on" or ((cur == "on") and "acc" or "off")
-    SetTabardEnableMode(nextMode)
-    RefreshTabardEnableModeButton()
-  end)
-
-  local function TabardMod()
-    return _G and rawget(_G, "fr0z3nUI_LootItTabard")
-  end
-
-  local function EnsureTabardDB()
-    EnsureDB()
-    DB.tabard = (type(DB.tabard) == "table") and DB.tabard or {}
-    DB.tabard.modeByContext = (type(DB.tabard.modeByContext) == "table") and DB.tabard.modeByContext or {
-      solo = "nochange",
-      city = "closest",
-      dungeon = "closest",
-      raid = "nochange",
-      pvp = "nochange",
-    }
-    if DB.tabard.delay == nil then DB.tabard.delay = 0.75 end
-    if DB.tabard.hideRepBarWhenNoChampion == nil then DB.tabard.hideRepBarWhenNoChampion = false end
-    return DB.tabard
-  end
-
-  local function NotifyTabardSettingsChanged(reason)
-    local mod = TabardMod()
-    if mod and mod.OnSettingsChanged then
-      mod.OnSettingsChanged(reason or "ui")
-    end
-  end
-
-  -- Context mode controls
-  local tabardModeTitle = tabardPanel:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-  tabardModeTitle:SetPoint("TOPLEFT", tabardEnableLabel, "BOTTOMLEFT", 0, -18)
-  tabardModeTitle:SetText("Context modes")
-
-  local MODE_LABELS = {
-    nochange = "No change",
-    closest = "Closest to Exalted",
-    furthest = "Furthest from Exalted",
-    lowest = "Lowest rep",
-    random = "Random",
-    faction = "Faction (cities)",
-    auto = "Auto",
-    none = "Unequip",
-  }
-
-  local MODE_ORDER = { "nochange", "closest", "furthest", "lowest", "random", "auto", "faction", "none" }
-
-  local function CreateModeDropDown(name, anchor, yOffset)
-    local label = tabardPanel:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
-    label:SetPoint("TOPLEFT", anchor, "BOTTOMLEFT", 0, yOffset)
-    label:SetText(name)
-
-    local dd = CreateFrame("Frame", nil, tabardPanel, "UIDropDownMenuTemplate")
-    dd:SetPoint("LEFT", label, "RIGHT", -6, -2)
-    UIDropDownMenu_SetWidth(dd, 170)
-    return label, dd
-  end
-
-  local soloLabel, soloDD = CreateModeDropDown("Solo", tabardModeTitle, -8)
-  local cityLabel, cityDD = CreateModeDropDown("City", soloLabel, -8)
-  local dungeonLabel, dungeonDD = CreateModeDropDown("Dungeon", cityLabel, -8)
-  local raidLabel, raidDD = CreateModeDropDown("Raid", dungeonLabel, -8)
-  local pvpLabel, pvpDD = CreateModeDropDown("PvP", raidLabel, -8)
-
-  local function SetModeFor(ctx, mode)
-    local tdb = EnsureTabardDB()
-    tdb.modeByContext[ctx] = tostring(mode or "nochange")
-    NotifyTabardSettingsChanged("mode")
-  end
-
-  local function GetModeFor(ctx)
-    local tdb = EnsureTabardDB()
-    return tostring((tdb.modeByContext and tdb.modeByContext[ctx]) or "nochange")
-  end
-
-  local function InitModeDropDown(dd, ctx)
-    UIDropDownMenu_Initialize(dd, function(_, level)
-      if level ~= 1 then return end
-      local current = GetModeFor(ctx)
-      for _, key in ipairs(MODE_ORDER) do
-        local info = UIDropDownMenu_CreateInfo()
-        info.text = MODE_LABELS[key] or key
-        info.value = key
-        info.checked = (key == current)
-        info.func = function()
-          UIDropDownMenu_SetText(dd, MODE_LABELS[key] or key)
-          SetModeFor(ctx, key)
-        end
-        UIDropDownMenu_AddButton(info, level)
-      end
-    end)
-  end
-
-  InitModeDropDown(soloDD, "solo")
-  InitModeDropDown(cityDD, "city")
-  InitModeDropDown(dungeonDD, "dungeon")
-  InitModeDropDown(raidDD, "raid")
-  InitModeDropDown(pvpDD, "pvp")
-
-  -- Delay + misc
-  local delayLabel = tabardPanel:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
-  delayLabel:SetPoint("TOPLEFT", pvpLabel, "BOTTOMLEFT", 0, -14)
-  delayLabel:SetText("Delay")
-
-  local delaySlider = CreateFrame("Slider", nil, tabardPanel, "OptionsSliderTemplate")
-  delaySlider:SetPoint("LEFT", delayLabel, "RIGHT", 14, 0)
-  delaySlider:SetWidth(180)
-  delaySlider:SetMinMaxValues(0, 3.0)
-  delaySlider:SetValueStep(0.05)
-  delaySlider:SetObeyStepOnDrag(true)
-  if delaySlider.Low then delaySlider.Low:SetText("0") end
-  if delaySlider.High then delaySlider.High:SetText("3.0") end
-  if delaySlider.Text then delaySlider.Text:SetText("") end
-
-  local delayValue = tabardPanel:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-  delayValue:SetPoint("LEFT", delaySlider, "RIGHT", 10, 0)
-  delayValue:SetText("0.75s")
-
-  delaySlider:SetScript("OnValueChanged", function(self, value)
-    local tdb = EnsureTabardDB()
-    local v = Clamp(value or 0, 0, 3.0)
-    tdb.delay = v
-    delayValue:SetText(string.format("%.2fs", v))
-    NotifyTabardSettingsChanged("delay")
-  end)
-
-  local repCB = CreateFrame("CheckButton", nil, tabardPanel, "UICheckButtonTemplate")
-  repCB:SetPoint("TOPLEFT", delayLabel, "BOTTOMLEFT", 0, -10)
-  SetCheckBoxText(repCB, "Hide rep bar when not championing")
-  repCB:SetScript("OnClick", function(self)
-    local tdb = EnsureTabardDB()
-    tdb.hideRepBarWhenNoChampion = self:GetChecked() and true or false
-    NotifyTabardSettingsChanged("repbar")
-  end)
-
-  local swapBtn = CreateFrame("Button", nil, tabardPanel, "UIPanelButtonTemplate")
-  swapBtn:SetSize(90, 20)
-  swapBtn:SetPoint("TOPLEFT", repCB, "BOTTOMLEFT", 0, -10)
-  swapBtn:SetText("Swap Now")
-  swapBtn:SetScript("OnClick", function()
-    local mod = TabardMod()
-    if mod and mod.MaybeSwap then mod.MaybeSwap("ui") end
-  end)
-
-  local dbgBtn = CreateFrame("Button", nil, tabardPanel, "UIPanelButtonTemplate")
-  dbgBtn:SetSize(90, 20)
-  dbgBtn:SetPoint("LEFT", swapBtn, "RIGHT", 10, 0)
-  dbgBtn:SetText("Debug")
-  dbgBtn:SetScript("OnClick", function()
-    local mod = TabardMod()
-    if mod and mod.Debug then mod.Debug() end
-  end)
-
-  local tip = tabardPanel:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
-  tip:SetPoint("TOPLEFT", swapBtn, "BOTTOMLEFT", 0, -10)
-  tip:SetJustifyH("LEFT")
-  tip:SetText("Tip: If you don't want auto-equips in towns, set City to 'No change'.")
-
-  local function RefreshTabardControls()
-    RefreshTabardEnableModeButton()
-    local tdb = EnsureTabardDB()
-    UIDropDownMenu_SetText(soloDD, MODE_LABELS[GetModeFor("solo")] or GetModeFor("solo"))
-    UIDropDownMenu_SetText(cityDD, MODE_LABELS[GetModeFor("city")] or GetModeFor("city"))
-    UIDropDownMenu_SetText(dungeonDD, MODE_LABELS[GetModeFor("dungeon")] or GetModeFor("dungeon"))
-    UIDropDownMenu_SetText(raidDD, MODE_LABELS[GetModeFor("raid")] or GetModeFor("raid"))
-    UIDropDownMenu_SetText(pvpDD, MODE_LABELS[GetModeFor("pvp")] or GetModeFor("pvp"))
-    local d = tonumber(tdb.delay) or 0.75
-    delaySlider:SetValue(Clamp(d, 0, 3.0))
-    delayValue:SetText(string.format("%.2fs", Clamp(d, 0, 3.0)))
-    repCB:SetChecked(tdb.hideRepBarWhenNoChampion and true or false)
-  end
-
-  tabardPanel:SetScript("OnShow", RefreshTabardEnableModeButton)
-
-  -- Replace with full refresh (enable + controls)
-  tabardPanel:SetScript("OnShow", RefreshTabardControls)
-
-  -- Other tab
-  local otherTitle = otherPanel:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-  otherTitle:SetPoint("TOPLEFT", otherPanel, "TOPLEFT", 10, -10)
-  otherTitle:SetText("Other")
-
-  local achCB = CreateFrame("CheckButton", nil, otherPanel, "UICheckButtonTemplate")
-  achCB:SetPoint("TOPLEFT", otherTitle, "BOTTOMLEFT", 0, -10)
-  SetCheckBoxText(achCB, "Achievement")
-  achCB:SetScript("OnClick", function(self)
-    EnsureDB()
-    DB.other = (type(DB.other) == "table") and DB.other or {}
-    DB.other.achievement = (type(DB.other.achievement) == "table") and DB.other.achievement or {}
-    DB.other.achievement.enabled = self:GetChecked() and true or false
-    ApplyFilters()
-  end)
-
-  do
-    local t = achCB.Text or achCB.text
-    if t and t.ClearAllPoints and t.SetPoint then
-      if achCB and achCB.SetSize then
-        achCB:SetSize(24, 24)
-      end
-      t:ClearAllPoints()
-      t:SetPoint("LEFT", achCB, "RIGHT", 3, 0)
-
-      if achCB and achCB.SetHitRectInsets and t.GetStringWidth then
-        local w = tonumber(t:GetStringWidth()) or 0
-        if w > 0 then
-          achCB:SetHitRectInsets(0, -(w + 10), 0, 0)
-        end
-      end
-    end
-  end
-
-  local otherOutputLabel = otherPanel:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-  otherOutputLabel:SetPoint("LEFT", (achCB.Text or achCB.text) or achCB, "RIGHT", 18, 0)
-  otherOutputLabel:SetText("Output")
-
-  local otherOutputDD = CreateFrame("Frame", "fr0z3nUI_LootIt_OtherOutputDropDown", otherPanel, "UIDropDownMenuTemplate")
-  otherOutputDD:SetPoint("LEFT", otherOutputLabel, "RIGHT", -6, -2)
-  UIDropDownMenu_SetWidth(otherOutputDD, 140)
-
-  do
-    local mu = _G and rawget(_G, "MenuUtil")
-    if type(mu) == "table" and type(mu.CreateContextMenu) == "function" then
-      local anchor = otherOutputDD.Button or otherOutputDD
-      if anchor and anchor.SetScript then
-        anchor:SetScript("OnClick", function(btn)
-          mu.CreateContextMenu(btn, function(_, root)
-            if root and root.CreateTitle then root:CreateTitle("Output") end
-            EnsureDB()
-            DB.other = (type(DB.other) == "table") and DB.other or {}
-            for i = 1, (NUM_CHAT_WINDOWS or 1) do
-              local name = GetChatWindowInfo and GetChatWindowInfo(i)
-              if not name or name == "" then name = "Chat " .. i end
-              local label = string.format("%d: %s", i, name)
-              if root and root.CreateRadio then
-                root:CreateRadio(label, function() return (DB.other.outputChatFrame == i) end, function()
-                  EnsureDB()
-                  DB.other = (type(DB.other) == "table") and DB.other or {}
-                  DB.other.outputChatFrame = i
-                  if UIDropDownMenu_SetSelectedID then UIDropDownMenu_SetSelectedID(otherOutputDD, i) end
-                end)
-              elseif root and root.CreateButton then
-                root:CreateButton(label, function()
-                  EnsureDB()
-                  DB.other = (type(DB.other) == "table") and DB.other or {}
-                  DB.other.outputChatFrame = i
-                  if UIDropDownMenu_SetSelectedID then UIDropDownMenu_SetSelectedID(otherOutputDD, i) end
-                end)
-              end
-            end
-          end)
-        end)
-      end
-    else
-      UIDropDownMenu_Initialize(otherOutputDD, function(_, level)
-    level = level or 1
-    if level ~= 1 then return end
-    EnsureDB()
-    DB.other = (type(DB.other) == "table") and DB.other or {}
-
-    for i = 1, (NUM_CHAT_WINDOWS or 1) do
-      local name = GetChatWindowInfo and GetChatWindowInfo(i)
-      if not name or name == "" then
-        name = "Chat " .. i
-      end
-
-      local info = UIDropDownMenu_CreateInfo()
-      info.text = string.format("%d: %s", i, name)
-      info.checked = (DB.other.outputChatFrame == i)
-      info.func = function()
-        EnsureDB()
-        DB.other = (type(DB.other) == "table") and DB.other or {}
-        DB.other.outputChatFrame = i
-        UIDropDownMenu_SetSelectedID(otherOutputDD, i)
-        do local cdm = _G and rawget(_G, "CloseDropDownMenus"); if cdm then cdm() end end
-      end
-      UIDropDownMenu_AddButton(info, level)
-    end
-      end)
-    end
-  end
-
-  local exampleTitle = otherPanel:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-  exampleTitle:SetPoint("TOPLEFT", achCB, "BOTTOMLEFT", 0, -14)
-  exampleTitle:SetText("Achievement Format")
-
-  local ex1 = otherPanel:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-  ex1:SetPoint("TOPLEFT", exampleTitle, "BOTTOMLEFT", 0, -6)
-  ex1:SetJustifyH("LEFT")
-  ex1:SetText("[Character] has earned the achievement [link]")
-
-  local ex2 = otherPanel:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-  ex2:SetPoint("TOPLEFT", ex1, "BOTTOMLEFT", 0, -4)
-  ex2:SetJustifyH("LEFT")
-  ex2:SetText("Character: earned Link!")
-
-  otherPanel.Refresh = function()
-    EnsureDB()
-    DB.other = (type(DB.other) == "table") and DB.other or {}
-    DB.other.achievement = (type(DB.other.achievement) == "table") and DB.other.achievement or {}
-    SetCheckBoxChecked(achCB, DB.other.achievement.enabled == true)
-    UIDropDownMenu_SetSelectedID(otherOutputDD, DB.other.outputChatFrame or 1)
-  end
-
-  local hide = CreateFrame("CheckButton", nil, lootPanel, "UICheckButtonTemplate")
-  hide:SetPoint("TOPLEFT", lootPanel, "TOPLEFT", 10, -6)
-  SetCheckBoxText(hide, "Hide |cff15AB0DYou receive loot:|r")
-  hide:SetScript("OnClick", function(self)
-    EnsureDB()
-    DB.hideLootText = self:GetChecked() and true or false
-  end)
-
-  local function TightenCheckBoxLabel(cb)
-    local t = cb and (cb.Text or cb.text)
-    if t and t.ClearAllPoints and t.SetPoint then
-      if cb and cb.SetSize then
-        cb:SetSize(24, 24)
-      end
-      t:ClearAllPoints()
-      t:SetPoint("LEFT", cb, "RIGHT", 3, 0)
-
-      -- Keep the click area covering the label even though the button itself is small.
-      if cb and cb.SetHitRectInsets and t.GetStringWidth then
-        local w = tonumber(t:GetStringWidth()) or 0
-        if w > 0 then
-          cb:SetHitRectInsets(0, -(w + 10), 0, 0)
-        end
-      end
-    end
-  end
-
-  TightenCheckBoxLabel(hide)
-
-  local hideText = hide.Text or hide.text
-  if hideText and hideText.SetWidth then
-    hideText:SetWidth(220)
-  end
-  if hideText and hideText.GetFont and hideText.SetFont then
-    local f, s, flags = hideText:GetFont()
-    if f and s then
-      hideText:SetFont(f, s + 1, flags)
-    end
-  end
-
-  local echo = CreateFrame("CheckButton", nil, lootPanel, "UICheckButtonTemplate")
-  echo:SetPoint("LEFT", (hide.Text or hide.text) or hide, "RIGHT", 10, 0)
-  SetCheckBoxText(echo, "Show Loot Only Line")
-  echo:SetScript("OnClick", function(self)
-    EnsureDB()
-    DB.echoItem = self:GetChecked() and true or false
-  end)
-
-  TightenCheckBoxLabel(echo)
-
-  local combineLabel = lootPanel:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-  combineLabel:SetPoint("TOPLEFT", hide, "BOTTOMLEFT", 2, -10)
-  combineLabel:SetText("Loot In Line")
-
-  local combineBox = CreateFrame("EditBox", nil, lootPanel, "InputBoxTemplate")
-  combineBox:SetSize(46, 20)
-  combineBox:SetPoint("LEFT", combineLabel, "RIGHT", 8, 0)
-  combineBox:SetAutoFocus(false)
-  combineBox:SetNumeric(true)
-  combineBox:SetJustifyH("CENTER")
-  combineBox:SetScript("OnEnterPressed", function(self)
-    EnsureDB()
-    local n = tonumber(self:GetText() or "") or 1
-    if n < 1 then n = 1 end
-    if n > 25 then n = 25 end
-    DB.lootCombineCount = n
-    self:SetText(tostring(n))
-    self:ClearFocus()
-
-    if n <= 1 then
-      LootCombineCancelTimers()
-      LootCombineFlush()
-    end
-  end)
-
-  local function CreateInlineTextToggleButton(parent, text, onColor)
-    local b = CreateFrame("Button", nil, parent)
-    b:SetSize(70, 20)
-
-    local hl = b:CreateTexture(nil, "HIGHLIGHT")
-    hl:SetColorTexture(1, 1, 1, 0.06)
-    hl:SetAllPoints(b)
-
-    local fs = b:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-    fs:SetPoint("CENTER", b, "CENTER", 0, 0)
-    fs:SetText(tostring(text or ""))
-    b._text = fs
-    b._onColor = onColor
-
-    function b:SetOn(on)
-      self._on = on and true or false
-      if self._text then
-        if self._on then
-          local c = self._onColor or { 1, 1, 1, 1 }
-          self._text:SetTextColor(c[1], c[2], c[3], c[4] or 1)
-        else
-          self._text:SetTextColor(0.65, 0.65, 0.65, 1)
-        end
-      end
-    end
-
-    b:SetOn(false)
-    return b
-  end
-
-  local plusGold = lootPanel:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-  plusGold:SetPoint("LEFT", combineBox, "RIGHT", 8, 0)
-  plusGold:SetText("+")
-
-  local combineGold = CreateInlineTextToggleButton(lootPanel, "Gold", { 1, 0.82, 0, 1 })
-  combineGold:SetSize(52, 20)
-  combineGold:SetPoint("LEFT", plusGold, "RIGHT", 8, 0)
-  combineGold:SetScript("OnClick", function(self)
-    EnsureDB()
-    DB.lootCombineIncludeGold = not (DB.lootCombineIncludeGold == true)
-    self:SetOn(DB.lootCombineIncludeGold)
-  end)
-
-  local plusCur = lootPanel:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-  plusCur:SetPoint("LEFT", combineGold, "RIGHT", 8, 0)
-  plusCur:SetText("+")
-
-  local combineCur = CreateInlineTextToggleButton(lootPanel, "Currency", { 0.85, 0.85, 0.85, 1 })
-  combineCur:SetSize(72, 20)
-  combineCur:SetPoint("LEFT", plusCur, "RIGHT", 8, 0)
-  combineCur:SetScript("OnClick", function(self)
-    EnsureDB()
-    DB.lootCombineIncludeCurrency = not (DB.lootCombineIncludeCurrency == true)
-    self:SetOn(DB.lootCombineIncludeCurrency)
-  end)
-
-  local perLabel = lootPanel:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-  perLabel:SetPoint("LEFT", combineCur, "RIGHT", 8, 0)
-  perLabel:SetText("Per")
-
-  local modeToggle = CreateFrame("Button", nil, lootPanel)
-  modeToggle:SetSize(108, 20)
-  modeToggle:SetPoint("LEFT", perLabel, "RIGHT", 8, 0)
-
-  local modeHL = modeToggle:CreateTexture(nil, "HIGHLIGHT")
-  modeHL:SetColorTexture(1, 1, 1, 0.06)
-  modeHL:SetAllPoints(modeToggle)
-
-  local modeText = modeToggle:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-  modeText:SetPoint("CENTER", modeToggle, "CENTER", 0, 0)
-  modeToggle._text = modeText
-
-  local COPPER = { 0.78, 0.61, 0.43, 1 }
-
-  local function RefreshCombineModeButtons()
-    EnsureDB()
-    local isLoot = (tostring(DB.lootCombineMode or "loot") == "loot")
-    if modeToggle._text then
-      modeToggle._text:SetText(isLoot and "Loot Window" or "Loot Period")
-      modeToggle._text:SetTextColor(COPPER[1], COPPER[2], COPPER[3], COPPER[4])
-    end
-  end
-
-  modeToggle:SetScript("OnClick", function()
-    EnsureDB()
-    local isLoot = (tostring(DB.lootCombineMode or "loot") == "loot")
-    DB.lootCombineMode = (isLoot and "timer" or "loot")
-    LootCombineCancelTimers()
-    LootCombineFlush()
-    RefreshCombineModeButtons()
-  end)
-
-  local function CreateCurrencyToggleButton(parent, texturePath)
-    local b = CreateFrame("Button", nil, parent, "BackdropTemplate")
-    b:SetSize(28, 28)
-    b:SetBackdrop({
-      bgFile = "Interface\\Buttons\\WHITE8X8",
-      edgeFile = "Interface\\Buttons\\WHITE8X8",
-      tile = true,
-      tileSize = 16,
-      edgeSize = 1,
-      insets = { left = 1, right = 1, top = 1, bottom = 1 },
-    })
-    -- Always transparent background; state is shown via icon color.
-    b:SetBackdropBorderColor(0, 0, 0, 0)
-    b:SetBackdropColor(0, 0, 0, 0)
-
-    local hl = b:CreateTexture(nil, "HIGHLIGHT")
-    hl:SetColorTexture(1, 1, 1, 0.08)
-    hl:SetAllPoints(b)
-
-    local icon = b:CreateTexture(nil, "ARTWORK")
-    icon:SetTexture(texturePath)
-    icon:SetSize(22, 22)
-    icon:SetPoint("CENTER", b, "CENTER", 0, 0)
-    b._icon = icon
-
-    function b:SetOn(on)
-      self._on = on and true or false
-      -- Keep background transparent; toggle icon saturation.
-      if self._icon and self._icon.SetDesaturated then
-        self._icon:SetDesaturated(not self._on)
-      end
-      if self._icon and self._icon.SetVertexColor then
-        if self._on then
-          self._icon:SetVertexColor(1, 1, 1, 1)
-        else
-          self._icon:SetVertexColor(0.7, 0.7, 0.7, 1)
-        end
-      end
-    end
-
-    return b
-  end
-
-  local moneySilver = CreateCurrencyToggleButton(lootPanel, "Interface\\MoneyFrame\\UI-SilverIcon")
-  moneySilver:SetPoint("TOP", combineBox, "BOTTOM", 0, -6)
-
-  local moneyGold = CreateCurrencyToggleButton(lootPanel, "Interface\\MoneyFrame\\UI-GoldIcon")
-  moneyGold:SetPoint("RIGHT", moneySilver, "LEFT", -8, 0)
-
-  local moneyCopper = CreateCurrencyToggleButton(lootPanel, "Interface\\MoneyFrame\\UI-CopperIcon")
-  moneyCopper:SetPoint("LEFT", moneySilver, "RIGHT", 8, 0)
-
-  local function RefreshMoneyButtons()
-    EnsureDB()
-    DB.money = DB.money or {}
-    moneyGold:SetOn(DB.money.gold ~= false)
-    moneySilver:SetOn(DB.money.silver == true)
-    moneyCopper:SetOn(DB.money.copper == true)
-  end
-
-  moneyGold:SetScript("OnClick", function(self)
-    EnsureDB()
-    DB.money = DB.money or {}
-    DB.money.gold = not (DB.money.gold ~= false)
-    RefreshMoneyButtons()
-  end)
-
-  moneySilver:SetScript("OnClick", function(self)
-    EnsureDB()
-    DB.money = DB.money or {}
-    DB.money.silver = not (DB.money.silver == true)
-    RefreshMoneyButtons()
-  end)
-
-  moneyCopper:SetScript("OnClick", function(self)
-    EnsureDB()
-    DB.money = DB.money or {}
-    DB.money.copper = not (DB.money.copper == true)
-    RefreshMoneyButtons()
-  end)
-
-  local selfName = CreateFrame("CheckButton", nil, lootPanel, "UICheckButtonTemplate")
-  SetCheckBoxText(selfName, "Show My Name Always")
-  selfName:SetScript("OnClick", function(self)
-    EnsureDB()
-    DB.showSelfNameAlways = self:GetChecked() and true or false
-  end)
-
-  TightenCheckBoxLabel(selfName)
-
-  local outputLabel = lootPanel:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-  outputLabel:SetPoint("TOPLEFT", moneyGold, "BOTTOMLEFT", 2, -12)
-  outputLabel:SetText("Output")
-
-  local outputDD = CreateFrame("Frame", "fr0z3nUI_LootIt_OutputDropDown", lootPanel, "UIDropDownMenuTemplate")
-  outputDD:SetPoint("LEFT", outputLabel, "RIGHT", -6, -2)
-  UIDropDownMenu_SetWidth(outputDD, 100)
-
-  do
-    local mu = _G and rawget(_G, "MenuUtil")
-    if type(mu) == "table" and type(mu.CreateContextMenu) == "function" then
-      local anchor = outputDD.Button or outputDD
-      if anchor and anchor.SetScript then
-        anchor:SetScript("OnClick", function(btn)
-          mu.CreateContextMenu(btn, function(_, root)
-            if root and root.CreateTitle then root:CreateTitle("Output") end
-            EnsureDB()
-            for i = 1, (NUM_CHAT_WINDOWS or 1) do
-              local name = GetChatWindowInfo and GetChatWindowInfo(i)
-              if not name or name == "" then name = "Chat " .. i end
-              local label = string.format("%d: %s", i, name)
-              if root and root.CreateRadio then
-                root:CreateRadio(label, function() return (DB.outputChatFrame == i) end, function()
-                  EnsureDB()
-                  DB.outputChatFrame = i
-                  if UIDropDownMenu_SetSelectedID then UIDropDownMenu_SetSelectedID(outputDD, i) end
-                end)
-              elseif root and root.CreateButton then
-                root:CreateButton(label, function()
-                  EnsureDB()
-                  DB.outputChatFrame = i
-                  if UIDropDownMenu_SetSelectedID then UIDropDownMenu_SetSelectedID(outputDD, i) end
-                end)
-              end
-            end
-          end)
-        end)
-      end
-    else
-      UIDropDownMenu_Initialize(outputDD, function(_, level)
-    level = level or 1
-    if level ~= 1 then return end
-    EnsureDB()
-
-    for i = 1, (NUM_CHAT_WINDOWS or 1) do
-      local name = GetChatWindowInfo and GetChatWindowInfo(i)
-      if not name or name == "" then
-        name = "Chat " .. i
-      end
-
-      local info = UIDropDownMenu_CreateInfo()
-      info.text = string.format("%d: %s", i, name)
-      info.checked = (DB.outputChatFrame == i)
-      info.func = function()
-        EnsureDB()
-        DB.outputChatFrame = i
-        UIDropDownMenu_SetSelectedID(outputDD, i)
-        do local cdm = _G and rawget(_G, "CloseDropDownMenus"); if cdm then cdm() end end
-      end
-      UIDropDownMenu_AddButton(info, level)
-    end
-      end)
-    end
-  end
-
-  local prefixLabel = lootPanel:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-  prefixLabel:SetPoint("LEFT", outputDD, "RIGHT", 6, 2)
-  prefixLabel:SetText("Prefix")
-
-  local prefixBox = CreateFrame("EditBox", nil, lootPanel, "InputBoxTemplate")
-  prefixBox:SetSize(120, 20)
-  prefixBox:SetPoint("LEFT", prefixLabel, "RIGHT", 6, 0)
-  prefixBox:SetAutoFocus(false)
-  prefixBox:SetJustifyH("LEFT")
-  prefixBox:SetScript("OnEnterPressed", function(self)
-    EnsureDB()
-    DB.echoPrefix = tostring(self:GetText() or "")
-    self:ClearFocus()
-  end)
-  prefixBox:SetScript("OnEscapePressed", function(self)
-    self:SetText(DB and DB.echoPrefix or "")
-    self:ClearFocus()
-  end)
-
-  do
-    local ph = prefixBox:CreateFontString(nil, "OVERLAY", "GameFontDisable")
-    ph:SetPoint("LEFT", prefixBox, "LEFT", 6, 0)
-    ph:SetText("Optional")
-    ph:Show()
-    local function UpdatePlaceholder()
-      local txt = tostring(prefixBox:GetText() or "")
-      if txt == "" and not prefixBox:HasFocus() then
-        ph:Show()
-      else
-        ph:Hide()
-      end
-    end
-    prefixBox:HookScript("OnEditFocusGained", UpdatePlaceholder)
-    prefixBox:HookScript("OnEditFocusLost", UpdatePlaceholder)
-    prefixBox:HookScript("OnTextChanged", UpdatePlaceholder)
-    UpdatePlaceholder()
-  end
-
-  -- Align "Show My Name in Groups" checkbox with the prefix box left edge.
-  selfName:ClearAllPoints()
-  selfName:SetPoint("TOP", moneyGold, "TOP", 0, 0)
-  selfName:SetPoint("LEFT", prefixLabel, "LEFT", 0, 0)
-
-  -- iLvl display: 3-state (account-wide on, per-char off, account-wide off)
-  local ilvlRow = CreateFrame("Frame", nil, lootPanel)
-  ilvlRow:SetHeight(20)
-  ilvlRow:SetPoint("TOPLEFT", outputLabel, "BOTTOMLEFT", 0, -10)
-  ilvlRow:SetPoint("RIGHT", lootPanel, "RIGHT", -10, 0)
-
-  local ilvlLabel = lootPanel:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-  ilvlLabel:SetPoint("LEFT", ilvlRow, "LEFT", 0, 0)
-  ilvlLabel:SetText("iLvl")
-
-  local ilvlToggle = CreateFrame("Button", nil, lootPanel)
-  ilvlToggle:SetSize(210, 20)
-  ilvlToggle:SetPoint("LEFT", ilvlLabel, "RIGHT", 10, 0)
-
-  local ilvlHL = ilvlToggle:CreateTexture(nil, "HIGHLIGHT")
-  ilvlHL:SetColorTexture(1, 1, 1, 0.06)
-  ilvlHL:SetAllPoints(ilvlToggle)
-
-  local ilvlText = ilvlToggle:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-  ilvlText:SetPoint("CENTER", ilvlToggle, "CENTER", 0, 0)
-  ilvlToggle._text = ilvlText
-
-  local function GetIlvlMode()
-    EnsureDB()
-    local accOn = (DB.showItemLevel ~= false)
-    local charHasOverride = (CHARDB and CHARDB.showItemLevel ~= nil)
-
-    if not accOn then
-      return "off_acc"
-    end
-    if charHasOverride and (CHARDB.showItemLevel == false) then
-      return "off_char"
-    end
-    return "on_acc"
-  end
-
-  local function RefreshIlvlButtons()
-    local mode = GetIlvlMode()
-    if ilvlToggle._text then
-      if mode == "on_acc" then
-        ilvlToggle._text:SetText("On Acc")
-        ilvlToggle._text:SetTextColor(0.20, 1.00, 0.20, 1)
-      elseif mode == "off_char" then
-        ilvlToggle._text:SetText("Off Char")
-        ilvlToggle._text:SetTextColor(1.00, 0.72, 0.10, 1)
-      else
-        ilvlToggle._text:SetText("Off Acc")
-        ilvlToggle._text:SetTextColor(1.00, 0.25, 0.25, 1)
-      end
-    end
-  end
-
-  ilvlToggle:SetScript("OnClick", function()
-    local mode = GetIlvlMode()
-    EnsureDB()
-
-    if mode == "on_acc" then
-      -- Next: Off Char
-      if CHARDB then CHARDB.showItemLevel = false end
-    elseif mode == "off_char" then
-      -- Next: Off Acc
-      DB.showItemLevel = false
-      if CHARDB then CHARDB.showItemLevel = nil end
-    else
-      -- Next: On Acc
-      DB.showItemLevel = true
-      if CHARDB then CHARDB.showItemLevel = nil end
-    end
-
-    RefreshIlvlButtons()
-  end)
-
-  RefreshIlvlButtons()
-
-  -- mailNotifyModeBtn/mailCombat are created in the Mail tab.
-
-  local reset = CreateFrame("Button", nil, lootPanel, "UIPanelButtonTemplate")
-  reset:SetSize(120, 22)
-
-  -- Center the reset button across the panel, but keep the same vertical placement.
-  local resetRow = CreateFrame("Frame", nil, lootPanel)
-  resetRow:SetHeight(1)
-  resetRow:SetPoint("TOP", ilvlRow, "BOTTOM", 0, -10)
-  resetRow:SetPoint("LEFT", lootPanel, "LEFT", 0, 0)
-  resetRow:SetPoint("RIGHT", lootPanel, "RIGHT", 0, 0)
-
-  reset:SetPoint("TOP", resetRow, "TOP", 0, 0)
-  reset:SetText("Reset Defaults")
-  reset:SetScript("OnClick", function()
-    fr0z3nUI_LootItDB = {}
-    fr0z3nUI_LootItCharDB = {}
-    EnsureDB()
-    ApplyFilters()
-    UpdateMailNotifier()
-    do
-      local mode
-      if CHARDB and CHARDB.enabledOverride == true then
-        mode = "on"
-      elseif CHARDB and CHARDB.enabledOverride == false then
-        mode = "off"
-      elseif DB and DB.enabled then
-        mode = "acc"
-      else
-        mode = "off"
-      end
-      enableModeBtn:SetText((mode == "on") and "On" or ((mode == "acc") and "On Acc" or "Off"))
-    end
-    SetCheckBoxChecked(hide, DB.hideLootText)
-    SetCheckBoxChecked(echo, DB.echoItem)
-    SetCheckBoxChecked(selfName, DB.showSelfNameAlways)
-    RefreshMailNotifyModeButton()
-    RefreshMailCombatButton()
-    combineBox:SetText(tostring(DB.lootCombineCount or 1))
-    combineCur:SetOn(DB.lootCombineIncludeCurrency)
-    combineGold:SetOn(DB.lootCombineIncludeGold)
-    RefreshCombineModeButtons()
-    RefreshMoneyButtons()
-    RefreshIlvlButtons()
-    prefixBox:SetText(DB.echoPrefix or "")
-  end)
-
-  local supportedLabel = lootPanel:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-
-  local supportedRow = CreateFrame("Frame", nil, lootPanel)
-  supportedRow:SetHeight(1)
-  supportedRow:SetPoint("TOP", reset, "BOTTOM", 0, -18)
-  supportedRow:SetPoint("LEFT", lootPanel, "LEFT", 10, 0)
-  supportedRow:SetPoint("RIGHT", lootPanel, "RIGHT", -10, 0)
-
-  supportedLabel:SetPoint("TOPLEFT", supportedRow, "TOPLEFT", 0, 0)
-  supportedLabel:SetText("Messages it can handle")
-
-  local scroll = CreateFrame("ScrollFrame", nil, lootPanel, "UIPanelScrollFrameTemplate")
-  scroll:SetPoint("TOPLEFT", supportedLabel, "BOTTOMLEFT", 0, -8)
-  scroll:SetPoint("BOTTOMRIGHT", lootPanel, "BOTTOMRIGHT", -28, 16)
-
-  local content = CreateFrame("Frame", nil, scroll)
-  content:SetSize(340, 1)
-  scroll:SetScrollChild(content)
-
-  local lineHeight = 14
-  local linePool = {}
-
-  local function GetLine(i)
-    if not linePool[i] then
-      local fs = content:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-      fs:SetJustifyH("LEFT")
-      fs:SetPoint("TOPLEFT", content, "TOPLEFT", 2, -((i - 1) * lineHeight))
-      fs:SetPoint("RIGHT", content, "RIGHT", -2, 0)
-      linePool[i] = fs
-    end
-    return linePool[i]
-  end
-
-  local function RefreshSupportedList()
-    local lines = GetSupportedMessageLines()
-
-    -- Keep the scroll child reasonably wide, otherwise text wraps to 1px.
-    local w = (scroll.GetWidth and scroll:GetWidth()) or 340
-    if type(w) == "number" and w > 40 then
-      content:SetWidth(w - 26)
-    else
-      content:SetWidth(340)
-    end
-
-    for i = 1, #lines do
-      local fs = GetLine(i)
-      fs:SetText(lines[i])
-      fs:Show()
-    end
-    for i = #lines + 1, #linePool do
-      linePool[i]:Hide()
-    end
-    content:SetHeight(#lines * lineHeight + 6)
-  end
-
-  -- Alias tab
-  do
-    local function HideInputBoxTemplateArt(e)
-      if not (e and e.GetRegions) then return end
-      for _, region in ipairs({ e:GetRegions() }) do
-        if region and region.GetObjectType and region:GetObjectType() == "Texture" then
-          region:Hide()
-        end
-      end
-    end
-
-    local function SetEditFontSize(e, size)
-      if not (e and e.GetFont and e.SetFont) then return end
-      local font, _, flags = e:GetFont()
-      if type(font) ~= "string" or font == "" then
-        font = "Fonts\\FRIZQT__.TTF"
-      end
-      e:SetFont(font, size, flags)
-    end
-
-    local function SetFontStringSize(fs, size)
-      if not (fs and fs.GetFont and fs.SetFont) then return end
-      local font, _, flags = fs:GetFont()
-      if type(font) ~= "string" or font == "" then
-        font = "Fonts\\FRIZQT__.TTF"
-      end
-      fs:SetFont(font, size, flags)
-    end
-
-    local function AddPlaceholder(e, text)
-      if not (e and e.CreateFontString) then return nil end
-      local fs = e:CreateFontString(nil, "OVERLAY", "GameFontDisable")
-      fs:SetText(tostring(text or ""))
-      fs:SetPoint("LEFT", e, "LEFT", 10, 0)
-      fs:SetJustifyH("LEFT")
-
-      local function Update()
-        local t = tostring(e:GetText() or "")
-        if t == "" and not e:HasFocus() then
-          fs:Show()
-        else
-          fs:Hide()
-        end
-      end
-
-      e:HookScript("OnEditFocusGained", Update)
-      e:HookScript("OnEditFocusLost", Update)
-      e:HookScript("OnTextChanged", Update)
-      Update()
-      return fs
-    end
-
-    local info = aliasPanel:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
-    info:SetPoint("TOP", aliasPanel, "TOP", 0, -18)
-    info:SetText("Enter ItemID Below")
-    SetFontStringSize(info, 15)
-
-    local itemEdit = CreateFrame("EditBox", nil, aliasPanel, "InputBoxTemplate")
-    itemEdit:SetSize(175, 38)
-    itemEdit:SetPoint("TOP", info, "BOTTOM", 0, -2)
-    itemEdit:SetAutoFocus(false)
-    itemEdit:SetJustifyH("CENTER")
-    if itemEdit.SetJustifyV then itemEdit:SetJustifyV("MIDDLE") end
-    itemEdit:SetTextInsets(6, 6, 0, 0)
-    SetEditFontSize(itemEdit, 16)
-    HideInputBoxTemplateArt(itemEdit)
-    itemEdit:SetNumeric(true)
-
-    local MODE_ITEM = "item"
-    local MODE_CURRENCY = "currency"
-
-    local modeBtn = CreateFrame("Button", nil, aliasPanel)
-    modeBtn:SetSize(18, 18)
-    modeBtn:SetPoint("RIGHT", itemEdit, "LEFT", -6, 0)
-    modeBtn:RegisterForClicks("LeftButtonUp")
-
-    local modeBtnText = modeBtn:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
-    modeBtnText:SetPoint("CENTER", modeBtn, "CENTER", 0, 0)
-    SetFontStringSize(modeBtnText, 16)
-
-    local function GetAliasInputMode()
-      EnsureDB()
-      local m = DB and DB.aliasInputMode
-      if m ~= MODE_ITEM and m ~= MODE_CURRENCY then
-        m = MODE_ITEM
-      end
-      return m
-    end
-
-    local function SetAliasInputMode(m)
-      EnsureDB()
-      if m ~= MODE_ITEM and m ~= MODE_CURRENCY then
-        m = MODE_ITEM
-      end
-      DB.aliasInputMode = m
-    end
-
-    local itemPH = aliasPanel:CreateFontString(nil, "OVERLAY", "GameFontDisable")
-    itemPH:SetPoint("CENTER", itemEdit, "CENTER", 0, 0)
-    itemPH:SetText("ItemID")
-    itemPH:SetTextColor(1, 1, 1, 0.35)
-    SetFontStringSize(itemPH, 13)
-
-    local function UpdateItemPlaceholder()
-      local txt = tostring(itemEdit:GetText() or "")
-      local hasText = (txt ~= "")
-      local focused = (itemEdit.HasFocus and itemEdit:HasFocus()) or false
-      itemPH:SetShown((not hasText) and (not focused))
-    end
-    itemEdit:SetScript("OnEditFocusGained", function() itemPH:Hide() end)
-    itemEdit:SetScript("OnEditFocusLost", function() UpdateItemPlaceholder() end)
-    itemEdit:HookScript("OnTextChanged", function() UpdateItemPlaceholder() end)
-    UpdateItemPlaceholder()
-
-    local nameLabel = aliasPanel:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
-    nameLabel:SetPoint("TOP", itemEdit, "BOTTOM", 0, -2)
-    nameLabel:SetPoint("LEFT", aliasPanel, "LEFT", 10, 0)
-    nameLabel:SetPoint("RIGHT", aliasPanel, "RIGHT", -10, 0)
-    nameLabel:SetJustifyH("CENTER")
-    nameLabel:SetWordWrap(true)
-    nameLabel:SetText("")
-    nameLabel:SetTextColor(1, 0.82, 0, 1)
-    SetFontStringSize(nameLabel, 17)
-
-    local renameEdit = CreateFrame("EditBox", nil, aliasPanel, "InputBoxTemplate")
-    renameEdit:SetSize(175, 38)
-    renameEdit:SetPoint("TOP", nameLabel, "BOTTOM", 0, -2)
-    renameEdit:SetAutoFocus(false)
-    renameEdit:SetJustifyH("CENTER")
-    if renameEdit.SetJustifyV then renameEdit:SetJustifyV("MIDDLE") end
-    renameEdit:SetTextInsets(6, 6, 0, 0)
-    SetEditFontSize(renameEdit, 16)
-    HideInputBoxTemplateArt(renameEdit)
-
-    local aliasPH = aliasPanel:CreateFontString(nil, "OVERLAY", "GameFontDisable")
-    aliasPH:SetPoint("CENTER", renameEdit, "CENTER", 0, 0)
-    aliasPH:SetText("Short Name Here")
-    aliasPH:SetTextColor(1, 1, 1, 0.35)
-    SetFontStringSize(aliasPH, 13)
-
-    local function UpdateAliasPlaceholder()
-      local txt = tostring(renameEdit:GetText() or "")
-      local hasText = (txt ~= "")
-      local focused = (renameEdit.HasFocus and renameEdit:HasFocus()) or false
-      aliasPH:SetShown((not hasText) and (not focused))
-    end
-    renameEdit:SetScript("OnEditFocusGained", function() aliasPH:Hide() end)
-    renameEdit:SetScript("OnEditFocusLost", function() UpdateAliasPlaceholder() end)
-    renameEdit:HookScript("OnTextChanged", function() UpdateAliasPlaceholder() end)
-    UpdateAliasPlaceholder()
-
-    local status = aliasPanel:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-    status:SetPoint("TOP", renameEdit, "BOTTOM", 0, -2)
-    status:SetPoint("LEFT", aliasPanel, "LEFT", 10, 0)
-    status:SetPoint("RIGHT", aliasPanel, "RIGHT", -10, 0)
-    status:SetJustifyH("CENTER")
-    status:SetTextColor(1, 0.55, 0.1, 1)
-    status:SetText("Type/Paste an ID above")
-    SetFontStringSize(status, 13)
-
-    local ignoreCB = CreateFrame("CheckButton", nil, aliasPanel, "UICheckButtonTemplate")
-    ignoreCB:SetPoint("BOTTOMLEFT", aliasPanel, "BOTTOMLEFT", 10, 44)
-    SetCheckBoxText(ignoreCB, "Ignore (hide from loot chat)")
-    ignoreCB:Disable()
-
-    local delayLabel = aliasPanel:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-    delayLabel:SetPoint("BOTTOMRIGHT", aliasPanel, "BOTTOMRIGHT", -140, 48)
-    delayLabel:SetText("Delay print (sec)")
-
-    local delayBox = CreateFrame("EditBox", nil, aliasPanel, "InputBoxTemplate")
-    delayBox:SetSize(54, 20)
-    delayBox:SetPoint("LEFT", delayLabel, "RIGHT", 8, -2)
-    delayBox:SetAutoFocus(false)
-    delayBox:SetJustifyH("CENTER")
-    delayBox:SetNumeric(true)
-    delayBox:SetText("0")
-    delayBox:Disable()
-
-    local BTN_W, BTN_H, BTN_GAP = 120, 22, 10
-    local ADD_ROW_X = (BTN_W / 2) + (BTN_GAP / 2)
-
-    local btnAcc = CreateFrame("Button", nil, aliasPanel, "UIPanelButtonTemplate")
-    btnAcc:SetSize(BTN_W, BTN_H)
-    btnAcc:SetPoint("BOTTOM", aliasPanel, "BOTTOM", -ADD_ROW_X, 18)
-    btnAcc:SetText("Account")
-    btnAcc:Disable()
-    btnAcc:RegisterForClicks("LeftButtonUp")
-
-    do
-      local fs = btnAcc.GetFontString and btnAcc:GetFontString()
-      if fs then
-        SetFontStringSize(fs, 13)
-      end
-    end
-
-    local btnChar = CreateFrame("Button", nil, aliasPanel, "UIPanelButtonTemplate")
-    btnChar:SetSize(BTN_W, BTN_H)
-    btnChar:SetPoint("BOTTOM", aliasPanel, "BOTTOM", ADD_ROW_X, 18)
-    btnChar:SetText("Character")
-    btnChar:Disable()
-    btnChar:RegisterForClicks("LeftButtonUp")
-
-    do
-      local fs = btnChar.GetFontString and btnChar:GetFontString()
-      if fs then
-        SetFontStringSize(fs, 13)
-      end
-    end
-
-    local function SetButtonColor(btn, label, color)
-      if not btn then return end
-      if color == "yellow" then
-        btn:SetText("|cffffff00" .. label .. "|r")
-      elseif color == "red" then
-        btn:SetText("|cffff0000" .. label .. "|r")
-      else
-        btn:SetText(label)
-      end
-    end
-
-    local function Trim(s)
-      s = tostring(s or "")
-      return s:gsub("^%s+", ""):gsub("%s+$", "")
-    end
-
-    local function GetValidID()
-      local txt = tostring(itemEdit:GetText() or "")
-      local n = tonumber(txt)
-      if n and n > 0 then
-        return n
-      end
-      return nil
-    end
-
-    local function SetNameLabelColorForItem(id)
-      if not id then
-        nameLabel:SetTextColor(1, 0.82, 0, 1)
-        return
-      end
-
-      local quality
-      if C_Item and C_Item.GetItemInfo then
-        local _, _, q = C_Item.GetItemInfo(id)
-        quality = q
-      end
-
-      if type(quality) == "number" then
-        local c = _G and rawget(_G, "ITEM_QUALITY_COLORS")
-        c = (type(c) == "table") and c[quality] or nil
-        if c and type(c.r) == "number" and type(c.g) == "number" and type(c.b) == "number" then
-          nameLabel:SetTextColor(c.r, c.g, c.b, 1)
-          return
-        end
-      end
-
-      nameLabel:SetTextColor(1, 0.82, 0, 1)
-    end
-
-    local function SetNameLabelColorForCurrency()
-      -- Rare blue
-      nameLabel:SetTextColor(0, 0.44, 0.87, 1)
-    end
-
-    local function GetDisplayNameForID(mode, id)
-      if not id then return nil end
-      if mode == MODE_CURRENCY then
-        if C_CurrencyInfo and C_CurrencyInfo.GetCurrencyInfo then
-          local info = C_CurrencyInfo.GetCurrencyInfo(id)
-          if info and type(info.name) == "string" and info.name ~= "" then
-            return info.name
-          end
-        end
-        return "CurrencyID: " .. tostring(id)
-      end
-
-      if C_Item and C_Item.GetItemInfo then
-        local name = C_Item.GetItemInfo(id)
-        if type(name) == "string" and name ~= "" then
-          return name
-        end
-      end
-      return "ItemID: " .. tostring(id)
-    end
-
-    local function GetAliasState(mode, id)
-      EnsureDB()
-
-      local out = {
-        char = { text = nil, disabled = false },
-        acc = { text = nil, disabled = false },
-        addon = { text = nil, disabled = false },
-      }
-
-      if mode == MODE_CURRENCY then
-        if CHARDB and type(CHARDB.currencyAliases) == "table" then
-          out.char.text = CHARDB.currencyAliases[id]
-        end
-        if CHARDB and type(CHARDB.currencyAliasDisabledChar) == "table" then
-          out.char.disabled = (CHARDB.currencyAliasDisabledChar[id] == true)
-        end
-
-        if DB and type(DB.currencyAliases) == "table" then
-          out.acc.text = DB.currencyAliases[id]
-        end
-        if DB and type(DB.currencyAliasDisabledAccount) == "table" then
-          out.acc.disabled = (DB.currencyAliasDisabledAccount[id] == true)
-        end
-
-        out.addon.text = ADDON_CURRENCY_ALIASES[id]
-        if DB and type(DB.currencyAliasDisabledAddon) == "table" then
-          out.addon.disabled = (DB.currencyAliasDisabledAddon[id] == true)
-        end
-      else
-        if CHARDB and type(CHARDB.linkAliases) == "table" then
-          out.char.text = CHARDB.linkAliases[id]
-        end
-        if CHARDB and type(CHARDB.linkAliasDisabledChar) == "table" then
-          out.char.disabled = (CHARDB.linkAliasDisabledChar[id] == true)
-        end
-
-        if DB and type(DB.linkAliases) == "table" then
-          out.acc.text = DB.linkAliases[id]
-        end
-        if DB and type(DB.linkAliasDisabledAccount) == "table" then
-          out.acc.disabled = (DB.linkAliasDisabledAccount[id] == true)
-        end
-
-        out.addon.text = ADDON_LINK_ALIASES[id]
-        if DB and type(DB.linkAliasDisabledAddon) == "table" then
-          out.addon.disabled = (DB.linkAliasDisabledAddon[id] == true)
-        end
-      end
-
-      return out
-    end
-
-    local function AnyAliasExists(st)
-      if not st then return false end
-      if type(st.acc.text) == "string" and st.acc.text ~= "" then return true end
-      if type(st.addon.text) == "string" and st.addon.text ~= "" then return true end
-      if type(st.char.text) == "string" and st.char.text ~= "" then return true end
-      return false
-    end
-
-    local function GetEffectiveAlias(mode, id)
-      local st = GetAliasState(mode, id)
-
-      -- Per-character disable suppresses all sources.
-      if st.char.disabled then
-        return nil, nil
-      end
-
-      if type(st.char.text) == "string" and st.char.text ~= "" then
-        return st.char.text, "Character"
-      end
-      if type(st.acc.text) == "string" and st.acc.text ~= "" and not st.acc.disabled then
-        return st.acc.text, "Account"
-      end
-      if type(st.addon.text) == "string" and st.addon.text ~= "" and not st.addon.disabled then
-        return st.addon.text, "Addon"
-      end
-
-      return nil, nil
-    end
-
-    local function GetEditSeedAlias(mode, id)
-      local st = GetAliasState(mode, id)
-      if type(st.acc.text) == "string" and st.acc.text ~= "" then
-        return st.acc.text, "Account"
-      end
-      if type(st.addon.text) == "string" and st.addon.text ~= "" then
-        return st.addon.text, "Addon"
-      end
-      if type(st.char.text) == "string" and st.char.text ~= "" then
-        return st.char.text, "Character"
-      end
-      return "", nil
-    end
-
-    local function SyncUI()
-      local mode = GetAliasInputMode()
-      aliasPanel._aliasMode = mode
-      local id = GetValidID()
-      aliasPanel._aliasID = id
-
-      if aliasPanel._aliasBaseline == nil then
-        aliasPanel._aliasBaseline = ""
-      end
-
-      if not id then
-        nameLabel:SetText("")
-        status:SetText("Type/Paste an ID above")
-        btnAcc:Disable()
-        btnChar:Disable()
-        ignoreCB:SetChecked(false)
-        ignoreCB:Disable()
-        delayBox:SetText("0")
-        delayBox:Disable()
-        SetButtonColor(btnAcc, "Account", nil)
-        SetButtonColor(btnChar, "Character", nil)
-        return
-      end
-
-      nameLabel:SetText(GetDisplayNameForID(mode, id) or "")
-      if mode == MODE_CURRENCY then
-        SetNameLabelColorForCurrency()
-      else
-        SetNameLabelColorForItem(id)
-      end
-
-      local st = GetAliasState(mode, id)
-      local exists = AnyAliasExists(st)
-
-      if mode == MODE_ITEM then
-        local ignored = (DB and type(DB.ignoredItemIDs) == "table" and DB.ignoredItemIDs[id] == true) and true or false
-        ignoreCB:SetChecked(ignored)
-        ignoreCB:Enable()
-
-        do
-          EnsureDB()
-          DB.delayPrint = (type(DB.delayPrint) == "table") and DB.delayPrint or {}
-          DB.delayPrint.itemSeconds = (type(DB.delayPrint.itemSeconds) == "table") and DB.delayPrint.itemSeconds or {}
-          local sec = tonumber(DB.delayPrint.itemSeconds[id]) or 0
-          if sec < 0 then sec = 0 end
-          if sec > 3600 then sec = 3600 end
-          delayBox:SetText(tostring(math.floor(sec + 0.5)))
-          delayBox:Enable()
-        end
-
-        if ignored then
-          status:SetText("Ignored: hidden (no chat output)")
-        end
-      else
-        ignoreCB:SetChecked(false)
-        ignoreCB:Disable()
-        delayBox:SetText("0")
-        delayBox:Disable()
-      end
-
-      local activeText, activeSource = GetEffectiveAlias(mode, id)
-      if activeText then
-        -- Keep status instructional; details are already visible via the name + alias box.
-      else
-      end
-
-      -- Seed rename box and baseline when not actively editing.
-      if not renameEdit:HasFocus() then
-        local seedText = select(1, GetEditSeedAlias(mode, id))
-        renameEdit:SetText(tostring(seedText or ""))
-        renameEdit:HighlightText()
-        aliasPanel._aliasBaseline = Trim(seedText)
-      end
-
-      local current = Trim(renameEdit:GetText())
-      local baseline = Trim(aliasPanel._aliasBaseline)
-      local edited = (current ~= baseline)
-
-      if not exists then
-        -- Input - Doesn't exist: Account Active / Character Inactive.
-        btnAcc:Enable()
-        btnChar:Disable()
-        SetButtonColor(btnAcc, "Account", nil)
-        SetButtonColor(btnChar, "Character", nil)
-        if not (mode == MODE_ITEM and ignoreCB:GetChecked()) then
-          status:SetText("Type an Alias, Click Account to Save")
-        end
-        return
-      end
-
-      if edited then
-        -- Alias edited: Account Yellow / Character Inactive.
-        btnAcc:Enable()
-        btnChar:Disable()
-        SetButtonColor(btnAcc, "Account", "yellow")
-        SetButtonColor(btnChar, "Character", nil)
-        if not (mode == MODE_ITEM and ignoreCB:GetChecked()) then
-          status:SetText("Click Account to Save")
-        end
-        return
-      end
-
-      -- Input - Exists, no edit: Account Red (remove from both), Character Red/Yellow (toggle char disable).
-      btnAcc:Enable()
-      btnChar:Enable()
-      SetButtonColor(btnAcc, "Account", "red")
-      SetButtonColor(btnChar, "Character", st.char.disabled and "yellow" or "red")
-
-      if st.char.disabled then
-        if not (mode == MODE_ITEM and ignoreCB:GetChecked()) then
-          status:SetText("Click Character to Enable, Account to Remove")
-        end
-      else
-        if not (mode == MODE_ITEM and ignoreCB:GetChecked()) then
-          status:SetText("Click Character to Disable, Account to Remove")
-        end
-      end
-    end
-
-    local function RemoveFromBoth(mode, id)
-      EnsureDB()
-      if not id then return end
-
-      if mode == MODE_CURRENCY then
-        DB.currencyAliases = (type(DB.currencyAliases) == "table") and DB.currencyAliases or {}
-        DB.currencyAliasDisabledAccount = (type(DB.currencyAliasDisabledAccount) == "table") and DB.currencyAliasDisabledAccount or {}
-        DB.currencyAliasDisabledAddon = (type(DB.currencyAliasDisabledAddon) == "table") and DB.currencyAliasDisabledAddon or {}
-
-        CHARDB.currencyAliases = (type(CHARDB.currencyAliases) == "table") and CHARDB.currencyAliases or {}
-        CHARDB.currencyAliasDisabledChar = (type(CHARDB.currencyAliasDisabledChar) == "table") and CHARDB.currencyAliasDisabledChar or {}
-
-        DB.currencyAliases[id] = nil
-        DB.currencyAliasDisabledAccount[id] = nil
-        CHARDB.currencyAliases[id] = nil
-        CHARDB.currencyAliasDisabledChar[id] = nil
-
-        if ADDON_CURRENCY_ALIASES and ADDON_CURRENCY_ALIASES[id] then
-          DB.currencyAliasDisabledAddon[id] = true
-        end
-
-        Print(PREFIX .. string.format("Alias removed (Currency): %d", id))
-      else
-        DB.linkAliases = (type(DB.linkAliases) == "table") and DB.linkAliases or {}
-        DB.linkAliasDisabledAccount = (type(DB.linkAliasDisabledAccount) == "table") and DB.linkAliasDisabledAccount or {}
-        DB.linkAliasDisabledAddon = (type(DB.linkAliasDisabledAddon) == "table") and DB.linkAliasDisabledAddon or {}
-
-        CHARDB.linkAliases = (type(CHARDB.linkAliases) == "table") and CHARDB.linkAliases or {}
-        CHARDB.linkAliasDisabledChar = (type(CHARDB.linkAliasDisabledChar) == "table") and CHARDB.linkAliasDisabledChar or {}
-
-        DB.linkAliases[id] = nil
-        DB.linkAliasDisabledAccount[id] = nil
-        CHARDB.linkAliases[id] = nil
-        CHARDB.linkAliasDisabledChar[id] = nil
-
-        if ADDON_LINK_ALIASES and ADDON_LINK_ALIASES[id] then
-          DB.linkAliasDisabledAddon[id] = true
-        end
-
-        Print(PREFIX .. string.format("Alias removed: %d", id))
-      end
-      aliasPanel._aliasBaseline = ""
-    end
-
-    local function SaveToAccount(mode, id)
-      EnsureDB()
-      if not id then return end
-
-      local txt = Trim(renameEdit:GetText())
-      if txt == "" then
-        RemoveFromBoth(mode, id)
-        return
-      end
-
-      if mode == MODE_CURRENCY then
-        DB.currencyAliases = (type(DB.currencyAliases) == "table") and DB.currencyAliases or {}
-        DB.currencyAliasDisabledAccount = (type(DB.currencyAliasDisabledAccount) == "table") and DB.currencyAliasDisabledAccount or {}
-        DB.currencyAliasDisabledAddon = (type(DB.currencyAliasDisabledAddon) == "table") and DB.currencyAliasDisabledAddon or {}
-
-        DB.currencyAliases[id] = txt
-        DB.currencyAliasDisabledAccount[id] = nil
-        DB.currencyAliasDisabledAddon[id] = nil
-
-        Print(PREFIX .. string.format("Alias set (Account, Currency): %d -> %s", id, txt))
-      else
-        DB.linkAliases = (type(DB.linkAliases) == "table") and DB.linkAliases or {}
-        DB.linkAliasDisabledAccount = (type(DB.linkAliasDisabledAccount) == "table") and DB.linkAliasDisabledAccount or {}
-        DB.linkAliasDisabledAddon = (type(DB.linkAliasDisabledAddon) == "table") and DB.linkAliasDisabledAddon or {}
-
-        DB.linkAliases[id] = txt
-        DB.linkAliasDisabledAccount[id] = nil
-        DB.linkAliasDisabledAddon[id] = nil
-
-        Print(PREFIX .. string.format("Alias set (Account): %d -> %s", id, txt))
-      end
-      aliasPanel._aliasBaseline = txt
-    end
-
-    local function ToggleCharDisable(mode, id)
-      EnsureDB()
-      if not id then return end
-
-      if mode == MODE_CURRENCY then
-        CHARDB.currencyAliasDisabledChar = (type(CHARDB.currencyAliasDisabledChar) == "table") and CHARDB.currencyAliasDisabledChar or {}
-        if CHARDB.currencyAliasDisabledChar[id] then
-          CHARDB.currencyAliasDisabledChar[id] = nil
-          Print(PREFIX .. string.format("Alias enabled (Character, Currency): %d", id))
-        else
-          CHARDB.currencyAliasDisabledChar[id] = true
-          Print(PREFIX .. string.format("Alias disabled (Character, Currency): %d", id))
-        end
-      else
-        CHARDB.linkAliasDisabledChar = (type(CHARDB.linkAliasDisabledChar) == "table") and CHARDB.linkAliasDisabledChar or {}
-        if CHARDB.linkAliasDisabledChar[id] then
-          CHARDB.linkAliasDisabledChar[id] = nil
-          Print(PREFIX .. string.format("Alias enabled (Character): %d", id))
-        else
-          CHARDB.linkAliasDisabledChar[id] = true
-          Print(PREFIX .. string.format("Alias disabled (Character): %d", id))
-        end
-      end
-    end
-
-    local function UpdateModeUI()
-      local mode = GetAliasInputMode()
-      if mode == MODE_CURRENCY then
-        info:SetText("Enter CurrencyID Below")
-        itemPH:SetText("CurrencyID")
-        modeBtnText:SetText("C")
-        modeBtnText:SetTextColor(0, 0.44, 0.87, 1)
-      else
-        info:SetText("Enter ItemID Below")
-        itemPH:SetText("ItemID")
-        modeBtnText:SetText("I")
-        modeBtnText:SetTextColor(0.64, 0.21, 0.93, 1)
-      end
-      itemEdit:SetText("")
-      renameEdit:SetText("")
-      aliasPanel._aliasBaseline = ""
-      UpdateItemPlaceholder()
-      UpdateAliasPlaceholder()
-    end
-
-    modeBtn:SetScript("OnClick", function()
-      local cur = GetAliasInputMode()
-      if cur == MODE_CURRENCY then
-        SetAliasInputMode(MODE_ITEM)
-      else
-        SetAliasInputMode(MODE_CURRENCY)
-      end
-      UpdateModeUI()
-      SyncUI()
-    end)
-
-    itemEdit:SetScript("OnEnterPressed", function(self)
-      self:ClearFocus()
-      SyncUI()
-    end)
-    itemEdit:SetScript("OnTextChanged", function()
-      SyncUI()
-    end)
-
-    renameEdit:SetScript("OnEnterPressed", function(self)
-      self:ClearFocus()
-      local id = aliasPanel._aliasID or GetValidID()
-      local mode = aliasPanel._aliasMode or GetAliasInputMode()
-      SaveToAccount(mode, id)
-      SyncUI()
-    end)
-
-    renameEdit:SetScript("OnTextChanged", function(self)
-      if self and self.HasFocus and self:HasFocus() then
-        SyncUI()
-      end
-    end)
-
-    ignoreCB:SetScript("OnClick", function(self)
-      local id = aliasPanel._aliasID or GetValidID()
-      local mode = aliasPanel._aliasMode or GetAliasInputMode()
-      if not (id and mode == MODE_ITEM) then
-        self:SetChecked(false)
-        self:Disable()
-        return
-      end
-
-      EnsureDB()
-      DB.ignoredItemIDs = (type(DB.ignoredItemIDs) == "table") and DB.ignoredItemIDs or {}
-      local on = self:GetChecked() and true or false
-      DB.ignoredItemIDs[id] = on and true or nil
-      Print(PREFIX .. string.format("Ignore %s: %d", on and "enabled" or "disabled", id))
-      SyncUI()
-    end)
-
-    delayBox:SetScript("OnEnterPressed", function(self)
-      self:ClearFocus()
-      local id = aliasPanel._aliasID or GetValidID()
-      local mode = aliasPanel._aliasMode or GetAliasInputMode()
-      if not (id and mode == MODE_ITEM) then
-        self:SetText("0")
-        self:Disable()
-        return
-      end
-
-      EnsureDB()
-      DB.delayPrint = (type(DB.delayPrint) == "table") and DB.delayPrint or {}
-      DB.delayPrint.itemSeconds = (type(DB.delayPrint.itemSeconds) == "table") and DB.delayPrint.itemSeconds or {}
-
-      local sec = tonumber(self:GetText() or "") or 0
-      if sec < 0 then sec = 0 end
-      if sec > 3600 then sec = 3600 end
-
-      if sec <= 0 then
-        DB.delayPrint.itemSeconds[id] = nil
-        Print(PREFIX .. string.format("Delay print: disabled (%d)", id))
-      else
-        DB.delayPrint.itemSeconds[id] = sec
-        Print(PREFIX .. string.format("Delay print: %ds (%d)", sec, id))
-      end
-
-      SyncUI()
-    end)
-
-    delayBox:SetScript("OnEscapePressed", function(self)
-      local id = aliasPanel._aliasID or GetValidID()
-      EnsureDB()
-      local sec = (DB and DB.delayPrint and DB.delayPrint.itemSeconds and id and tonumber(DB.delayPrint.itemSeconds[id])) or 0
-      if sec < 0 then sec = 0 end
-      if sec > 3600 then sec = 3600 end
-      self:SetText(tostring(math.floor(sec + 0.5)))
-      self:ClearFocus()
-    end)
-
-    btnAcc:SetScript("OnClick", function()
-      local id = aliasPanel._aliasID or GetValidID()
-      local mode = aliasPanel._aliasMode or GetAliasInputMode()
-      if not id then return end
-
-      local st = GetAliasState(mode, id)
-      local exists = AnyAliasExists(st)
-      local current = Trim(renameEdit:GetText())
-      local baseline = Trim(aliasPanel._aliasBaseline)
-      local edited = (current ~= baseline)
-
-      if (not exists) or edited then
-        SaveToAccount(mode, id)
-      else
-        RemoveFromBoth(mode, id)
-      end
-      SyncUI()
-    end)
-
-    btnChar:SetScript("OnClick", function()
-      local id = aliasPanel._aliasID or GetValidID()
-      local mode = aliasPanel._aliasMode or GetAliasInputMode()
-      if not id then return end
-
-      local st = GetAliasState(mode, id)
-      local exists = AnyAliasExists(st)
-      if not exists then return end
-
-      local current = Trim(renameEdit:GetText())
-      local baseline = Trim(aliasPanel._aliasBaseline)
-      local edited = (current ~= baseline)
-      if edited then return end
-
-      ToggleCharDisable(mode, id)
-      SyncUI()
-    end)
-
-    aliasPanel.Refresh = function()
-      EnsureDB()
-      UpdateModeUI()
-      SyncUI()
-    end
-
-    UpdateModeUI()
-    SyncUI()
-  end
-
-  -- Mail tab controls
-  mailNotifyLabel = mailPanel:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-  mailNotifyLabel:SetPoint("TOPLEFT", mailPanel, "TOPLEFT", 10, -10)
-  mailNotifyLabel:SetText("")
-  if mailNotifyLabel.Hide then mailNotifyLabel:Hide() end
-
-  mailNotifyModeBtn = CreateFrame("Button", nil, mailPanel, "UIPanelButtonTemplate")
-  mailNotifyModeBtn:SetSize(90, 20)
-  mailNotifyModeBtn:SetPoint("TOPRIGHT", mailPanel, "TOPRIGHT", -10, -6)
-  mailNotifyModeBtn:SetScript("OnClick", function()
-    local cur = GetMailNotifyMode()
-    local nextMode = (cur == "off") and "on" or ((cur == "on") and "acc" or "off")
-    SetMailNotifyMode(nextMode)
-    RefreshMailNotifyModeButton()
-  end)
-  RefreshMailNotifyModeButton()
-
-  mailCombatBtn = CreateFrame("Button", nil, mailPanel, "UIPanelButtonTemplate")
-  mailCombatBtn:SetSize(90, 20)
-  mailCombatBtn:SetPoint("RIGHT", mailNotifyModeBtn, "LEFT", -10, 0)
-  mailCombatBtn:SetScript("OnClick", function()
-    EnsureDB()
-    local mn = MailNotifyCfg()
-    if not mn then return end
-    local on = (mn.showInCombat ~= false)
-    mn.showInCombat = on and false or true
-    UpdateMailNotifier()
-    RefreshMailCombatButton()
-  end)
-  RefreshMailCombatButton()
-
-  -- Embedded mail model editor (replaces the old pop-out window).
-  local modelUI = CreateFrame("Frame", nil, mailPanel)
-  modelUI:SetPoint("TOPLEFT", mailPanel, "TOPLEFT", 8, -32)
-  modelUI:SetPoint("BOTTOMRIGHT", mailPanel, "BOTTOMRIGHT", -12, 8)
-  mailPanel.modelUI = modelUI
-
-  local preview = CreateFrame("DressUpModel", nil, modelUI)
-  preview:SetPoint("TOPLEFT", modelUI, "TOPLEFT", 2, 0)
-  preview:SetSize(190, 250)
-  modelUI.preview = preview
-
-  local RefreshViewControls
-
-  modelUI._repeatElapsed = 0
-  modelUI:SetScript("OnUpdate", function(self, elapsed)
-    EnsureDB()
-    local mnc = MailNotifyCfg()
-    if not (mnc and mnc.model) then return end
-    local spec = mnc.model
-    if not spec.animRepeat then return end
-
-    local interval = tonumber(spec.animRepeatSec) or 10
-    if interval < 0.5 then interval = 0.5 end
-    if interval > 3600 then interval = 3600 end
-
-    self._repeatElapsed = (self._repeatElapsed or 0) + (elapsed or 0)
-    if self._repeatElapsed < interval then return end
-    self._repeatElapsed = 0
-
-    local anim = tonumber(spec.anim) or 0
-    if preview then
-      ModelApplyAnimation(preview, anim)
-    end
-    if MailNotifier and MailNotifier.model then
-      ModelApplyAnimation(MailNotifier.model, anim)
-    end
-  end)
-
-  preview:EnableMouseWheel(true)
-  preview:SetScript("OnMouseWheel", function(self, delta)
-    EnsureDB()
-    local mnc = MailNotifyCfg()
-    if not mnc then return end
-    mnc.model = mnc.model or {}
-
-    if IsShiftKeyDown and IsShiftKeyDown() then
-      local r = tonumber(mnc.model.rotation) or ModelGetRotation(self) or 0
-      r = r + (delta * 0.20)
-      mnc.model.rotation = r
-      ModelSetRotation(self, r)
-    else
-      local z = tonumber(mnc.model.zoom)
-      if not z then z = 1.0 end
-      z = Clamp(z + (delta * 0.08), 0.20, 3.00)
-      mnc.model.zoom = z
-      ModelApplyZoom(self, z)
-    end
-  end)
-
-  local function NewPresetButton(text, npcID)
-    local b = CreateFrame("Button", nil, modelUI, "UIPanelButtonTemplate")
-    b:SetSize(110, 18)
-    b:SetText(text)
-    b:SetScript("OnClick", function()
-      EnsureDB()
-      local mnc = MailNotifyCfg()
-      if not mnc then return end
-      mnc.model = mnc.model or {}
-      mnc.model.kind = "npc"
-      mnc.model.id = npcID
-      modelUI.rPlayer:SetChecked(false)
-      modelUI.rNPC:SetChecked(true)
-      modelUI.rDisplay:SetChecked(false)
-      modelUI.rFile:SetChecked(false)
-      modelUI.idBox:SetEnabled(true)
-      modelUI.idBox:SetText(tostring(npcID))
-      ApplyMailModelToFrame(preview)
-      UpdateMailNotifier()
-    end)
-    return b
-  end
-
-  local kindLabel = modelUI:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-  kindLabel:SetPoint("TOPLEFT", preview, "TOPRIGHT", 12, 2)
-  kindLabel:SetText("Type")
-
-  local function NewRadio(text)
-    local r = CreateFrame("CheckButton", nil, modelUI, "UIRadioButtonTemplate")
-    SetCheckBoxText(r, text)
-    return r
-  end
-
-  local rPlayer = NewRadio("Player")
-  rPlayer:SetPoint("TOPLEFT", kindLabel, "BOTTOMLEFT", -2, -6)
-  local rNPC = NewRadio("NPCID")
-  rNPC:SetPoint("TOPLEFT", rPlayer, "BOTTOMLEFT", 0, -6)
-  local rDisplay = NewRadio("DisplayID")
-  rDisplay:SetPoint("TOPLEFT", rNPC, "BOTTOMLEFT", 0, -6)
-  local rFile = NewRadio("FileID")
-  rFile:SetPoint("TOPLEFT", rDisplay, "BOTTOMLEFT", 0, -6)
-  modelUI.rPlayer, modelUI.rNPC, modelUI.rDisplay, modelUI.rFile = rPlayer, rNPC, rDisplay, rFile
-
-  local idLabel = modelUI:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-  idLabel:SetPoint("LEFT", kindLabel, "RIGHT", 64, 0)
-  idLabel:SetText("ID")
-
-  local idBox = CreateFrame("EditBox", nil, modelUI, "InputBoxTemplate")
-  idBox:SetSize(110, 20)
-  idBox:SetPoint("LEFT", idLabel, "RIGHT", 8, 0)
-  idBox:SetAutoFocus(false)
-  idBox:SetJustifyH("CENTER")
-  modelUI.idBox = idBox
-
-  local presetKaty = NewPresetButton("Katy", 132969)
-  presetKaty:SetPoint("TOPLEFT", idBox, "BOTTOMLEFT", 0, -6)
-  local presetDalaran = NewPresetButton("Dalaran", 104230)
-  presetDalaran:SetPoint("TOPLEFT", presetKaty, "BOTTOMLEFT", 0, -4)
-  local presetPlagued = NewPresetButton("Plagued", 155971)
-  presetPlagued:SetPoint("TOPLEFT", presetDalaran, "BOTTOMLEFT", 0, -4)
-
-  local function GetKind()
-    if rNPC:GetChecked() then return "npc" end
-    if rDisplay:GetChecked() then return "display" end
-    if rFile:GetChecked() then return "file" end
-    return "player"
-  end
-
-  local function SetKind(kind)
-    kind = tostring(kind or "player"):lower()
-    rPlayer:SetChecked(kind == "player")
-    rNPC:SetChecked(kind == "npc" or kind == "creature")
-    rDisplay:SetChecked(kind == "display")
-    rFile:SetChecked(kind == "file")
-    idBox:SetEnabled(kind ~= "player")
-    if kind == "player" then
-      idBox:SetText("")
-    end
-  end
-
-  local function PreviewSpec()
-    EnsureDB()
-    local mnc = MailNotifyCfg()
-    if not mnc then return end
-    local spec = mnc.model or {}
-    local kind = GetKind()
-    local id = tonumber(idBox:GetText() or "")
-    spec.kind = kind
-    spec.id = (kind == "player") and nil or id
-    mnc.model = spec
-    ApplyMailModelToFrame(preview)
-  end
-
-  local function ApplyNotifierSizingAndAlpha()
-    EnsureDB()
-    local mnc = MailNotifyCfg()
-    if not mnc then return end
-    mnc.ui = mnc.ui or {}
-
-    local w = Clamp(mnc.ui.w or 200, 40, 600)
-    local h = Clamp(mnc.ui.h or 220, 40, 600)
-    local a = Clamp(mnc.ui.alpha or 0.5, 0.10, 1.00)
-    mnc.ui.w, mnc.ui.h, mnc.ui.alpha = w, h, a
-
-    local mn = MailNotifier or CreateMailNotifier()
-    if mn then
-      mn:SetSize(w, h)
-      if mn.model and mn.model.SetAlpha then
-        mn.model:SetAlpha(a)
-      end
-      if mnc.ui and mnc.ui.strata and mn.SetFrameStrata then
-        mn:SetFrameStrata(mnc.ui.strata)
-      end
-    end
-  end
-
-  local function OnRadioClick(self)
-    rPlayer:SetChecked(self == rPlayer)
-    rNPC:SetChecked(self == rNPC)
-    rDisplay:SetChecked(self == rDisplay)
-    rFile:SetChecked(self == rFile)
-    SetKind(GetKind())
-    PreviewSpec()
-  end
-
-  rPlayer:SetScript("OnClick", OnRadioClick)
-  rNPC:SetScript("OnClick", OnRadioClick)
-  rDisplay:SetScript("OnClick", OnRadioClick)
-  rFile:SetScript("OnClick", OnRadioClick)
-  idBox:SetScript("OnEnterPressed", function(self)
-    self:ClearFocus()
-    PreviewSpec()
-  end)
-
-  local apply = CreateFrame("Button", nil, modelUI, "UIPanelButtonTemplate")
-  apply:SetSize(90, 22)
-  apply:SetPoint("TOPLEFT", preview, "BOTTOMLEFT", 0, -8)
-  apply:SetText("Apply")
-  apply:SetScript("OnClick", function()
-    PreviewSpec()
-    UpdateMailNotifier()
-  end)
-
-  local reset = CreateFrame("Button", nil, modelUI, "UIPanelButtonTemplate")
-  reset:SetSize(90, 22)
-  reset:SetPoint("LEFT", apply, "RIGHT", 10, 0)
-  reset:SetText("Reset")
-  reset:SetScript("OnClick", function()
-    EnsureDB()
-    local mn = MailNotifyCfg()
-    if not mn then return end
-
-    -- Model defaults
-    mn.model = mn.model or {}
-    mn.model.kind = "npc"
-    mn.model.id = 104230
-    mn.model.anim = 0
-    mn.model.rotation = 0.15
-    mn.model.zoom = 0.9
-
-    -- View defaults
-    mn.ui = mn.ui or {}
-    mn.ui.w = 200
-    mn.ui.h = 220
-    mn.ui.alpha = 0.5
-    mn.ui.strata = "BACKGROUND"
-
-    mn.showInCombat = true
-
-    SetKind("npc")
-    if idBox and idBox.SetText then
-      idBox:SetText("104230")
-    end
-    ApplyMailModelToFrame(preview)
-    ApplyNotifierSizingAndAlpha()
-    UpdateMailNotifier()
-    if RefreshViewControls then RefreshViewControls() end
-  end)
-
-  -- Mail notifier mode + combat buttons are anchored at the top of the tab.
-
-  local viewContent = CreateFrame("Frame", nil, modelUI)
-  viewContent:SetPoint("TOPLEFT", rFile, "BOTTOMLEFT", -2, -10)
-  viewContent:SetPoint("BOTTOMRIGHT", modelUI, "BOTTOMRIGHT", -12, 64)
-
-  local viewLabel = viewContent:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-  viewLabel:SetPoint("TOPLEFT", viewContent, "TOPLEFT", 6, -4)
-  viewLabel:SetText("View")
-
-  local wLabel = viewContent:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-  wLabel:SetPoint("TOPLEFT", viewLabel, "BOTTOMLEFT", 0, -10)
-  wLabel:SetText("Notifier W/H")
-
-  local wBox = CreateFrame("EditBox", nil, viewContent, "InputBoxTemplate")
-  wBox:SetSize(46, 20)
-  wBox:SetPoint("LEFT", wLabel, "RIGHT", 10, 0)
-  wBox:SetAutoFocus(false)
-  wBox:SetJustifyH("CENTER")
-
-  local hBox = CreateFrame("EditBox", nil, viewContent, "InputBoxTemplate")
-  hBox:SetSize(46, 20)
-  hBox:SetPoint("LEFT", wBox, "RIGHT", 10, 0)
-  hBox:SetAutoFocus(false)
-  hBox:SetJustifyH("CENTER")
-
-  local applyWH = CreateFrame("Button", nil, viewContent, "UIPanelButtonTemplate")
-  applyWH:SetSize(54, 20)
-  applyWH:SetPoint("LEFT", hBox, "RIGHT", 10, 0)
-  applyWH:SetText("Set")
-
-  local alphaLabel = viewContent:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-  alphaLabel:SetPoint("TOPLEFT", wLabel, "BOTTOMLEFT", 0, -12)
-  alphaLabel:SetText("Alpha")
-
-  local alphaSlider = CreateFrame("Slider", "fr0z3nUI_LootIt_MailModelPickerAlpha", viewContent, "OptionsSliderTemplate")
-  alphaSlider:SetPoint("LEFT", alphaLabel, "RIGHT", 16, 0)
-  alphaSlider:SetWidth(170)
-  alphaSlider:SetMinMaxValues(0.10, 1.00)
-  alphaSlider:SetValueStep(0.05)
-  if alphaSlider.SetObeyStepOnDrag then alphaSlider:SetObeyStepOnDrag(true) end
-  _G[alphaSlider:GetName() .. "Low"]:SetText("0.1")
-  _G[alphaSlider:GetName() .. "High"]:SetText("1.0")
-  _G[alphaSlider:GetName() .. "Text"]:SetText(" ")
-
-  local strataLabel = viewContent:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-  strataLabel:SetPoint("TOPLEFT", alphaLabel, "BOTTOMLEFT", 0, -18)
-  strataLabel:SetText("Layer")
-
-  local strataDD = CreateFrame("Frame", "fr0z3nUI_LootIt_MailModelPickerStrata", viewContent, "UIDropDownMenuTemplate")
-  strataDD:SetPoint("LEFT", strataLabel, "RIGHT", -10, -2)
-  UIDropDownMenu_SetWidth(strataDD, 145)
-
-  local STRATA = {
-    { key = "BACKGROUND", text = "Background" },
-    { key = "LOW", text = "Low" },
-    { key = "MEDIUM", text = "Medium" },
-    { key = "HIGH", text = "High" },
-    { key = "DIALOG", text = "Dialog" },
-    { key = "FULLSCREEN", text = "Fullscreen" },
-    { key = "FULLSCREEN_DIALOG", text = "Fullscreen Dialog" },
-    { key = "TOOLTIP", text = "Tooltip" },
-  }
-
-  do
-    local mu = _G and rawget(_G, "MenuUtil")
-    if type(mu) == "table" and type(mu.CreateContextMenu) == "function" then
-      local anchor = strataDD.Button or strataDD
-      if anchor and anchor.SetScript then
-        anchor:SetScript("OnClick", function(btn)
-          mu.CreateContextMenu(btn, function(_, root)
-            if root and root.CreateTitle then root:CreateTitle("Layer") end
-            EnsureDB()
-            local mnc = MailNotifyCfg()
-            if not mnc then return end
-            mnc.ui = mnc.ui or {}
-            local selected = tostring(mnc.ui.strata or "")
-            for i, s in ipairs(STRATA) do
-              if root and root.CreateRadio then
-                root:CreateRadio(s.text, function() return selected == s.key end, function()
-                  EnsureDB()
-                  local mnc2 = MailNotifyCfg()
-                  if not mnc2 then return end
-                  mnc2.ui = mnc2.ui or {}
-                  mnc2.ui.strata = s.key
-                  if UIDropDownMenu_SetSelectedID then UIDropDownMenu_SetSelectedID(strataDD, i) end
-                  ApplyNotifierSizingAndAlpha()
-                  UpdateMailNotifier()
-                end)
-              elseif root and root.CreateButton then
-                root:CreateButton(s.text, function()
-                  EnsureDB()
-                  local mnc2 = MailNotifyCfg()
-                  if not mnc2 then return end
-                  mnc2.ui = mnc2.ui or {}
-                  mnc2.ui.strata = s.key
-                  if UIDropDownMenu_SetSelectedID then UIDropDownMenu_SetSelectedID(strataDD, i) end
-                  ApplyNotifierSizingAndAlpha()
-                  UpdateMailNotifier()
-                end)
-              end
-            end
-          end)
-        end)
-      end
-    else
-      UIDropDownMenu_Initialize(strataDD, function(_, level)
-        if level ~= 1 then return end
-        for i, s in ipairs(STRATA) do
-          local info = UIDropDownMenu_CreateInfo()
-          info.text = s.text
-          info.func = function()
-            EnsureDB()
-            local mnc = MailNotifyCfg()
-            if not mnc then return end
-            mnc.ui = mnc.ui or {}
-            mnc.ui.strata = s.key
-            UIDropDownMenu_SetSelectedID(strataDD, i)
-            ApplyNotifierSizingAndAlpha()
-            UpdateMailNotifier()
-          end
-          UIDropDownMenu_AddButton(info, level)
-        end
-      end)
-    end
-  end
-
-  local zoomLabel = viewContent:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-  zoomLabel:SetPoint("TOPLEFT", strataLabel, "BOTTOMLEFT", 0, -18)
-  zoomLabel:SetText("Zoom")
-
-  local zoomSlider = CreateFrame("Slider", "fr0z3nUI_LootIt_MailModelPickerZoom", viewContent, "OptionsSliderTemplate")
-  zoomSlider:SetPoint("LEFT", zoomLabel, "RIGHT", 18, 0)
-  zoomSlider:SetWidth(170)
-  zoomSlider:SetMinMaxValues(0.20, 3.00)
-  zoomSlider:SetValueStep(0.05)
-  if zoomSlider.SetObeyStepOnDrag then zoomSlider:SetObeyStepOnDrag(true) end
-  _G[zoomSlider:GetName() .. "Low"]:SetText("0.2")
-  _G[zoomSlider:GetName() .. "High"]:SetText("3.0")
-  _G[zoomSlider:GetName() .. "Text"]:SetText(" ")
-
-  local rotLabel = viewContent:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-  rotLabel:SetPoint("TOPLEFT", zoomLabel, "BOTTOMLEFT", 0, -18)
-  rotLabel:SetText("Rotate")
-
-  local rotLeft = CreateFrame("Button", nil, viewContent, "UIPanelButtonTemplate")
-  rotLeft:SetSize(30, 20)
-  rotLeft:SetPoint("LEFT", rotLabel, "RIGHT", 16, 0)
-  rotLeft:SetText("<")
-
-  local rotReset = CreateFrame("Button", nil, viewContent, "UIPanelButtonTemplate")
-  rotReset:SetSize(46, 20)
-  rotReset:SetPoint("LEFT", rotLeft, "RIGHT", 8, 0)
-  rotReset:SetText("Reset")
-
-  local rotRight = CreateFrame("Button", nil, viewContent, "UIPanelButtonTemplate")
-  rotRight:SetSize(30, 20)
-  rotRight:SetPoint("LEFT", rotReset, "RIGHT", 8, 0)
-  rotRight:SetText(">")
-
-  local actionLabel = viewContent:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-  actionLabel:SetPoint("TOPLEFT", rotLabel, "BOTTOMLEFT", 0, -12)
-  actionLabel:SetText("Action")
-
-  local actionPrev = CreateFrame("Button", nil, viewContent, "UIPanelButtonTemplate")
-  actionPrev:SetSize(30, 20)
-  actionPrev:SetPoint("LEFT", actionLabel, "RIGHT", 16, 0)
-  actionPrev:SetText("<")
-
-  local actionBox = CreateFrame("EditBox", nil, viewContent, "InputBoxTemplate")
-  actionBox:SetSize(46, 20)
-  actionBox:SetPoint("LEFT", actionPrev, "RIGHT", 8, 0)
-  actionBox:SetAutoFocus(false)
-  actionBox:SetJustifyH("CENTER")
-  actionBox:SetNumeric(true)
-  actionBox:SetText("0")
-
-  local actionNext = CreateFrame("Button", nil, viewContent, "UIPanelButtonTemplate")
-  actionNext:SetSize(30, 20)
-  actionNext:SetPoint("LEFT", actionBox, "RIGHT", 8, 0)
-  actionNext:SetText(">")
-
-  local actionRandom = CreateFrame("CheckButton", nil, viewContent, "UICheckButtonTemplate")
-  SetCheckBoxText(actionRandom, "")
-  if actionRandom.Text then actionRandom.Text:Hide() end
-  if actionRandom.text then actionRandom.text:Hide() end
-  actionRandom:SetSize(24, 24)
-  actionRandom:SetPoint("LEFT", actionNext, "RIGHT", 10, 0)
-
-  local randomLabel = viewContent:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-  randomLabel:SetPoint("LEFT", actionRandom, "RIGHT", 6, 0)
-  randomLabel:SetText("Random")
-
-  local repeatCB = CreateFrame("CheckButton", nil, viewContent, "UICheckButtonTemplate")
-  SetCheckBoxText(repeatCB, "")
-  if repeatCB.Text then repeatCB.Text:Hide() end
-  if repeatCB.text then repeatCB.text:Hide() end
-  repeatCB:SetSize(24, 24)
-
-  local repeatSecBox = CreateFrame("EditBox", nil, viewContent, "InputBoxTemplate")
-  repeatSecBox:SetSize(50, 20)
-  repeatSecBox:SetPoint("TOPLEFT", actionBox, "BOTTOMLEFT", 0, -10)
-  repeatSecBox:SetAutoFocus(false)
-  repeatSecBox:SetJustifyH("CENTER")
-  repeatSecBox:SetNumeric(true)
-  repeatSecBox:SetText("10")
-
-  repeatCB:SetPoint("RIGHT", repeatSecBox, "LEFT", -6, 0)
-
-  local repeatLabel = viewContent:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-  repeatLabel:SetPoint("LEFT", repeatSecBox, "RIGHT", 6, 0)
-  repeatLabel:SetText("sec. Repeat")
-
-  local mailTest = CreateFrame("Button", nil, modelUI, "UIPanelButtonTemplate")
-  mailTest:SetSize(110, 18)
-  mailTest:SetPoint("TOPLEFT", presetPlagued, "BOTTOMLEFT", 0, -6)
-  mailTest:SetText("Test")
-  mailTest:SetScript("OnClick", function()
-    EnsureDB()
-    local mf = CreateMailNotifier()
-    local mnc = MailNotifyCfg()
-    if not (mf and mnc and mnc.ui) then return end
-    if mnc.ui then
-      mf:ClearAllPoints()
-      mf:SetPoint(mnc.ui.point or "TOPRIGHT", UIParent, mnc.ui.point or "TOPRIGHT", mnc.ui.x or 0, mnc.ui.y or 0)
-    end
-    if (mnc.showInCombat == false) and InCombatLockdown and InCombatLockdown() then
-      mf:Hide()
-      Print("Mail notifier: hidden in combat.")
-      return
-    end
-    ApplyMailModelToFrame(mf.model)
-    mf:Show()
-    Print("Mail notifier: shown (test).")
-  end)
-
-  RefreshViewControls = function()
-    EnsureDB()
-    local mnc = MailNotifyCfg()
-    if not mnc then return end
-    mnc.ui = mnc.ui or {}
-    mnc.model = mnc.model or {}
-
-    local w = Clamp(mnc.ui.w or 200, 40, 600)
-    local h = Clamp(mnc.ui.h or 220, 40, 600)
-    local a = Clamp(mnc.ui.alpha or 0.5, 0.10, 1.00)
-    wBox:SetText(tostring(math.floor(w + 0.5)))
-    hBox:SetText(tostring(math.floor(h + 0.5)))
-    alphaSlider:SetValue(a)
-
-    local want = tostring(mnc.ui.strata or "BACKGROUND")
-    local selected = 1
-    for i, s in ipairs(STRATA) do
-      if s.key == want then selected = i break end
-    end
-    UIDropDownMenu_SetSelectedID(strataDD, selected)
-
-    local z = Clamp(mnc.model.zoom or 0.9, 0.20, 3.00)
-    zoomSlider:SetValue(z)
-
-    local anim = tonumber(mnc.model.anim) or 0
-    actionBox:SetText(tostring(anim))
-    SetCheckBoxChecked(actionRandom, mnc.model.animRandom)
-
-    local repeatOn = (mnc.model.animRepeat == true)
-    local sec = tonumber(mnc.model.animRepeatSec) or 10
-    if sec < 1 then sec = 1 end
-    if sec > 3600 then sec = 3600 end
-    repeatSecBox:SetText(tostring(math.floor(sec + 0.5)))
-    SetCheckBoxChecked(repeatCB, repeatOn)
-    repeatSecBox:SetEnabled(repeatOn)
-
-    local randomOn = (mnc.model.animRandom == true)
-    local allowManual = (not randomOn)
-    actionBox:SetEnabled(allowManual)
-    actionPrev:SetEnabled(allowManual)
-    actionNext:SetEnabled(allowManual)
-  end
-
-  applyWH:SetScript("OnClick", function()
-    EnsureDB()
-    local mnc = MailNotifyCfg()
-    if not mnc then return end
-    mnc.ui = mnc.ui or {}
-
-    mnc.ui.w = tonumber(wBox:GetText() or "") or mnc.ui.w or 200
-    mnc.ui.h = tonumber(hBox:GetText() or "") or mnc.ui.h or 220
-    ApplyNotifierSizingAndAlpha()
-    UpdateMailNotifier()
-    RefreshViewControls()
-  end)
-
-  wBox:SetScript("OnEnterPressed", function(self)
-    self:ClearFocus()
-    applyWH:Click()
-  end)
-  hBox:SetScript("OnEnterPressed", function(self)
-    self:ClearFocus()
-    applyWH:Click()
-  end)
-
-  alphaSlider:SetScript("OnValueChanged", function(_, v)
-    EnsureDB()
-    local mnc = MailNotifyCfg()
-    if not mnc then return end
-    mnc.ui = mnc.ui or {}
-    mnc.ui.alpha = Clamp(v, 0.10, 1.00)
-    ApplyNotifierSizingAndAlpha()
-    if preview and preview.SetAlpha then
-      preview:SetAlpha(mnc.ui.alpha)
-    end
-    UpdateMailNotifier()
-  end)
-
-  zoomSlider:SetScript("OnValueChanged", function(_, v)
-    EnsureDB()
-    local mnc = MailNotifyCfg()
-    if not mnc then return end
-    mnc.model = mnc.model or {}
-    mnc.model.zoom = Clamp(v, 0.20, 3.00)
-    ApplyMailModelToFrame(preview)
-    UpdateMailNotifier()
-  end)
-
-  local function NudgeRotation(dir)
-    EnsureDB()
-    local mnc = MailNotifyCfg()
-    if not mnc then return end
-    mnc.model = mnc.model or {}
-    local r = tonumber(mnc.model.rotation) or ModelGetRotation(preview) or 0
-    r = r + (dir * 0.20)
-    mnc.model.rotation = r
-    ModelSetRotation(preview, r)
-    UpdateMailNotifier()
-  end
-
-  rotLeft:SetScript("OnClick", function() NudgeRotation(-1) end)
-  rotRight:SetScript("OnClick", function() NudgeRotation(1) end)
-  rotReset:SetScript("OnClick", function()
-    EnsureDB()
-    local mnc = MailNotifyCfg()
-    if not mnc then return end
-    mnc.model = mnc.model or {}
-    mnc.model.rotation = 0
-    ModelSetRotation(preview, 0)
-    UpdateMailNotifier()
-  end)
-
-  local function SetAction(anim)
-    EnsureDB()
-    local mnc = MailNotifyCfg()
-    if not mnc then return end
-    mnc.model = mnc.model or {}
-    anim = tonumber(anim) or 0
-    if anim < 0 then anim = 0 end
-    if anim > 150 then anim = 0 end
-    mnc.model.animRandom = false
-    mnc.model.anim = anim
-    actionBox:SetText(tostring(anim))
-    SetCheckBoxChecked(actionRandom, false)
-    actionBox:SetEnabled(true)
-    actionPrev:SetEnabled(true)
-    actionNext:SetEnabled(true)
-    ModelApplyAnimation(preview, anim)
-    UpdateMailNotifier()
-  end
-
-  actionPrev:SetScript("OnClick", function()
-    EnsureDB()
-    local mnc = MailNotifyCfg()
-    local anim = tonumber(mnc and mnc.model and mnc.model.anim) or 0
-    SetAction(anim - 1)
-  end)
-
-  actionNext:SetScript("OnClick", function()
-    EnsureDB()
-    local mnc = MailNotifyCfg()
-    local anim = tonumber(mnc and mnc.model and mnc.model.anim) or 0
-    SetAction(anim + 1)
-  end)
-
-  actionBox:SetScript("OnEnterPressed", function(self)
-    self:ClearFocus()
-    SetAction(tonumber(self:GetText()) or 0)
-  end)
-
-  actionRandom:SetScript("OnClick", function(self)
-    EnsureDB()
-    local mnc = MailNotifyCfg()
-    if not mnc then return end
-    mnc.model = mnc.model or {}
-
-    local on = self:GetChecked() and true or false
-    mnc.model.animRandom = on
-
-    if on then
-      mnc.model.anim = math.random(0, 150)
-      actionBox:SetEnabled(false)
-      actionPrev:SetEnabled(false)
-      actionNext:SetEnabled(false)
-    else
-      local repeatOn = (mnc.model.animRepeat == true)
-      actionBox:SetEnabled(not repeatOn)
-      actionPrev:SetEnabled(not repeatOn)
-      actionNext:SetEnabled(not repeatOn)
-    end
-
-    ApplyMailModelToFrame(preview)
-    UpdateMailNotifier()
-    RefreshViewControls()
-  end)
-
-  repeatCB:SetScript("OnClick", function(self)
-    EnsureDB()
-    local mnc = MailNotifyCfg()
-    if not mnc then return end
-    mnc.model = mnc.model or {}
-
-    local on = self:GetChecked() and true or false
-    mnc.model.animRepeat = on
-    if mnc.model.animRepeatSec == nil then
-      mnc.model.animRepeatSec = 10
-    end
-
-    repeatSecBox:SetEnabled(on)
-    RefreshViewControls()
-  end)
-
-  repeatSecBox:SetScript("OnEnterPressed", function(self)
-    self:ClearFocus()
-    EnsureDB()
-    local mnc = MailNotifyCfg()
-    if not mnc then return end
-    mnc.model = mnc.model or {}
-
-    local sec = tonumber(self:GetText() or "") or 10
-    if sec < 1 then sec = 1 end
-    if sec > 3600 then sec = 3600 end
-    mnc.model.animRepeatSec = sec
-    RefreshViewControls()
-  end)
-
-  local hint = modelUI:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-  hint:SetPoint("BOTTOMLEFT", modelUI, "BOTTOMLEFT", 10, 10)
-  hint:SetPoint("BOTTOMRIGHT", modelUI, "BOTTOMRIGHT", -10, 10)
-  hint:SetJustifyH("CENTER")
-  hint:SetText("Shift-click uses Katy's Stampwhistle.")
-
-  modelUI.Refresh = function()
-    EnsureDB()
-    local mnc = MailNotifyCfg()
-    local spec = (mnc and mnc.model) or {}
-    SetKind(spec.kind or "player")
-    if spec.id then idBox:SetText(tostring(spec.id)) end
-    ApplyMailModelToFrame(preview)
-    ApplyNotifierSizingAndAlpha()
-    if RefreshViewControls then RefreshViewControls() end
-  end
-
-  frame:SetScript("OnShow", function(self)
-    EnsureDB()
-    do
-      local mode
-      if CHARDB and CHARDB.enabledOverride == true then
-        mode = "on"
-      elseif CHARDB and CHARDB.enabledOverride == false then
-        mode = "off"
-      elseif DB and DB.enabled then
-        mode = "acc"
-      else
-        mode = "off"
-      end
-      enableModeBtn:SetText((mode == "on") and "On" or ((mode == "acc") and "On Acc" or "Off"))
-    end
-    SetCheckBoxChecked(hide, DB.hideLootText)
-    SetCheckBoxChecked(echo, DB.echoItem)
-    SetCheckBoxChecked(selfName, DB.showSelfNameAlways)
-    RefreshIlvlButtons()
-    combineBox:SetText(tostring(DB.lootCombineCount or 1))
-    combineCur:SetOn(DB.lootCombineIncludeCurrency)
-    combineGold:SetOn(DB.lootCombineIncludeGold)
-    RefreshCombineModeButtons()
-    RefreshMailNotifyModeButton()
-    RefreshMailCombatButton()
-    RefreshMoneyButtons()
-    UIDropDownMenu_SetSelectedID(outputDD, DB.outputChatFrame or 1)
-    prefixBox:SetText(DB.echoPrefix or "")
-    if DB.ui then
-      self:ClearAllPoints()
-      self:SetPoint(DB.ui.point or "CENTER", UIParent, DB.ui.point or "CENTER", DB.ui.x or 0, DB.ui.y or 0)
-    end
-    SelectTab(self._activeTab or "loot")
-    if aliasPanel and aliasPanel.Refresh then
-      aliasPanel:Refresh()
-    end
-    if otherPanel and otherPanel.Refresh then
-      otherPanel:Refresh()
-    end
-    if mailPanel and mailPanel.modelUI and mailPanel.modelUI.Refresh then
-      mailPanel.modelUI:Refresh()
-    end
-    RefreshSupportedList()
-  end)
-
-  frame:SetScript("OnHide", function()
-    ApplyMailNotifierInteractivity()
-  end)
-
-  -- Default tab
-  SelectTab("loot")
-
-  frame:Hide()
-  ConfigUI = frame
-  return frame
+  return nil
 end
 
 local function ToggleConfigUI()
-  EnsureDB()
-  local frame = CreateConfigUI()
-  if frame:IsShown() then
-    frame:Hide()
-  else
-    frame:Show()
+  local ui = LI and LI.UI
+  if ui and ui.ToggleConfigUI then
+    return ui.ToggleConfigUI()
   end
 end
 
-local MailModelPicker
-
-local function Clamp(v, minV, maxV)
-  if v == nil then return minV end
-  v = tonumber(v)
-  if not v then return minV end
-  if minV and v < minV then return minV end
-  if maxV and v > maxV then return maxV end
-  return v
-end
-
-local MAIL_TOY_KATY_STAMPWHISTLE = 156833
-
-local function FormatCooldown(seconds)
-  seconds = tonumber(seconds) or 0
-  if seconds <= 0 then return "0s" end
-  if SecondsToTime then
-    return SecondsToTime(seconds)
-  end
-  local m = math.floor(seconds / 60)
-  local s = math.floor(seconds % 60)
-  if m > 0 then
-    return string.format("%dm %ds", m, s)
-  end
-  return string.format("%ds", s)
-end
-
-local function TryUseKatyStampwhistle()
-  local id = MAIL_TOY_KATY_STAMPWHISTLE
-
-  if PlayerHasToy and not PlayerHasToy(id) then
-    Print("You don't have Katy's Stampwhistle.")
-    return
-  end
-
-  local start, duration, enable
-  if C_ToyBox and C_ToyBox.GetToyCooldown then
-    start, duration, enable = C_ToyBox.GetToyCooldown(id)
-  end
-
-  if enable == 1 and start and duration and duration > 0 then
-    local remaining = (start + duration) - (GetTime and GetTime() or 0)
-    if remaining and remaining > 0.25 then
-      Print("Katy is busy rn, try again in [" .. FormatCooldown(remaining) .. "]")
-      return
-    end
-  end
-
-  if C_ToyBox and C_ToyBox.IsToyUsable and not C_ToyBox.IsToyUsable(id) then
-    -- Can be unusable due to being indoors, etc.
-    Print("Katy is not usable right now.")
-    return
-  end
-
-  if UseToy then
-    UseToy(id)
-  elseif C_ToyBox and C_ToyBox.UseToy then
-    C_ToyBox.UseToy(id)
-  else
-    Print("Cannot use toys on this client.")
+do
+  local ui = LI and LI.UI
+  if ui and type(ui.SetEnv) == "function" then
+    ui.SetEnv({
+      EnsureDB = EnsureDB,
+      GetDB = function() return DB end,
+      GetCharDB = function() return CHARDB end,
+      ApplyFilters = ApplyFilters,
+      LootCombineCancelTimers = LootCombineCancelTimers,
+      LootCombineFlush = LootCombineFlush,
+      SetCheckBoxText = SetCheckBoxText,
+      SetCheckBoxChecked = SetCheckBoxChecked,
+      GetSupportedMessageLines = GetSupportedMessageLines,
+      MailNotifyCfg = MailNotifyCfg,
+      Clamp = Clamp,
+      Print = Print,
+      ApplyMailNotifierInteractivity = (LI and LI.Mail and LI.Mail.ApplyMailNotifierInteractivity) or nil,
+      CreateMailNotifier = (LI and LI.Mail and LI.Mail.CreateMailNotifier) or nil,
+      UpdateMailNotifier = (LI and LI.Mail and LI.Mail.UpdateMailNotifier) or nil,
+      ApplyMailModelToFrame = (LI and LI.Mail and LI.Mail.ApplyMailModelToFrame) or nil,
+      ModelApplyAnimation = (LI and LI.Mail and LI.Mail.ModelApplyAnimation) or nil,
+      ModelGetRotation = (LI and LI.Mail and LI.Mail.ModelGetRotation) or nil,
+      ModelSetRotation = (LI and LI.Mail and LI.Mail.ModelSetRotation) or nil,
+      ModelApplyZoom = (LI and LI.Mail and LI.Mail.ModelApplyZoom) or nil,
+      GetMailNotifier = (LI and LI.Mail and LI.Mail.GetMailNotifier) or nil,
+    })
   end
 end
 
-ApplyMailNotifierInteractivity = function()
-  if not MailNotifier then return end
-  local pickerOpen = IsMailEditorOpen()
-  local shiftDown = (IsShiftKeyDown and IsShiftKeyDown()) and true or false
-  local interactive = pickerOpen or shiftDown
+do
+  local mail = LI and LI.Mail
+  if mail and type(mail.SetNotifierEnv) == "function" then
+    mail.SetNotifierEnv({
+      EnsureDB = EnsureDB,
+      MailNotifyCfg = MailNotifyCfg,
+      IsMailNotifierEnabled = IsMailNotifierEnabled,
+      IsMailEditorOpen = IsMailEditorOpen,
+      ToggleConfigUI = ToggleConfigUI,
+      Print = Print,
+    })
 
-  -- Clickthrough unless holding Shift, except when the picker is open (always interactive then).
-  MailNotifier:EnableMouse(true)
-  if MailNotifier.SetMouseClickEnabled then
-    local ok = pcall(MailNotifier.SetMouseClickEnabled, MailNotifier, interactive)
-    if not ok then
-      pcall(MailNotifier.SetMouseClickEnabled, MailNotifier, "LeftButton", interactive)
-      pcall(MailNotifier.SetMouseClickEnabled, MailNotifier, "RightButton", interactive)
-    end
-  elseif MailNotifier.SetPropagateMouseClicks then
-    pcall(MailNotifier.SetPropagateMouseClicks, MailNotifier, not interactive)
-  else
-    MailNotifier:EnableMouse(interactive)
+    ApplyMailNotifierInteractivity = mail.ApplyMailNotifierInteractivity
+    ModelGetRotation = mail.ModelGetRotation
+    ModelSetRotation = mail.ModelSetRotation
+    ModelApplyZoom = mail.ModelApplyZoom
+    ModelApplyAnimation = mail.ModelApplyAnimation
+    ApplyMailModelToFrame = mail.ApplyMailModelToFrame
+    CreateMailNotifier = mail.CreateMailNotifier
+    UpdateMailNotifier = mail.UpdateMailNotifier
   end
-
-  -- Lock movement when the editor is closed.
-  if not pickerOpen then
-    MailNotifier:SetMovable(false)
-    MailNotifier:RegisterForDrag()
-  else
-    MailNotifier:SetMovable(true)
-    MailNotifier:RegisterForDrag("LeftButton")
-  end
-end
-
-ModelGetRotation = function(modelFrame)
-  if not modelFrame then return 0 end
-  if modelFrame.GetFacing then
-    return modelFrame:GetFacing() or 0
-  end
-  if modelFrame.GetRotation then
-    return modelFrame:GetRotation() or 0
-  end
-  return 0
-end
-
-ModelSetRotation = function(modelFrame, rotation)
-  if not modelFrame then return end
-  rotation = tonumber(rotation) or 0
-  if modelFrame.SetFacing then
-    modelFrame:SetFacing(rotation)
-    return
-  end
-  if modelFrame.SetRotation then
-    modelFrame:SetRotation(rotation)
-    return
-  end
-end
-
-ModelApplyZoom = function(modelFrame, zoom)
-  if not modelFrame then return end
-  zoom = tonumber(zoom)
-  if not zoom then return end
-
-  -- Retail APIs differ across model frame types; try most common ones first.
-  if modelFrame.SetCamDistanceScale then
-    modelFrame:SetCamDistanceScale(zoom)
-    return
-  end
-  if modelFrame.SetPortraitZoom then
-    modelFrame:SetPortraitZoom(zoom)
-    return
-  end
-  if modelFrame.SetModelScale then
-    modelFrame:SetModelScale(zoom)
-    return
-  end
-end
-
-ModelApplyAnimation = function(modelFrame, anim)
-  if not modelFrame then return end
-  anim = tonumber(anim)
-  if anim == nil then return end
-  if modelFrame.SetAnimation then
-    modelFrame:SetAnimation(anim)
-  end
-end
-
-ApplyMailModelToFrame = function(modelFrame)
-  if not modelFrame then return end
-  EnsureDB()
-  local mnc = MailNotifyCfg()
-  local spec = mnc and mnc.model or nil
-  local kind = tostring((spec and spec.kind) or "npc"):lower()
-  local id = (spec and spec.id) or ((kind == "npc" or kind == "creature") and 104230) or nil
-
-  if modelFrame.ClearModel then modelFrame:ClearModel() end
-
-  if kind == "player" then
-    if modelFrame.SetUnit then
-      modelFrame:SetUnit("player")
-    end
-  elseif kind == "display" then
-    local displayID = tonumber(id)
-    if displayID and modelFrame.SetDisplayInfo then
-      modelFrame:SetDisplayInfo(displayID)
-    end
-  elseif kind == "file" then
-    local fileID = tonumber(id)
-    if fileID and modelFrame.SetModelByFileID then
-      modelFrame:SetModelByFileID(fileID)
-    end
-  elseif kind == "npc" or kind == "creature" then
-    local npcID = tonumber(id)
-    if npcID and modelFrame.SetCreature then
-      modelFrame:SetCreature(npcID)
-    end
-  end
-
-  local rotation = spec and tonumber(spec.rotation)
-  if rotation then
-    ModelSetRotation(modelFrame, rotation)
-  end
-  local zoom = spec and tonumber(spec.zoom)
-  if zoom then
-    ModelApplyZoom(modelFrame, zoom)
-  end
-
-  local anim = spec and tonumber(spec.anim)
-  if anim ~= nil then
-    ModelApplyAnimation(modelFrame, anim)
-  end
-
-  local a = mnc and mnc.ui and tonumber(mnc.ui.alpha)
-  if a and modelFrame.SetAlpha then
-    modelFrame:SetAlpha(Clamp(a, 0.10, 1.00))
-  end
-end
-
-CreateMailNotifier = function()
-  if MailNotifier then return MailNotifier end
-
-  EnsureDB()
-  local mnc = MailNotifyCfg()
-  if not mnc then return end
-  mnc.ui = mnc.ui or {}
-  local w = Clamp(mnc.ui.w or 200, 40, 600)
-  local h = Clamp(mnc.ui.h or 220, 40, 600)
-  local a = Clamp(mnc.ui.alpha or 0.5, 0.10, 1.00)
-  mnc.ui.w, mnc.ui.h, mnc.ui.alpha = w, h, a
-
-  -- Minimal notifier: just the model.
-  local frame = CreateFrame("Frame", "fr0z3nUI_LootIt_MailNotifier", UIParent)
-  frame:SetSize(w, h)
-  frame:SetFrameStrata(mnc.ui.strata or "BACKGROUND")
-  if frame.SetAlpha then frame:SetAlpha(1) end
-  frame:SetClampedToScreen(true)
-  frame:SetMovable(true)
-
-  frame:EnableMouse(true)
-  frame:RegisterForDrag("LeftButton")
-  frame:SetScript("OnDragStart", function(self)
-    if not IsMailEditorOpen() then return end
-    self:StartMoving()
-  end)
-  frame:SetScript("OnDragStop", function(self)
-    self:StopMovingOrSizing()
-    EnsureDB()
-    local mnc = MailNotifyCfg()
-    if not mnc then return end
-    mnc.ui = mnc.ui or {}
-    local point, _, _, x, y = self:GetPoint(1)
-    mnc.ui.point = point or "TOPRIGHT"
-    mnc.ui.x = x or 0
-    mnc.ui.y = y or 0
-  end)
-
-  local model = CreateFrame("DressUpModel", nil, frame)
-  model:SetAllPoints(frame)
-  if model.EnableMouse then model:EnableMouse(false) end
-  ApplyMailModelToFrame(model)
-  if model.SetAlpha then
-    model:SetAlpha(a)
-  end
-  frame.model = model
-
-  frame:SetScript("OnMouseUp", function(_, button)
-    if not (IsShiftKeyDown and IsShiftKeyDown()) then return end
-    if button == "LeftButton" then
-      TryUseKatyStampwhistle()
-    elseif button == "RightButton" then
-      ToggleConfigUI()
-    end
-  end)
-
-  frame:HookScript("OnShow", function(self)
-    EnsureDB()
-    local mnc = MailNotifyCfg()
-    if not mnc then return end
-    if (mnc.showInCombat == false) and InCombatLockdown and InCombatLockdown() then
-      self:Hide()
-    end
-  end)
-
-  frame:EnableMouseWheel(true)
-  frame:SetScript("OnMouseWheel", function(self, delta)
-    if not self.model then return end
-    EnsureDB()
-    local mnc = MailNotifyCfg()
-    if not mnc then return end
-    mnc.model = mnc.model or {}
-
-    if IsShiftKeyDown and IsShiftKeyDown() then
-      local r = tonumber(mnc.model.rotation) or ModelGetRotation(self.model) or 0
-      r = r + (delta * 0.20)
-      mnc.model.rotation = r
-      ModelSetRotation(self.model, r)
-    else
-      local z = tonumber(mnc.model.zoom)
-      if not z then z = 1.0 end
-      z = Clamp(z + (delta * 0.08), 0.20, 3.00)
-      mnc.model.zoom = z
-      ModelApplyZoom(self.model, z)
-    end
-  end)
-
-  frame._lastShiftDown = nil
-  frame._repeatElapsed = 0
-  frame:SetScript("OnUpdate", function(self, elapsed)
-    local s = (IsShiftKeyDown and IsShiftKeyDown()) and true or false
-    if self._lastShiftDown ~= s then
-      self._lastShiftDown = s
-      ApplyMailNotifierInteractivity()
-    end
-
-    -- Repeat action tick (only when the editor is NOT open; editor drives repeat when open).
-    if IsMailEditorOpen() then return end
-
-    EnsureDB()
-    local mnc = MailNotifyCfg()
-    if not (mnc and mnc.model) then return end
-    local spec = mnc.model
-    if not spec.animRepeat then return end
-
-    local interval = tonumber(spec.animRepeatSec) or 10
-    if interval < 0.5 then interval = 0.5 end
-    if interval > 3600 then interval = 3600 end
-
-    self._repeatElapsed = (self._repeatElapsed or 0) + (elapsed or 0)
-    if self._repeatElapsed < interval then return end
-    self._repeatElapsed = 0
-
-    local anim = tonumber(spec.anim) or 0
-    if self.model then
-      ModelApplyAnimation(self.model, anim)
-    end
-  end)
-
-  ApplyMailNotifierInteractivity()
-
-  frame:Hide()
-  MailNotifier = frame
-  return frame
-end
-
-UpdateMailNotifier = function()
-  EnsureDB()
-  if not (DB and DB.mailNotify and IsMailNotifierEnabled()) then
-    if MailNotifier then MailNotifier:Hide() end
-    return
-  end
-
-  local frame = CreateMailNotifier()
-  local mn = MailNotifyCfg()
-  if not (frame and mn) then
-    if MailNotifier then MailNotifier:Hide() end
-    return
-  end
-  if mn and mn.ui then
-    frame:ClearAllPoints()
-    frame:SetPoint(mn.ui.point or "TOPRIGHT", UIParent, mn.ui.point or "TOPRIGHT", mn.ui.x or 0, mn.ui.y or 0)
-    local w = Clamp(mn.ui.w or frame:GetWidth() or 200, 40, 600)
-    local h = Clamp(mn.ui.h or frame:GetHeight() or 220, 40, 600)
-    local currentAlpha = (frame.model and frame.model.GetAlpha and frame.model:GetAlpha()) or 1
-    local a = Clamp(mn.ui.alpha or currentAlpha, 0.10, 1.00)
-    mn.ui.w, mn.ui.h, mn.ui.alpha = w, h, a
-    frame:SetSize(w, h)
-    if frame.model and frame.model.SetAlpha then
-      frame.model:SetAlpha(a)
-    end
-    frame:SetFrameStrata(mn.ui.strata or frame:GetFrameStrata() or "BACKGROUND")
-  end
-
-  ApplyMailNotifierInteractivity()
-
-  if (mn and mn.showInCombat == false) and InCombatLockdown and InCombatLockdown() then
-    frame:Hide()
-    return
-  end
-
-  local has = false
-  if HasNewMail then
-    has = HasNewMail() and true or false
-  end
-
-  if has then
-    -- If random action is enabled, roll only when mail first appears.
-    frame._hadMail = (frame._hadMail == true)
-    if not frame._hadMail then
-      frame._hadMail = true
-      if mn and mn.model and mn.model.animRandom then
-        mn.model.anim = math.random(0, 150)
-      end
-    end
-
-    ApplyMailModelToFrame(frame.model)
-    frame:Show()
-  else
-    frame._hadMail = false
-    frame:Hide()
-  end
-end
-
-OpenMailModelPicker = function()
-  EnsureDB()
-
-  if not MailModelPicker then
-    local frame = CreateFrame("Frame", "fr0z3nUI_LootIt_MailModelPicker", UIParent, "BasicFrameTemplateWithInset")
-    frame:SetSize(560, 390)
-    frame:SetFrameStrata("DIALOG")
-    if frame.SetClampedToScreen then frame:SetClampedToScreen(true) end
-    frame:SetMovable(true)
-    frame:EnableMouse(true)
-    frame:RegisterForDrag("LeftButton")
-    frame:SetScript("OnDragStart", frame.StartMoving)
-    frame:SetScript("OnDragStop", frame.StopMovingOrSizing)
-
-    frame.TitleText:SetText("LootIt Mail Model")
-
-    local preview = CreateFrame("DressUpModel", nil, frame)
-    preview:SetPoint("TOPLEFT", frame.InsetBg, "TOPLEFT", 10, -10)
-    preview:SetSize(190, 270)
-    frame.preview = preview
-
-    local RefreshViewControls
-
-    frame._repeatElapsed = 0
-    frame:SetScript("OnUpdate", function(self, elapsed)
-      EnsureDB()
-      local mnc = MailNotifyCfg()
-      if not (mnc and mnc.model) then return end
-      local spec = mnc.model
-      if not spec.animRepeat then return end
-
-      local interval = tonumber(spec.animRepeatSec) or 10
-      if interval < 0.5 then interval = 0.5 end
-      if interval > 3600 then interval = 3600 end
-
-      self._repeatElapsed = (self._repeatElapsed or 0) + (elapsed or 0)
-      if self._repeatElapsed < interval then return end
-      self._repeatElapsed = 0
-
-      local anim = tonumber(spec.anim) or 0
-      if preview then
-        ModelApplyAnimation(preview, anim)
-      end
-      if MailNotifier and MailNotifier.model then
-        ModelApplyAnimation(MailNotifier.model, anim)
-      end
-    end)
-
-    preview:EnableMouseWheel(true)
-    preview:SetScript("OnMouseWheel", function(self, delta)
-      EnsureDB()
-      local mnc = MailNotifyCfg()
-      if not mnc then return end
-      mnc.model = mnc.model or {}
-
-      if IsShiftKeyDown and IsShiftKeyDown() then
-        local r = tonumber(mnc.model.rotation) or ModelGetRotation(self) or 0
-        r = r + (delta * 0.20)
-        mnc.model.rotation = r
-        ModelSetRotation(self, r)
-      else
-        local z = tonumber(mnc.model.zoom)
-        if not z then z = 1.0 end
-        z = Clamp(z + (delta * 0.08), 0.20, 3.00)
-        mnc.model.zoom = z
-        ModelApplyZoom(self, z)
-      end
-    end)
-
-    local function NewPresetButton(text, npcID)
-      local b = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
-      b:SetSize(110, 18)
-      b:SetText(text)
-      b:SetScript("OnClick", function()
-        EnsureDB()
-        local mnc = MailNotifyCfg()
-        if not mnc then return end
-        mnc.model = mnc.model or {}
-        mnc.model.kind = "npc"
-        mnc.model.id = npcID
-        frame.rPlayer:SetChecked(false)
-        frame.rNPC:SetChecked(true)
-        frame.rDisplay:SetChecked(false)
-        frame.rFile:SetChecked(false)
-        frame.idBox:SetEnabled(true)
-        frame.idBox:SetText(tostring(npcID))
-        ApplyMailModelToFrame(preview)
-        UpdateMailNotifier()
-      end)
-      return b
-    end
-
-    -- Type + ID (left column) anchored next to the model.
-    local kindLabel = frame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-    kindLabel:SetPoint("TOPLEFT", preview, "TOPRIGHT", 12, -4)
-    kindLabel:SetText("Type")
-
-    local function NewRadio(text)
-      local r = CreateFrame("CheckButton", nil, frame, "UIRadioButtonTemplate")
-      SetCheckBoxText(r, text)
-      return r
-    end
-
-    local rPlayer = NewRadio("Player")
-    rPlayer:SetPoint("TOPLEFT", kindLabel, "BOTTOMLEFT", -2, -8)
-    local rNPC = NewRadio("NPCID")
-    rNPC:SetPoint("TOPLEFT", rPlayer, "BOTTOMLEFT", 0, -6)
-    local rDisplay = NewRadio("DisplayID")
-    rDisplay:SetPoint("TOPLEFT", rNPC, "BOTTOMLEFT", 0, -6)
-    local rFile = NewRadio("FileID")
-    rFile:SetPoint("TOPLEFT", rDisplay, "BOTTOMLEFT", 0, -6)
-    frame.rPlayer, frame.rNPC, frame.rDisplay, frame.rFile = rPlayer, rNPC, rDisplay, rFile
-
-    -- ID box up next to Type label.
-    local idLabel = frame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-    idLabel:SetPoint("LEFT", kindLabel, "RIGHT", 64, 0)
-    idLabel:SetText("ID")
-
-    local idBox = CreateFrame("EditBox", nil, frame, "InputBoxTemplate")
-    idBox:SetSize(110, 20)
-    idBox:SetPoint("LEFT", idLabel, "RIGHT", 8, 0)
-    idBox:SetAutoFocus(false)
-    idBox:SetJustifyH("CENTER")
-    frame.idBox = idBox
-
-    -- Presets (no Defaults label): right column under the ID box.
-    local presetKaty = NewPresetButton("Katy", 132969)
-    presetKaty:SetPoint("TOPLEFT", idBox, "BOTTOMLEFT", 0, -6)
-    local presetDalaran = NewPresetButton("Dalaran", 104230)
-    presetDalaran:SetPoint("TOPLEFT", presetKaty, "BOTTOMLEFT", 0, -4)
-    local presetPlagued = NewPresetButton("Plagued", 155971)
-    presetPlagued:SetPoint("TOPLEFT", presetDalaran, "BOTTOMLEFT", 0, -4)
-
-    local function GetKind()
-      if rNPC:GetChecked() then return "npc" end
-      if rDisplay:GetChecked() then return "display" end
-      if rFile:GetChecked() then return "file" end
-      return "player"
-    end
-
-    local function SetKind(kind)
-      kind = tostring(kind or "player"):lower()
-      rPlayer:SetChecked(kind == "player")
-      rNPC:SetChecked(kind == "npc" or kind == "creature")
-      rDisplay:SetChecked(kind == "display")
-      rFile:SetChecked(kind == "file")
-      idBox:SetEnabled(kind ~= "player")
-      if kind == "player" then
-        idBox:SetText("")
-      end
-    end
-
-    local function Preview()
-      EnsureDB()
-      local mnc = MailNotifyCfg()
-      if not mnc then return end
-      local spec = mnc.model or {}
-      local kind = GetKind()
-      local id = tonumber(idBox:GetText() or "")
-      spec.kind = kind
-      spec.id = (kind == "player") and nil or id
-      mnc.model = spec
-      ApplyMailModelToFrame(preview)
-    end
-
-    -- Defaults list moved next to viewer.
-
-    local function ApplyNotifierSizingAndAlpha()
-      EnsureDB()
-      local mnc = MailNotifyCfg()
-      if not mnc then return end
-      mnc.ui = mnc.ui or {}
-
-      local w = Clamp(mnc.ui.w or 200, 40, 600)
-      local h = Clamp(mnc.ui.h or 220, 40, 600)
-      local a = Clamp(mnc.ui.alpha or 0.5, 0.10, 1.00)
-      mnc.ui.w, mnc.ui.h, mnc.ui.alpha = w, h, a
-
-      local mn = MailNotifier or CreateMailNotifier()
-      if mn then
-        mn:SetSize(w, h)
-        if mn.model and mn.model.SetAlpha then
-          mn.model:SetAlpha(a)
-        end
-        if mnc.ui and mnc.ui.strata and mn.SetFrameStrata then
-          mn:SetFrameStrata(mnc.ui.strata)
-        end
-      end
-    end
-
-    local function OnRadioClick(self)
-      rPlayer:SetChecked(self == rPlayer)
-      rNPC:SetChecked(self == rNPC)
-      rDisplay:SetChecked(self == rDisplay)
-      rFile:SetChecked(self == rFile)
-      SetKind(GetKind())
-      Preview()
-    end
-
-    rPlayer:SetScript("OnClick", OnRadioClick)
-    rNPC:SetScript("OnClick", OnRadioClick)
-    rDisplay:SetScript("OnClick", OnRadioClick)
-    rFile:SetScript("OnClick", OnRadioClick)
-    idBox:SetScript("OnEnterPressed", function(self)
-      self:ClearFocus()
-      Preview()
-    end)
-
-    local apply = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
-    apply:SetSize(90, 22)
-    apply:SetPoint("BOTTOMLEFT", frame.InsetBg, "BOTTOMLEFT", 10, 34)
-    apply:SetText("Apply")
-    apply:SetScript("OnClick", function()
-      Preview()
-      UpdateMailNotifier()
-    end)
-
-    local reset = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
-    reset:SetSize(90, 22)
-    reset:SetPoint("LEFT", apply, "RIGHT", 10, 0)
-    reset:SetText("Reset")
-    reset:SetScript("OnClick", function()
-      EnsureDB()
-      local mnc = MailNotifyCfg()
-      if not mnc then return end
-
-      -- Model defaults
-      mnc.model = mnc.model or {}
-      mnc.model.kind = "npc"
-      mnc.model.id = 104230
-      mnc.model.anim = 0
-      mnc.model.rotation = 0.15
-      mnc.model.zoom = 0.9
-
-      -- View defaults
-      mnc.ui = mnc.ui or {}
-      mnc.ui.w = 200
-      mnc.ui.h = 220
-      mnc.ui.alpha = 0.5
-      mnc.ui.strata = "BACKGROUND"
-
-      mnc.showInCombat = true
-
-      SetKind("npc")
-      if idBox and idBox.SetText then
-        idBox:SetText("104230")
-      end
-      ApplyMailModelToFrame(preview)
-      ApplyNotifierSizingAndAlpha()
-      UpdateMailNotifier()
-      if RefreshViewControls then RefreshViewControls() end
-    end)
-
-    -- View controls live inside the window, right of the preview.
-    local viewContent = CreateFrame("Frame", nil, frame)
-    viewContent:SetPoint("TOPLEFT", rFile, "BOTTOMLEFT", -2, -14)
-    viewContent:SetPoint("BOTTOMRIGHT", frame.InsetBg, "BOTTOMRIGHT", -10, 58)
-
-    local viewLabel = viewContent:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-    viewLabel:SetPoint("TOPLEFT", viewContent, "TOPLEFT", 6, -4)
-    viewLabel:SetText("View")
-
-    local wLabel = viewContent:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    wLabel:SetPoint("TOPLEFT", viewLabel, "BOTTOMLEFT", 0, -10)
-    wLabel:SetText("Notifier W/H")
-
-    local wBox = CreateFrame("EditBox", nil, viewContent, "InputBoxTemplate")
-    wBox:SetSize(46, 20)
-    wBox:SetPoint("LEFT", wLabel, "RIGHT", 10, 0)
-    wBox:SetAutoFocus(false)
-    wBox:SetJustifyH("CENTER")
-
-    local hBox = CreateFrame("EditBox", nil, viewContent, "InputBoxTemplate")
-    hBox:SetSize(46, 20)
-    hBox:SetPoint("LEFT", wBox, "RIGHT", 10, 0)
-    hBox:SetAutoFocus(false)
-    hBox:SetJustifyH("CENTER")
-
-    local applyWH = CreateFrame("Button", nil, viewContent, "UIPanelButtonTemplate")
-    applyWH:SetSize(54, 20)
-    applyWH:SetPoint("LEFT", hBox, "RIGHT", 10, 0)
-    applyWH:SetText("Set")
-
-    local alphaLabel = viewContent:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    alphaLabel:SetPoint("TOPLEFT", wLabel, "BOTTOMLEFT", 0, -12)
-    alphaLabel:SetText("Alpha")
-
-    local alphaSlider = CreateFrame("Slider", "fr0z3nUI_LootIt_MailModelPickerAlpha", viewContent, "OptionsSliderTemplate")
-    alphaSlider:SetPoint("LEFT", alphaLabel, "RIGHT", 16, 0)
-    alphaSlider:SetWidth(200)
-    alphaSlider:SetMinMaxValues(0.10, 1.00)
-    alphaSlider:SetValueStep(0.05)
-    if alphaSlider.SetObeyStepOnDrag then alphaSlider:SetObeyStepOnDrag(true) end
-    _G[alphaSlider:GetName() .. "Low"]:SetText("0.1")
-    _G[alphaSlider:GetName() .. "High"]:SetText("1.0")
-    _G[alphaSlider:GetName() .. "Text"]:SetText(" ")
-
-    local strataLabel = viewContent:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    strataLabel:SetPoint("TOPLEFT", alphaLabel, "BOTTOMLEFT", 0, -18)
-    strataLabel:SetText("Layer")
-
-    local strataDD = CreateFrame("Frame", "fr0z3nUI_LootIt_MailModelPickerStrata", viewContent, "UIDropDownMenuTemplate")
-    strataDD:SetPoint("LEFT", strataLabel, "RIGHT", -10, -2)
-    UIDropDownMenu_SetWidth(strataDD, 160)
-
-    local STRATA = {
-      { key = "BACKGROUND", text = "Background" },
-      { key = "LOW", text = "Low" },
-      { key = "MEDIUM", text = "Medium" },
-      { key = "HIGH", text = "High" },
-      { key = "DIALOG", text = "Dialog" },
-      { key = "FULLSCREEN", text = "Fullscreen" },
-      { key = "FULLSCREEN_DIALOG", text = "Fullscreen Dialog" },
-      { key = "TOOLTIP", text = "Tooltip" },
-    }
-
-    UIDropDownMenu_Initialize(strataDD, function(_, level)
-      if level ~= 1 then return end
-      for i, s in ipairs(STRATA) do
-        local info = UIDropDownMenu_CreateInfo()
-        info.text = s.text
-        info.func = function()
-          EnsureDB()
-          local mnc = MailNotifyCfg()
-          if not mnc then return end
-          mnc.ui = mnc.ui or {}
-          mnc.ui.strata = s.key
-          UIDropDownMenu_SetSelectedID(strataDD, i)
-          ApplyNotifierSizingAndAlpha()
-          UpdateMailNotifier()
-        end
-        UIDropDownMenu_AddButton(info, level)
-      end
-    end)
-
-    local zoomLabel = viewContent:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    zoomLabel:SetPoint("TOPLEFT", strataLabel, "BOTTOMLEFT", 0, -18)
-    zoomLabel:SetText("Zoom")
-
-    local zoomSlider = CreateFrame("Slider", "fr0z3nUI_LootIt_MailModelPickerZoom", viewContent, "OptionsSliderTemplate")
-    zoomSlider:SetPoint("LEFT", zoomLabel, "RIGHT", 18, 0)
-    zoomSlider:SetWidth(200)
-    zoomSlider:SetMinMaxValues(0.20, 3.00)
-    zoomSlider:SetValueStep(0.05)
-    if zoomSlider.SetObeyStepOnDrag then zoomSlider:SetObeyStepOnDrag(true) end
-    _G[zoomSlider:GetName() .. "Low"]:SetText("0.2")
-    _G[zoomSlider:GetName() .. "High"]:SetText("3.0")
-    _G[zoomSlider:GetName() .. "Text"]:SetText(" ")
-
-    local rotLabel = viewContent:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    rotLabel:SetPoint("TOPLEFT", zoomLabel, "BOTTOMLEFT", 0, -18)
-    rotLabel:SetText("Rotate")
-
-    local rotLeft = CreateFrame("Button", nil, viewContent, "UIPanelButtonTemplate")
-    rotLeft:SetSize(30, 20)
-    rotLeft:SetPoint("LEFT", rotLabel, "RIGHT", 16, 0)
-    rotLeft:SetText("<")
-
-    local rotRight = CreateFrame("Button", nil, viewContent, "UIPanelButtonTemplate")
-    rotRight:SetSize(30, 20)
-    rotRight:SetPoint("LEFT", rotLeft, "RIGHT", 6, 0)
-    rotRight:SetText(">")
-
-    local rotReset = CreateFrame("Button", nil, viewContent, "UIPanelButtonTemplate")
-    rotReset:SetSize(54, 20)
-    rotReset:SetPoint("LEFT", rotRight, "RIGHT", 10, 0)
-    rotReset:SetText("Reset")
-
-    local actionLabel = viewContent:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    actionLabel:SetPoint("TOPLEFT", rotLabel, "BOTTOMLEFT", 0, -12)
-    actionLabel:SetText("Action")
-
-    local actionPrev = CreateFrame("Button", nil, viewContent, "UIPanelButtonTemplate")
-    actionPrev:SetSize(30, 20)
-    actionPrev:SetPoint("LEFT", actionLabel, "RIGHT", 16, 0)
-    actionPrev:SetText("<")
-
-    local actionBox = CreateFrame("EditBox", nil, viewContent, "InputBoxTemplate")
-    actionBox:SetSize(46, 20)
-    actionBox:SetPoint("LEFT", actionPrev, "RIGHT", 8, 0)
-    actionBox:SetAutoFocus(false)
-    actionBox:SetJustifyH("CENTER")
-    actionBox:SetNumeric(true)
-    actionBox:SetText("0")
-
-    local actionNext = CreateFrame("Button", nil, viewContent, "UIPanelButtonTemplate")
-    actionNext:SetSize(30, 20)
-    actionNext:SetPoint("LEFT", actionBox, "RIGHT", 8, 0)
-    actionNext:SetText(">")
-
-    local actionRandom = CreateFrame("CheckButton", nil, viewContent, "UICheckButtonTemplate")
-    SetCheckBoxText(actionRandom, "Random")
-    actionRandom:SetPoint("LEFT", actionNext, "RIGHT", 12, 0)
-
-    local repeatCB = CreateFrame("CheckButton", nil, viewContent, "UICheckButtonTemplate")
-    SetCheckBoxText(repeatCB, "Repeat")
-    repeatCB:SetPoint("TOPLEFT", actionRandom, "BOTTOMLEFT", 0, -8)
-
-    local repeatSecBox = CreateFrame("EditBox", nil, viewContent, "InputBoxTemplate")
-    repeatSecBox:SetSize(46, 20)
-    repeatSecBox:SetPoint("TOPLEFT", actionBox, "BOTTOMLEFT", 0, -10)
-    repeatSecBox:SetAutoFocus(false)
-    repeatSecBox:SetJustifyH("CENTER")
-    repeatSecBox:SetNumeric(true)
-    repeatSecBox:SetText("10")
-
-    local repeatSecLabel = viewContent:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    repeatSecLabel:SetPoint("LEFT", repeatSecBox, "RIGHT", 6, 0)
-    repeatSecLabel:SetText("sec")
-
-    RefreshViewControls = function()
-      EnsureDB()
-      local mnc = MailNotifyCfg()
-      if not mnc then return end
-      mnc.ui = mnc.ui or {}
-      mnc.model = mnc.model or {}
-
-      local w = Clamp(mnc.ui.w or 200, 40, 600)
-      local h = Clamp(mnc.ui.h or 220, 40, 600)
-      local a = Clamp(mnc.ui.alpha or 0.5, 0.10, 1.00)
-      wBox:SetText(tostring(math.floor(w + 0.5)))
-      hBox:SetText(tostring(math.floor(h + 0.5)))
-      alphaSlider:SetValue(a)
-
-      local want = tostring(mnc.ui.strata or "BACKGROUND")
-      local selected = 1
-      for i, s in ipairs(STRATA) do
-        if s.key == want then selected = i break end
-      end
-      UIDropDownMenu_SetSelectedID(strataDD, selected)
-
-      local z = Clamp(mnc.model.zoom or 0.9, 0.20, 3.00)
-      zoomSlider:SetValue(z)
-
-      local anim = tonumber(mnc.model.anim) or 0
-      actionBox:SetText(tostring(anim))
-      SetCheckBoxChecked(actionRandom, mnc.model.animRandom)
-
-      local repeatOn = (mnc.model.animRepeat == true)
-      local sec = tonumber(mnc.model.animRepeatSec) or 10
-      if sec < 1 then sec = 1 end
-      if sec > 3600 then sec = 3600 end
-      repeatSecBox:SetText(tostring(math.floor(sec + 0.5)))
-      SetCheckBoxChecked(repeatCB, repeatOn)
-      repeatSecBox:SetEnabled(repeatOn)
-
-      local randomOn = (mnc.model.animRandom == true)
-      local allowManual = (not randomOn)
-      actionBox:SetEnabled(allowManual)
-      actionPrev:SetEnabled(allowManual)
-      actionNext:SetEnabled(allowManual)
-    end
-
-    applyWH:SetScript("OnClick", function()
-      EnsureDB()
-      local mnc = MailNotifyCfg()
-      if not mnc then return end
-      mnc.ui = mnc.ui or {}
-
-      mnc.ui.w = tonumber(wBox:GetText() or "") or mnc.ui.w or 200
-      mnc.ui.h = tonumber(hBox:GetText() or "") or mnc.ui.h or 220
-      ApplyNotifierSizingAndAlpha()
-      UpdateMailNotifier()
-      RefreshViewControls()
-    end)
-
-    wBox:SetScript("OnEnterPressed", function(self)
-      self:ClearFocus()
-      applyWH:Click()
-    end)
-    hBox:SetScript("OnEnterPressed", function(self)
-      self:ClearFocus()
-      applyWH:Click()
-    end)
-
-    alphaSlider:SetScript("OnValueChanged", function(_, v)
-      EnsureDB()
-      local mnc = MailNotifyCfg()
-      if not mnc then return end
-      mnc.ui = mnc.ui or {}
-      mnc.ui.alpha = Clamp(v, 0.10, 1.00)
-      ApplyNotifierSizingAndAlpha()
-      if preview and preview.SetAlpha then
-        preview:SetAlpha(mnc.ui.alpha)
-      end
-      UpdateMailNotifier()
-    end)
-
-    zoomSlider:SetScript("OnValueChanged", function(_, v)
-      EnsureDB()
-      local mnc = MailNotifyCfg()
-      if not mnc then return end
-      mnc.model = mnc.model or {}
-      mnc.model.zoom = Clamp(v, 0.20, 3.00)
-      ApplyMailModelToFrame(preview)
-      UpdateMailNotifier()
-    end)
-
-    local function NudgeRotation(dir)
-      EnsureDB()
-      local mnc = MailNotifyCfg()
-      if not mnc then return end
-      mnc.model = mnc.model or {}
-      local r = tonumber(mnc.model.rotation) or ModelGetRotation(preview) or 0
-      r = r + (dir * 0.20)
-      mnc.model.rotation = r
-      ModelSetRotation(preview, r)
-      UpdateMailNotifier()
-    end
-
-    rotLeft:SetScript("OnClick", function() NudgeRotation(-1) end)
-    rotRight:SetScript("OnClick", function() NudgeRotation(1) end)
-    rotReset:SetScript("OnClick", function()
-      EnsureDB()
-      local mnc = MailNotifyCfg()
-      if not mnc then return end
-      mnc.model = mnc.model or {}
-      mnc.model.rotation = 0
-      ModelSetRotation(preview, 0)
-      UpdateMailNotifier()
-    end)
-
-    local function SetAction(anim)
-      EnsureDB()
-      local mnc = MailNotifyCfg()
-      if not mnc then return end
-      mnc.model = mnc.model or {}
-      anim = tonumber(anim) or 0
-      if anim < 0 then anim = 0 end
-      if anim > 150 then anim = 0 end
-      mnc.model.animRandom = false
-      mnc.model.anim = anim
-      actionBox:SetText(tostring(anim))
-      SetCheckBoxChecked(actionRandom, false)
-      actionBox:SetEnabled(true)
-      actionPrev:SetEnabled(true)
-      actionNext:SetEnabled(true)
-      ModelApplyAnimation(preview, anim)
-      UpdateMailNotifier()
-    end
-
-    actionPrev:SetScript("OnClick", function()
-      EnsureDB()
-      local mnc = MailNotifyCfg()
-      local anim = tonumber(mnc and mnc.model and mnc.model.anim) or 0
-      SetAction(anim - 1)
-    end)
-
-    actionNext:SetScript("OnClick", function()
-      EnsureDB()
-      local mnc = MailNotifyCfg()
-      local anim = tonumber(mnc and mnc.model and mnc.model.anim) or 0
-      SetAction(anim + 1)
-    end)
-
-    actionBox:SetScript("OnEnterPressed", function(self)
-      self:ClearFocus()
-      SetAction(tonumber(self:GetText()) or 0)
-    end)
-
-    actionRandom:SetScript("OnClick", function(self)
-      EnsureDB()
-      local mnc = MailNotifyCfg()
-      if not mnc then return end
-      mnc.model = mnc.model or {}
-
-      local on = self:GetChecked() and true or false
-      mnc.model.animRandom = on
-
-      if on then
-        mnc.model.anim = math.random(0, 150)
-        actionBox:SetEnabled(false)
-        actionPrev:SetEnabled(false)
-        actionNext:SetEnabled(false)
-      else
-        local repeatOn = (mnc.model.animRepeat == true)
-        actionBox:SetEnabled(not repeatOn)
-        actionPrev:SetEnabled(not repeatOn)
-        actionNext:SetEnabled(not repeatOn)
-      end
-
-      ApplyMailModelToFrame(preview)
-      UpdateMailNotifier()
-      RefreshViewControls()
-    end)
-
-    repeatCB:SetScript("OnClick", function(self)
-      EnsureDB()
-      local mnc = MailNotifyCfg()
-      if not mnc then return end
-      mnc.model = mnc.model or {}
-
-      local on = self:GetChecked() and true or false
-      mnc.model.animRepeat = on
-      if mnc.model.animRepeatSec == nil then
-        mnc.model.animRepeatSec = 10
-      end
-
-      repeatSecBox:SetEnabled(on)
-
-      -- Repeat does not affect Random; it just re-applies the current action.
-      RefreshViewControls()
-    end)
-
-    repeatSecBox:SetScript("OnEnterPressed", function(self)
-      self:ClearFocus()
-      EnsureDB()
-      local mnc = MailNotifyCfg()
-      if not mnc then return end
-      mnc.model = mnc.model or {}
-
-      local sec = tonumber(self:GetText() or "") or 10
-      if sec < 1 then sec = 1 end
-      if sec > 3600 then sec = 3600 end
-      mnc.model.animRepeatSec = sec
-      RefreshViewControls()
-    end)
-
-    local hint = frame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-    hint:SetPoint("BOTTOMLEFT", frame.InsetBg, "BOTTOMLEFT", 10, 12)
-    hint:SetPoint("BOTTOMRIGHT", frame.InsetBg, "BOTTOMRIGHT", -10, 12)
-    hint:SetJustifyH("LEFT")
-    hint:SetText("Shift-click uses Katy's Stampwhistle.")
-
-    frame:SetScript("OnShow", function(self)
-      EnsureDB()
-      local mnc = MailNotifyCfg()
-      local spec = (mnc and mnc.model) or {}
-      SetKind(spec.kind or "player")
-      if spec.id then idBox:SetText(tostring(spec.id)) end
-      ApplyMailModelToFrame(preview)
-      ApplyNotifierSizingAndAlpha()
-      RefreshViewControls()
-      ApplyMailNotifierInteractivity()
-    end)
-
-    frame:SetScript("OnHide", function()
-      ApplyMailNotifierInteractivity()
-    end)
-
-    frame:Hide()
-    MailModelPicker = frame
-  end
-
-  if MailModelPicker:IsShown() then
-    MailModelPicker:Hide()
-  else
-    if MailModelPicker.ClearAllPoints and ConfigUI and ConfigUI.IsShown and ConfigUI:IsShown() then
-      MailModelPicker:ClearAllPoints()
-      MailModelPicker:SetPoint("TOPLEFT", ConfigUI, "TOPRIGHT", 12, -20)
-    end
-    MailModelPicker:Show()
-    if MailModelPicker.Raise then MailModelPicker:Raise() end
-    if ConfigUI and ConfigUI.GetFrameLevel and MailModelPicker.SetFrameLevel then
-      MailModelPicker:SetFrameLevel(ConfigUI:GetFrameLevel() + 20)
-    end
-  end
-
-  ApplyMailNotifierInteractivity()
 end
 
 SLASH_FR0Z3NUI_LOOTIT1 = "/fli"
 SLASH_FR0Z3NUI_LOOTIT2 = "/lootit"
+
+do
+  local uiv = LI and LI.UIV
+  if uiv and type(uiv.SetEnv) == "function" then
+    uiv.SetEnv({
+      EnsureDB = EnsureDB,
+      GetDB = function() return DB end,
+      GetCharDB = function() return CHARDB end,
+      IsEnabled = IsEnabled,
+      ToggleConfigUI = ToggleConfigUI,
+      CreateConfigUI = CreateConfigUI,
+      RunDeposit = RunDeposit,
+      ApplyFilters = ApplyFilters,
+      LootCombineEnabled = LootCombineEnabled,
+      CaptureAppend = CaptureAppend,
+      Print = Print,
+      PREFIX = PREFIX,
+      MailNotifyCfg = MailNotifyCfg,
+      UpdateMailNotifier = UpdateMailNotifier,
+      CreateMailNotifier = CreateMailNotifier,
+      ApplyMailModelToFrame = ApplyMailModelToFrame,
+    })
+  end
+end
+
+---@diagnostic disable-next-line: duplicate-set-field
 SlashCmdList.FR0Z3NUI_LOOTIT = function(msg)
+  local uiv = LI and LI.UIV
+  if uiv and type(uiv.Handle) == "function" then
+    return uiv.Handle(msg)
+  end
+
   EnsureDB()
-  msg = tostring(msg or "")
-  local cmd, rest = msg:match("^(%S+)%s*(.-)$")
-  cmd = (cmd and cmd:lower()) or ""
-
-  local function Status()
-    local mode
-    if CHARDB and CHARDB.enabledOverride == true then
-      mode = "on"
-    elseif CHARDB and CHARDB.enabledOverride == false then
-      mode = "off"
-    elseif DB and DB.enabled then
-      mode = "acc"
-    else
-      mode = "off"
-    end
-    local e = (IsEnabled() and "on" or "off")
-    local h = (DB.hideLootText and "on" or "off")
-    local x = (DB.echoItem and "on" or "off")
-    Print(string.format("enabled=%s (%s), hide=%s, echo=%s", e, (mode == "acc") and "acc" or "char", h, x))
-  end
-
-  if cmd == "" then
-    ToggleConfigUI()
-    return
-  end
-
-  if cmd == "?" or cmd == "help" then
-    Print("/fli - open options")
-    Print("/fli on|off|toggle")
-    Print("/fli hide on|off")
-    Print("/fli echo on|off")
-    Print("/fli selfname on|off")
-    Print("/fli prefix <text>|default (leave blank to clear)")
-    Print("/fli ignore <itemID>")
-    Print("/fli tabard swap")
-    Print("/fli tabard debug")
-    Print("/fli mail on|off|toggle|test")
-    Print("/fli mail model player")
-    Print("/fli mail model katy")
-    Print("/fli mail model dalaran")
-    Print("/fli mail model plagued")
-    Print("/fli mail model npc <id>")
-    Print("/fli mail model display <id>")
-    Print("/fli mail model file <id>")
-    Print("/fli alias set [acc|char] <itemID> <text>")
-    Print("/fli alias del [acc|char] <itemID>")
-    Print("/fli alias list")
-    Print("/fli capture on|off|status|dump|clear|max|stacks")
-    Print("/fli status")
-    return
-  end
-
-  if cmd == "ignore" then
-    local id = tonumber((rest or ""):match("(%d+)"))
-    if not id or id <= 0 then
-      local n = 0
-      if DB and type(DB.ignoredItemIDs) == "table" then
-        for _ in pairs(DB.ignoredItemIDs) do n = n + 1 end
-      end
-      Print("Usage: /fli ignore <itemID>")
-      Print("Ignored items: " .. tostring(n))
-      return
-    end
-
-    DB.ignoredItemIDs = (type(DB.ignoredItemIDs) == "table") and DB.ignoredItemIDs or {}
-    local on = not (DB.ignoredItemIDs[id] == true)
-    DB.ignoredItemIDs[id] = on and true or nil
-    Print(string.format("Ignore %s: %d", on and "enabled" or "disabled", id))
-    return
-  end
-
-  if cmd == "tabard" then
-    local sub = tostring(rest or ""):lower():gsub("^%s+", ""):gsub("%s+$", "")
-    local tabard = _G and rawget(_G, "fr0z3nUI_LootItTabard")
-    if sub == "" or sub == "help" or sub == "?" then
-      Print("Tabard commands:")
-      Print("  /fli tabard swap")
-      Print("  /fli tabard debug")
-      return
-    end
-
-    if not (tabard and (tabard.MaybeSwap or tabard.Debug)) then
-      Print("Tabard module not loaded.")
-      return
-    end
-
-    if sub == "swap" then
-      if tabard.MaybeSwap then tabard.MaybeSwap("cmd") end
-      return
-    end
-    if sub == "debug" then
-      if tabard.Debug then tabard.Debug() end
-      return
-    end
-
-    Print("Unknown tabard command. Try: /fli tabard help")
-    return
-  end
-
-  if cmd == "capture" or cmd == "cap" then
-    local parts = {}
-    for w in tostring(rest or ""):gmatch("%S+") do
-      parts[#parts + 1] = w
-    end
-    local sub = (parts[1] and parts[1]:lower()) or "status"
-
-    if sub == "on" then
-      DB.debugCapture = true
-      -- Force a first entry so users can verify capture is working immediately.
-      CaptureAppend("CAPTURE", { event = "manual_on", msg = "Capture enabled" })
-      Print("Capture: on")
-      return
-    end
-    if sub == "off" then
-      DB.debugCapture = false
-      Print("Capture: off")
-      return
-    end
-    if sub == "stacks" then
-      DB.debugCaptureStacks = not (DB and DB.debugCaptureStacks)
-      Print("Capture stacks: " .. ((DB.debugCaptureStacks and "on") or "off"))
-      return
-    end
-    if sub == "max" then
-      local n = tonumber(parts[2])
-      if not n then
-        Print("Capture max: " .. tostring(DB.debugCaptureMax or 200))
-        return
-      end
-      if n < 20 then n = 20 end
-      if n > 500 then n = 500 end
-      DB.debugCaptureMax = n
-      Print("Capture max set: " .. n)
-      return
-    end
-    if sub == "clear" then
-      if CHARDB then
-        CHARDB.debugCaptureLog = {}
-      end
-      Print("Capture: cleared")
-      return
-    end
-    if sub == "dump" then
-      if not (DB and DB.debugCapture) then
-        Print("Capture is OFF. Run: /fli capture on")
-      end
-      local n = tonumber(parts[2]) or 30
-      if n < 1 then n = 1 end
-      if n > 200 then n = 200 end
-      local filter = table.concat(parts, " ", 3)
-      filter = (type(filter) == "string") and filter:lower() or ""
-
-      local log = (CHARDB and type(CHARDB.debugCaptureLog) == "table") and CHARDB.debugCaptureLog or {}
-      Print(string.format("Capture dump: %d entries (showing last %d)", #log, n))
-      if #log == 0 then
-        Print("(No entries yet. Make sure you ran /fli capture on, then loot something or run /fli status.)")
-      end
-      local start = #log - n + 1
-      if start < 1 then start = 1 end
-      for i = start, #log do
-        local e = log[i]
-        if type(e) == "table" then
-          local line = string.format("%s %s %s", tostring(e.t or ""), tostring(e.kind or ""), tostring(e.event or ""))
-          local msg2 = tostring(e.out or e.msg or e.link or "")
-
-          local hay = (msg2 ~= "" and msg2 or line)
-          if filter == "" or hay:lower():find(filter, 1, true) then
-            local extra = ""
-            if e.kind == "MATCH" then
-              extra = string.format(" (hasItemLink=%s link=%s qty=%s)", tostring(e.hasItemLink), tostring(e.link or ""), tostring(e.qty or ""))
-            else
-              if e.itemID then
-                extra = extra .. string.format(" (itemID=%s)", tostring(e.itemID))
-              end
-              if e.link and e.link ~= "" and (e.kind == "CHAT_IN" or e.kind == "CHAT_OUT") then
-                extra = extra .. string.format(" (link=%s)", tostring(e.link))
-              end
-              if e.hasItemLink ~= nil and e.kind == "CHAT_IN" then
-                extra = extra .. string.format(" (hasItemLink=%s)", tostring(e.hasItemLink))
-              end
-              if e.rewrittenMoney then
-                extra = extra .. " (rewrittenMoney=true)"
-              end
-              if e.rewrittenCurrency then
-                extra = extra .. " (rewrittenCurrency=true)"
-              end
-              if e.async then
-                extra = extra .. " (async=true)"
-              end
-            end
-
-            if msg2 ~= "" then
-              Print(line .. " :: " .. msg2 .. extra)
-            else
-              Print(line .. extra)
-            end
-          end
-        end
-      end
-      return
-    end
-
-    local enabled = (DB and DB.debugCapture) and "on" or "off"
-    local stacks = (DB and DB.debugCaptureStacks) and "on" or "off"
-    local count = (CHARDB and type(CHARDB.debugCaptureLog) == "table") and #CHARDB.debugCaptureLog or 0
-    Print(string.format("Capture: %s (stacks=%s, max=%s, entries=%d)", enabled, stacks, tostring(DB and DB.debugCaptureMax or 200), count))
-    Print("Usage: /fli capture on|off|status|dump [n] [filter]|clear|max <n>|stacks")
-    return
-  end
-  if cmd == "alias" then
-    local parts = {}
-    for w in tostring(rest or ""):gmatch("%S+") do
-      parts[#parts + 1] = w
-    end
-
-    local sub = (parts[1] and parts[1]:lower()) or ""
-    local function NormalizeScope(s)
-      s = (s and s:lower()) or ""
-      if s == "acc" or s == "account" then return "acc" end
-      if s == "char" or s == "character" then return "char" end
-      return nil
-    end
-
-    local function AliasStatusLine(scopeLabel)
-      local a = 0
-      local t
-      if scopeLabel == "char" then
-        t = (CHARDB and type(CHARDB.linkAliases) == "table") and CHARDB.linkAliases or {}
-      else
-        t = (DB and type(DB.linkAliases) == "table") and DB.linkAliases or {}
-      end
-      for _ in pairs(t) do a = a + 1 end
-      Print(string.format("Aliases (%s): %d", scopeLabel == "char" and "Character" or "Account", a))
-      for id, text in pairs(t) do
-        Print(string.format("  %d = %s", tonumber(id) or 0, tostring(text or "")))
-      end
-    end
-
-    if sub == "" or sub == "list" then
-      AliasStatusLine("acc")
-      AliasStatusLine("char")
-      return
-    end
-
-    if sub == "set" or sub == "add" then
-      local scope = NormalizeScope(parts[2]) or "acc"
-      local idIndex = (NormalizeScope(parts[2]) and 3) or 2
-      local id = tonumber(parts[idIndex])
-      local text = table.concat(parts, " ", idIndex + 1)
-      if not id or id <= 0 or text == "" then
-        Print("Usage: /fli alias set [acc|char] <itemID> <text>")
-        return
-      end
-
-      if scope == "char" then
-        CHARDB.linkAliases = (type(CHARDB.linkAliases) == "table") and CHARDB.linkAliases or {}
-        CHARDB.linkAliasDisabledChar = (type(CHARDB.linkAliasDisabledChar) == "table") and CHARDB.linkAliasDisabledChar or {}
-        CHARDB.linkAliases[id] = text
-        CHARDB.linkAliasDisabledChar[id] = nil
-        Print(string.format("Alias set (Character): %d -> %s", id, text))
-      else
-        DB.linkAliases = (type(DB.linkAliases) == "table") and DB.linkAliases or {}
-        DB.linkAliasDisabledAccount = (type(DB.linkAliasDisabledAccount) == "table") and DB.linkAliasDisabledAccount or {}
-        DB.linkAliases[id] = text
-        DB.linkAliasDisabledAccount[id] = nil
-        Print(string.format("Alias set (Account): %d -> %s", id, text))
-      end
-      return
-    end
-
-    if sub == "del" or sub == "remove" or sub == "clear" then
-      local scope = NormalizeScope(parts[2]) or "acc"
-      local idIndex = (NormalizeScope(parts[2]) and 3) or 2
-      local id = tonumber(parts[idIndex])
-      if not id or id <= 0 then
-        Print("Usage: /fli alias del [acc|char] <itemID>")
-        return
-      end
-
-      if scope == "char" then
-        CHARDB.linkAliases = (type(CHARDB.linkAliases) == "table") and CHARDB.linkAliases or {}
-        CHARDB.linkAliasDisabledChar = (type(CHARDB.linkAliasDisabledChar) == "table") and CHARDB.linkAliasDisabledChar or {}
-        CHARDB.linkAliases[id] = nil
-        CHARDB.linkAliasDisabledChar[id] = nil
-        Print("Alias removed (Character): " .. id)
-      else
-        DB.linkAliases = (type(DB.linkAliases) == "table") and DB.linkAliases or {}
-        DB.linkAliasDisabledAccount = (type(DB.linkAliasDisabledAccount) == "table") and DB.linkAliasDisabledAccount or {}
-        DB.linkAliases[id] = nil
-        DB.linkAliasDisabledAccount[id] = nil
-        Print("Alias removed (Account): " .. id)
-      end
-      return
-    end
-
-    Print("Usage: /fli alias set|del|list")
-    Print("  /fli alias set [acc|char] <itemID> <text>")
-    Print("  /fli alias del [acc|char] <itemID>")
-    return
-  end
-
-
-  if cmd == "status" then
-    Status()
-    return
-  end
-
-  if cmd == "repair" or cmd == "reapply" then
-    ApplyFilters()
-    Print(string.format("reapplied filters (enabled=%s, hide=%s, echo=%s, combine=%s)", IsEnabled() and "on" or "off", (DB and DB.hideLootText) and "on" or "off", (DB and DB.echoItem) and "on" or "off", LootCombineEnabled() and "on" or "off"))
-    return
-  end
-
-  if cmd == "debugfilters" or cmd == "debug" then
-    local add = _G and rawget(_G, "ChatFrame_AddMessageEventFilter")
-    local rem = _G and rawget(_G, "ChatFrame_RemoveMessageEventFilter")
-    Print(string.format("enabled=%s, hide=%s, echo=%s, combine=%s", IsEnabled() and "on" or "off", (DB and DB.hideLootText) and "on" or "off", (DB and DB.echoItem) and "on" or "off", LootCombineEnabled() and "on" or "off"))
-    Print(string.format("ChatFrame_AddMessageEventFilter=%s", type(add)))
-    Print(string.format("ChatFrame_RemoveMessageEventFilter=%s", type(rem)))
-    Print("(If those are nil, chat filters cannot install yet.)")
-    return
-  end
-
-  if cmd == "ui" or cmd == "config" or cmd == "options" then
-    ToggleConfigUI()
-    return
-  end
-
-  if cmd == "on" or cmd == "enable" then
-    -- Keep slash commands account-wide (matches old behavior).
-    CHARDB.enabledOverride = nil
-    DB.enabled = true
-    ApplyFilters()
-    Status()
-    return
-  end
-
-  if cmd == "off" or cmd == "disable" then
-    CHARDB.enabledOverride = nil
-    DB.enabled = false
-    ApplyFilters()
-    Status()
-    return
-  end
-
-  if cmd == "toggle" then
-    CHARDB.enabledOverride = nil
-    DB.enabled = not DB.enabled
-    ApplyFilters()
-    Status()
-    return
-  end
-
-  if cmd == "hide" then
-    local v = (rest or ""):lower()
-    DB.hideLootText = (v ~= "off" and v ~= "0" and v ~= "false")
-    Status()
-    return
-  end
-
-  if cmd == "echo" then
-    local v = (rest or ""):lower()
-    DB.echoItem = (v ~= "off" and v ~= "0" and v ~= "false")
-    Status()
-    return
-  end
-
-  if cmd == "selfname" then
-    local v = (rest or ""):lower()
-    DB.showSelfNameAlways = (v ~= "off" and v ~= "0" and v ~= "false")
-    Status()
-    return
-  end
-
-  if cmd == "prefix" then
-    local p = tostring(rest or "")
-    if p == "" then
-      DB.echoPrefix = ""
-    elseif p:lower() == "default" then
-      DB.echoPrefix = PREFIX
-    else
-      DB.echoPrefix = p
-    end
-    Status()
-    return
-  end
-
-  if cmd == "mail" then
-    local v = (rest or ""):lower()
-    DB.mailNotify = DB.mailNotify or {}
-
-    if v:match("^model") then
-      local _, kind, id = v:match("^(model)%s*(%S*)%s*(%S*)")
-      kind = tostring(kind or ""):lower()
-
-      if kind == "" then
-        local ui = CreateConfigUI()
-        ui:Show()
-        if ui.SelectTab then ui.SelectTab("mail") end
-        return
-      end
-
-      local mnc = MailNotifyCfg()
-      if not mnc then return end
-      mnc.model = mnc.model or {}
-      if kind == "picker" then
-        local ui = CreateConfigUI()
-        ui:Show()
-        if ui.SelectTab then ui.SelectTab("mail") end
-        return
-      elseif kind == "katy" then
-        mnc.model.kind = "npc"
-        mnc.model.id = 132969
-        UpdateMailNotifier()
-        Print("Mail model: Katy Stampwhistle (132969)")
-        return
-      elseif kind == "dalaran" then
-        mnc.model.kind = "npc"
-        mnc.model.id = 104230
-        UpdateMailNotifier()
-        Print("Mail model: Dalaran Mailemental (104230)")
-        return
-      elseif kind == "plagued" then
-        mnc.model.kind = "npc"
-        mnc.model.id = 155971
-        UpdateMailNotifier()
-        Print("Mail model: Plagued Mailemental (155971)")
-        return
-      elseif kind == "player" then
-        mnc.model.kind = "player"
-        mnc.model.id = nil
-        UpdateMailNotifier()
-        Print("Mail model: player")
-        return
-      elseif kind == "display" then
-        local n = tonumber(id)
-        if not n then
-          Print("Usage: /fli mail model display <id>")
-          return
-        end
-        mnc.model.kind = "display"
-        mnc.model.id = n
-        UpdateMailNotifier()
-        Print("Mail model: display " .. n)
-        return
-      elseif kind == "npc" or kind == "creature" then
-        local n = tonumber(id)
-        if not n then
-          Print("Usage: /fli mail model npc <id>")
-          return
-        end
-        mnc.model.kind = "npc"
-        mnc.model.id = n
-        UpdateMailNotifier()
-        Print("Mail model: npc " .. n)
-        return
-      elseif kind == "file" then
-        local n = tonumber(id)
-        if not n then
-          Print("Usage: /fli mail model file <id>")
-          return
-        end
-        mnc.model.kind = "file"
-        mnc.model.id = n
-        UpdateMailNotifier()
-        Print("Mail model: file " .. n)
-        return
-      else
-        Print("Usage: /fli mail model [player|npc <id>|display <id>|file <id>]")
-        return
-      end
-    end
-
-    local function GetMailNotifyModeCLI()
-      if CHARDB and CHARDB.mailNotifyEnabledOverride == true then return "on" end
-      if CHARDB and CHARDB.mailNotifyEnabledOverride == false then return "off" end
-      if DB and DB.mailNotify and DB.mailNotify.enabled then return "acc" end
-      return "off"
-    end
-
-    local function SetMailNotifyModeCLI(mode)
-      mode = tostring(mode or ""):lower()
-      DB.mailNotify = DB.mailNotify or {}
-      if mode == "on" then
-        CHARDB.mailNotifyEnabledOverride = true
-      elseif mode == "acc" then
-        CHARDB.mailNotifyEnabledOverride = nil
-        DB.mailNotify.enabled = true
-      else -- off
-        CHARDB.mailNotifyEnabledOverride = false
-      end
-      UpdateMailNotifier()
-      Print("Mail notifier: " .. ((mode == "on") and "on" or ((mode == "acc") and "on acc" or "off")))
-    end
-
-    if v == "" or v == "toggle" then
-      local cur = GetMailNotifyModeCLI()
-      local nextMode = (cur == "off") and "on" or ((cur == "on") and "acc" or "off")
-      SetMailNotifyModeCLI(nextMode)
-      return
-    end
-    if v == "on" or v == "1" or v == "true" then
-      SetMailNotifyModeCLI("on")
-      return
-    end
-    if v == "acc" then
-      SetMailNotifyModeCLI("acc")
-      return
-    end
-    if v == "off" or v == "0" or v == "false" then
-      SetMailNotifyModeCLI("off")
-      return
-    end
-    if v == "test" then
-      local mf = CreateMailNotifier()
-      local mnc = MailNotifyCfg()
-      if not (mf and mnc and mnc.ui) then return end
-      mf:ClearAllPoints()
-      mf:SetPoint(mnc.ui.point or "TOPRIGHT", UIParent, mnc.ui.point or "TOPRIGHT", mnc.ui.x or 0, mnc.ui.y or 0)
-      if (mnc.showInCombat == false) and InCombatLockdown and InCombatLockdown() then
-        mf:Hide()
-        Print("Mail notifier: hidden in combat.")
-        return
-      end
-      ApplyMailModelToFrame(mf.model)
-      mf:Show()
-      Print("Mail notifier: shown (test).")
-      return
-    end
-
-    Print("Usage: /fli mail on|acc|off|toggle|test")
-    return
-  end
-
-  Print("Unknown command. Try /fli ?")
+  Print("LootIt slash handler not available.")
 end
 
 local f = CreateFrame("Frame")
@@ -6322,12 +1567,18 @@ f:RegisterEvent("PLAYER_ENTERING_WORLD")
 f:RegisterEvent("MERCHANT_SHOW")
 f:RegisterEvent("MERCHANT_CLOSED")
 f:RegisterEvent("UPDATE_PENDING_MAIL")
+f:RegisterEvent("GUILDBANKFRAME_OPENED")
+f:RegisterEvent("GUILDBANKFRAME_CLOSED")
+f:RegisterEvent("BANKFRAME_OPENED")
+f:RegisterEvent("BANKFRAME_CLOSED")
+f:RegisterEvent("PLAYER_INTERACTION_MANAGER_FRAME_SHOW")
+f:RegisterEvent("PLAYER_INTERACTION_MANAGER_FRAME_HIDE")
 f:RegisterEvent("PLAYER_REGEN_DISABLED")
 f:RegisterEvent("PLAYER_REGEN_ENABLED")
 f:RegisterEvent("LOOT_OPENED")
 f:RegisterEvent("LOOT_CLOSED")
 f:RegisterEvent("LOOT_READY")
-f:SetScript("OnEvent", function(_, event)
+f:SetScript("OnEvent", function(_, event, arg1)
   EnsureDB()
   if event == "PLAYER_LOGIN" then
     do
@@ -6339,12 +1590,33 @@ f:SetScript("OnEvent", function(_, event)
     ApplyFilters()
     ApplyFiltersSoon(1)
     C_Timer.After(1, UpdateMailNotifier)
+    if UpdateDepositButtonVisibility then
+      C_Timer.After(0.25, UpdateDepositButtonVisibility)
+    end
   elseif event == "PLAYER_ENTERING_WORLD" then
     ApplyFiltersSoon(0.5)
     C_Timer.After(1, UpdateMailNotifier)
+    if UpdateDepositButtonVisibility then
+      C_Timer.After(0.25, UpdateDepositButtonVisibility)
+    end
+  elseif event == "MERCHANT_SHOW" then
+    RunMerchantTradeOnce()
   elseif event == "MERCHANT_CLOSED" then
     if DB and DB.delayPrint and DB.delayPrint.flushOnMerchantClose then
       DelayPrintFlushAll()
+    end
+  elseif event == "PLAYER_INTERACTION_MANAGER_FRAME_SHOW" or event == "PLAYER_INTERACTION_MANAGER_FRAME_HIDE" then
+    local it = (Enum and Enum.PlayerInteractionType) and Enum.PlayerInteractionType or nil
+    local isAccountBanker = (it and it.AccountBanker and arg1 == it.AccountBanker) and true or false
+    if isAccountBanker then
+      _warbankInteractionOpen = (event == "PLAYER_INTERACTION_MANAGER_FRAME_SHOW")
+      if UpdateDepositButtonVisibility then
+        UpdateDepositButtonVisibility()
+      end
+    end
+  elseif event == "GUILDBANKFRAME_OPENED" or event == "GUILDBANKFRAME_CLOSED" or event == "BANKFRAME_OPENED" or event == "BANKFRAME_CLOSED" then
+    if UpdateDepositButtonVisibility then
+      UpdateDepositButtonVisibility()
     end
   elseif event == "UPDATE_PENDING_MAIL" then
     C_Timer.After(0.5, UpdateMailNotifier)

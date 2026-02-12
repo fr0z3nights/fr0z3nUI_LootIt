@@ -47,4 +47,3 @@ DB.tabardGroup = {
 -- If you previously had a populated dataset from the standalone addon, paste it here.
 -- Leaving the tables present (even if empty) avoids nil errors and keeps the module functional
 -- via tooltip scanning + dynamic caching.
-

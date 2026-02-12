@@ -6,7 +6,16 @@
 ## SavedVariables: fr0z3nUI_LootItDB
 ## SavedVariablesPerCharacter: fr0z3nUI_LootItCharDB
 
-fr0z3nUI_LootIt_ADB.lua
-fr0z3nUI_LootItDB.lua
+fr0z3nUI_LootItAliasDB.lua
+fr0z3nUI_LootItTabardDB.lua
 fr0z3nUI_LootItTabard.lua
+fr0z3nUI_LootItTrade.lua
+fr0z3nUI_LootItAlias.lua
+fr0z3nUI_LootItMail.lua
+fr0z3nUI_LootItOther.lua
+fr0z3nUI_LootItLoot.lua
+fr0z3nUI_LootItLootChat.lua
+fr0z3nUI_LootItUIV.lua
+fr0z3nUI_LootItTabardUI.lua
+fr0z3nUI_LootItUI.lua
 fr0z3nUI_LootIt.lua

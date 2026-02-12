@@ -1,4 +1,4 @@
--- Addon Alias Database (ADB)
+-- Addon Alias Database (AliasDB)
 -- Built-in aliases shipped with the addon.
 -- Keyed by itemID; values are display-only text (link remains the original item).
 
