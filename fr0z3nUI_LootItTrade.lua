@@ -585,7 +585,7 @@ function LI.Trade.BuildTab(depositPanel)
     end)
   end
 
-  Tip(bankBtn, "Deposit Target", "Bank = whichever bank is open", "Cycles: Bank / Guild / Warbank")
+  Tip(bankBtn, "List Target", "Affects where entries are added/managed; deposit uses the currently open bank.", "Cycles: Bank / Guild / Warbank")
   Tip(guildTabBtn, "Guild Tab", "Left-click: cycle tabs (or pick random)", "Right-click: toggle Random; disabled on Warbank")
   Tip(keepBox, "Keep (Deposit)", "For this item: if bags have less than Keep, withdraw the difference", "Empty/0 disables")
   Tip(spBtn, "SP (Stack Pull)", "Per-item toggle: pull partial stacks before depositing", "Default: Off")

@@ -671,6 +671,43 @@ local function TryAutoSortGuildBank()
   return false
 end
 
+local _liGuildBankScanTip
+local function GetGuildBankItemLinkSafe(tab, slot)
+  tab = tonumber(tab)
+  slot = tonumber(slot)
+  if not tab or tab <= 0 then return nil end
+  if not slot or slot <= 0 then return nil end
+
+  if type(GetGuildBankItemLink) == "function" then
+    local ok, link = pcall(GetGuildBankItemLink, tab, slot)
+    link = ok and link or nil
+    if type(link) == "string" and link ~= "" then
+      return link
+    end
+  end
+
+  if not (CreateFrame and UIParent) then return nil end
+  if not _liGuildBankScanTip then
+    _liGuildBankScanTip = CreateFrame("GameTooltip", "fr0z3nUI_LootIt_GuildBankScanTip", UIParent, "GameTooltipTemplate")
+    _liGuildBankScanTip:SetOwner(UIParent, "ANCHOR_NONE")
+  end
+
+  if not (_liGuildBankScanTip and _liGuildBankScanTip.SetGuildBankItem and _liGuildBankScanTip.GetItem) then
+    return nil
+  end
+
+  _liGuildBankScanTip:ClearLines()
+  local okSet = pcall(_liGuildBankScanTip.SetGuildBankItem, _liGuildBankScanTip, tab, slot)
+  if not okSet then
+    return nil
+  end
+  local _, link = _liGuildBankScanTip:GetItem()
+  if type(link) == "string" and link ~= "" then
+    return link
+  end
+  return nil
+end
+
 local function GetResetToken(resetKind)
   resetKind = tostring(resetKind or "daily")
   local now = nil
@@ -1101,14 +1138,42 @@ local WithdrawFromGuildBankToBags
 local WithdrawFromContainerBagsToBags
 local GetPersonalBankBagIDs
 
-local _guildTabQueried = {}
+-- Guild bank data must be queried per open-session.
+-- Caching across close/reopen can leave tabs unqueried and make withdraw/deposit look "broken".
+local _guildBankQuerySession = 0
+local _guildTabQueriedSession = {}
+
+local function ResetGuildBankQuerySession()
+  _guildBankQuerySession = (_guildBankQuerySession or 0) + 1
+  _guildTabQueriedSession = {}
+end
+
 local function QueryGuildBankTabIfNeeded(tab)
   tab = tonumber(tab)
   if not tab or tab <= 0 then return end
-  if _guildTabQueried[tab] == true then return end
+  if _guildTabQueriedSession[tab] == _guildBankQuerySession then return end
   if type(QueryGuildBankTab) ~= "function" then return end
   pcall(QueryGuildBankTab, tab)
-  _guildTabQueried[tab] = true
+  _guildTabQueriedSession[tab] = _guildBankQuerySession
+end
+
+local function GuildBankTabCanView(tab)
+  tab = tonumber(tab)
+  if not tab or tab <= 0 then
+    return false, "invalid tab"
+  end
+  if type(GetGuildBankTabInfo) ~= "function" then
+    return true
+  end
+  QueryGuildBankTabIfNeeded(tab)
+  local ok, name, _, canView = pcall(GetGuildBankTabInfo, tab)
+  if not ok then
+    return false, "tab info unavailable"
+  end
+  if not name or canView ~= true then
+    return false, "no view permission"
+  end
+  return true
 end
 
 GuildBankTabCanDeposit = function(tab)
@@ -1315,8 +1380,7 @@ local function RunDepositGuild()
             if inBags and inBags > 0 then
               local partialCount = nil
               for slot = 1, maxSlots do
-                local okL, link = pcall(GetGuildBankItemLink, tab, slot)
-                link = okL and link or nil
+                local link = GetGuildBankItemLinkSafe(tab, slot)
                 if type(link) == "string" then
                   local id = tonumber(string.match(link, "item:(%d+)"))
                   if id and id == itemID then
@@ -2342,10 +2406,24 @@ WithdrawFromGuildBankToBags = function(tab, itemID, wantCount)
   if not itemID or itemID <= 0 then return 0 end
   wantCount = wantCount and math.floor(wantCount) or 0
   if wantCount <= 0 then return 0 end
-  if type(GetGuildBankItemLink) ~= "function" then return 0, "No guild bank API" end
+  if type(GetGuildBankItemLink) ~= "function" and not (CreateFrame and UIParent) then
+    return 0, "No guild bank API"
+  end
   if type(PickupGuildBankItem) ~= "function" then return 0, "No guild bank API" end
   if not (C_Container and type(C_Container.PickupContainerItem) == "function") then
     return 0, "No container pickup API"
+  end
+
+  do
+    local okView, whyView = GuildBankTabCanView(tab)
+    if not okView then
+      return 0, whyView
+    end
+  end
+
+  -- Some clients are picky about the current tab being selected before data is fully available.
+  if type(SetCurrentGuildBankTab) == "function" then
+    pcall(SetCurrentGuildBankTab, tab)
   end
 
   if QueryGuildBankTabIfNeeded then
@@ -2358,8 +2436,7 @@ WithdrawFromGuildBankToBags = function(tab, itemID, wantCount)
   local moved = 0
   for slot = 1, maxSlots do
     if moved >= wantCount then return moved end
-    local okL, link = pcall(GetGuildBankItemLink, tab, slot)
-    link = okL and link or nil
+    local link = GetGuildBankItemLinkSafe(tab, slot)
     if type(link) == "string" then
       local id = tonumber(string.match(link, "item:(%d+)"))
       if id and id == itemID then
@@ -2414,6 +2491,60 @@ WithdrawFromGuildBankToBags = function(tab, itemID, wantCount)
   return moved
 end
 
+local function WithdrawFromGuildBankToBagsAuto(preferredTab, itemID, wantCount)
+  preferredTab = tonumber(preferredTab)
+  itemID = tonumber(itemID)
+  wantCount = tonumber(wantCount)
+  if not itemID or itemID <= 0 then return 0 end
+  wantCount = wantCount and math.floor(wantCount) or 0
+  if wantCount <= 0 then return 0 end
+  if not IsGuildBankOpen() then return 0, "Guild bank not open" end
+
+  local nTabs = GetGuildBankTabCount and GetGuildBankTabCount() or 8
+  nTabs = tonumber(nTabs) or 8
+  nTabs = math.floor(nTabs)
+  if nTabs < 1 then nTabs = 1 end
+  if nTabs > 8 then nTabs = 8 end
+
+  local moved = 0
+  local anyViewable = false
+
+  local function tryTab(t)
+    if moved >= wantCount then return end
+    t = tonumber(t)
+    if not t or t <= 0 then return end
+    if t > nTabs then return end
+    local okView = true
+    if GuildBankTabCanView then
+      okView = (select(1, GuildBankTabCanView(t)) == true)
+    end
+    if not okView then return end
+    anyViewable = true
+    local did, why = WithdrawFromGuildBankToBags(t, itemID, wantCount - moved)
+    if why then
+      return why
+    end
+    moved = moved + (tonumber(did) or 0)
+  end
+
+  local why = nil
+  if preferredTab and preferredTab > 0 then
+    why = tryTab(preferredTab) or why
+  end
+  for t = 1, nTabs do
+    if moved >= wantCount then break end
+    if not preferredTab or t ~= preferredTab then
+      why = tryTab(t) or why
+    end
+  end
+
+  if moved > 0 then return moved end
+  if not anyViewable then
+    return 0, "No view permission"
+  end
+  return 0
+end
+
 local function RunKeepTopUpForTarget(target, targets)
   if type(targets) ~= "table" then return false end
   local hasAny = false
@@ -2431,9 +2562,8 @@ local function RunKeepTopUpForTarget(target, targets)
 
   target = resolvedTarget(target)
   if target == "" then
-    local cfg = DepositCfgAcc()
-    target = resolvedTarget(cfg and cfg.target)
-    if target == "" then target = "bank" end
+    -- No explicit target: treat as "bank" (auto to whichever bank is open).
+    target = "bank"
   end
 
   if target == "bank" then
@@ -2489,7 +2619,7 @@ local function RunKeepTopUpForTarget(target, targets)
               return anyMoved
             end
             local tab = GetConfiguredGuildBankTab()
-            moved, why = WithdrawFromGuildBankToBags(tab, itemID, need)
+            moved, why = WithdrawFromGuildBankToBagsAuto(tab, itemID, need)
           else
             if not IsPersonalBankOpen() then
               return anyMoved
@@ -2532,9 +2662,8 @@ local function RunDeposit(target)
 
   target = Normalize(target)
   if target == "" then
-    local cfg = DepositCfgAcc()
-    target = Normalize(cfg.target)
-    if target == "" then target = "bank" end
+    -- No explicit target: treat as "bank" (auto to whichever bank is open).
+    target = "bank"
   end
 
   local keepMoved = false
@@ -3624,11 +3753,20 @@ f:SetScript("OnEvent", function(_, event, arg1)
       _warbankInteractionOpen = isShow
     elseif isGuildBanker then
       _guildbankInteractionOpen = isShow
+      if isShow and ResetGuildBankQuerySession then
+        ResetGuildBankQuerySession()
+      end
     end
     if (isBanker or isAccountBanker or isGuildBanker) and UpdateDepositButtonVisibility then
       UpdateDepositButtonVisibility()
     end
   elseif event == "GUILDBANKFRAME_OPENED" or event == "GUILDBANKFRAME_CLOSED" or event == "BANKFRAME_OPENED" or event == "BANKFRAME_CLOSED" then
+    if event == "GUILDBANKFRAME_OPENED" and ResetGuildBankQuerySession then
+      ResetGuildBankQuerySession()
+    end
+    if event == "GUILDBANKFRAME_CLOSED" and ResetGuildBankQuerySession then
+      ResetGuildBankQuerySession()
+    end
     if UpdateDepositButtonVisibility then
       UpdateDepositButtonVisibility()
     end

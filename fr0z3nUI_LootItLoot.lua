@@ -20,8 +20,21 @@ function LI.LootTab.BuildTab(lootPanel, env)
   local LootCombineCancelTimers = env.LootCombineCancelTimers or function() end
   local LootCombineFlush = env.LootCombineFlush or function() end
 
-  local SetCheckBoxText = env.SetCheckBoxText or LI.SetCheckBoxText or function() end
-  local SetCheckBoxChecked = env.SetCheckBoxChecked or LI.SetCheckBoxChecked or function() end
+  local SetCheckBoxText = env.SetCheckBoxText or LI.SetCheckBoxText or function(cb, text)
+    if not cb then return end
+    local t = cb.Text or cb.text
+    if t and t.SetText then
+      t:SetText(tostring(text or ""))
+    elseif cb.SetText then
+      cb:SetText(tostring(text or ""))
+    end
+  end
+  local SetCheckBoxChecked = env.SetCheckBoxChecked or LI.SetCheckBoxChecked or function(cb, checked)
+    if not cb then return end
+    if cb.SetChecked then
+      cb:SetChecked(checked == true)
+    end
+  end
 
   local enableModeBtn = env.enableModeBtn
   local GetSupportedMessageLines = env.GetSupportedMessageLines or function() return {} end

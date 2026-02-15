@@ -86,7 +86,42 @@ do
 
     local UISpecialFrames = _G and rawget(_G, "UISpecialFrames")
 
-    local frame = CreateFrame("Frame", "fr0z3nUI_LootIt_Config", UIParent, "BasicFrameTemplateWithInset")
+    local frame = CreateFrame("Frame", "fr0z3nUI_LootIt_Config", UIParent, "BackdropTemplate")
+
+    do
+      -- Match FGO styling: simple tooltip background + top tab bar.
+      frame:SetBackdrop({
+        bgFile = "Interface/Tooltips/UI-Tooltip-Background",
+        tile = true,
+        tileSize = 16,
+        insets = { left = 4, right = 4, top = 4, bottom = 4 },
+      })
+      frame:SetBackdropColor(0, 0, 0, 0.85)
+
+      local tabBarBG = CreateFrame("Frame", nil, frame, "BackdropTemplate")
+      tabBarBG:SetPoint("TOPLEFT", frame, "TOPLEFT", 4, -4)
+      tabBarBG:SetPoint("TOPRIGHT", frame, "TOPRIGHT", -4, -4)
+      tabBarBG:SetHeight(26)
+      tabBarBG:SetBackdrop({
+        bgFile = "Interface/Tooltips/UI-Tooltip-Background",
+        tile = true,
+        tileSize = 16,
+        insets = { left = 0, right = 0, top = 0, bottom = 0 },
+      })
+      tabBarBG:SetBackdropColor(0, 0, 0, 0.92)
+      tabBarBG:SetFrameLevel((frame.GetFrameLevel and frame:GetFrameLevel() or 0) + 1)
+      frame._tabBarBG = tabBarBG
+
+      local closeBtn = CreateFrame("Button", nil, frame, "UIPanelCloseButton")
+      closeBtn:SetPoint("TOPRIGHT", frame, "TOPRIGHT", -6, -6)
+      closeBtn:SetFrameLevel((frame.GetFrameLevel and frame:GetFrameLevel() or 0) + 20)
+      closeBtn:SetScript("OnClick", function()
+        if frame and frame.Hide then
+          frame:Hide()
+        end
+      end)
+      frame._closeBtn = closeBtn
+    end
 
     if type(UISpecialFrames) == "table" then
       local name = "fr0z3nUI_LootIt_Config"
@@ -98,6 +133,8 @@ do
     end
 
     frame:SetSize(480, 400)
+    frame:SetClampedToScreen(true)
+    frame:SetFrameStrata("DIALOG")
     frame:SetMovable(true)
     frame:EnableMouse(true)
     frame:RegisterForDrag("LeftButton")
@@ -113,17 +150,32 @@ do
       end
     end)
 
-    local titleFS = frame.TitleText
-    if not (titleFS and titleFS.SetText and titleFS.SetPoint) then
-      titleFS = frame:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
-    end
+    local titleFS = frame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
     frame._titleFS = titleFS
 
-    titleFS:SetText("|cff00ccff[FLI]|r LootIt")
     titleFS:ClearAllPoints()
-    titleFS:SetPoint("TOPLEFT", frame, "TOPLEFT", 12, -6)
+    if frame._tabBarBG and titleFS.SetParent then
+      titleFS:SetParent(frame._tabBarBG)
+    end
+    if frame._tabBarBG then
+      titleFS:SetPoint("LEFT", frame._tabBarBG, "LEFT", 8, 0)
+    else
+      titleFS:SetPoint("TOPLEFT", frame, "TOPLEFT", 12, -6)
+    end
     titleFS:SetText("|cff00ccff[FLI]|r")
+    do
+      local fontPath, fontSize, fontFlags = titleFS:GetFont()
+      if fontPath and fontSize then
+        titleFS:SetFont(fontPath, fontSize + 2, fontFlags)
+      end
+    end
     if titleFS.Show then titleFS:Show() end
+
+    -- Content root (below the tab bar), matching FGO layout.
+    local content = CreateFrame("Frame", nil, frame)
+    content:SetPoint("TOPLEFT", frame, "TOPLEFT", 12, -54)
+    content:SetPoint("BOTTOMRIGHT", frame, "BOTTOMRIGHT", -12, 12)
+    frame._content = content
 
     local function GetEnableMode()
       RefreshRefs()
@@ -209,7 +261,7 @@ do
     end)
 
     local sub = frame:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
-    sub:SetPoint("TOPLEFT", frame.InsetBg, "TOPLEFT", 10, -10)
+    sub:SetPoint("TOPLEFT", content, "TOPLEFT", 0, 0)
     sub:SetJustifyH("LEFT")
     sub:SetText("")
 
@@ -223,67 +275,121 @@ do
     end)
     frame._reloadBtn = reloadBtn
 
+    local TAB_COUNT = 6
+    local TAB_OVERLAP_X = -6
+
+    local function SizeTabToText(btn, pad, minW)
+      if not (btn and btn.GetFontString and btn.SetWidth) then return end
+      local fs = btn:GetFontString()
+      local w = (fs and fs.GetStringWidth and fs:GetStringWidth()) or 0
+      w = (tonumber(w) or 0) + (tonumber(pad) or 18)
+      if minW and w < minW then w = minW end
+      btn:SetWidth(w)
+    end
+
+    local function StyleTab(btn, active)
+      if not (btn and btn.GetFontString) then return end
+      local fs = btn:GetFontString()
+      if fs and fs.SetTextColor then
+        if active then
+          fs:SetTextColor(1.0, 0.82, 0.0, 1)
+        else
+          fs:SetTextColor(0.70, 0.70, 0.70, 1)
+        end
+      end
+    end
+
+    local function UpdateTabZOrder(activeIndex)
+      local base = (frame.GetFrameLevel and frame:GetFrameLevel()) or 0
+      base = base + 20
+      for i = 1, TAB_COUNT do
+        local t = frame["tab" .. tostring(i)]
+        if t and t.SetFrameLevel then
+          t:SetFrameLevel(base + (TAB_COUNT - i))
+        end
+      end
+      local a = tonumber(activeIndex)
+      if a and a >= 1 and a <= TAB_COUNT then
+        local t = frame["tab" .. tostring(a)]
+        if t and t.SetFrameLevel then
+          t:SetFrameLevel(base + TAB_COUNT + 5)
+        end
+      end
+    end
+
     local tabLoot = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
-    tabLoot:SetSize(70, 22)
-    tabLoot:SetPoint("LEFT", titleFS, "RIGHT", 8, 0)
+    tabLoot:SetID(1)
     tabLoot:SetText("LootIt")
+    tabLoot:SetPoint("LEFT", titleFS, "RIGHT", 10, 0)
+    tabLoot:SetHeight(22)
+    SizeTabToText(tabLoot, 18, 70)
+    frame.tab1 = tabLoot
 
     local tabAlias = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
-    tabAlias:SetSize(70, 22)
-    tabAlias:SetPoint("LEFT", tabLoot, "RIGHT", -6, 0)
+    tabAlias:SetID(2)
     tabAlias:SetText("Alias")
+    tabAlias:SetPoint("LEFT", tabLoot, "RIGHT", TAB_OVERLAP_X, 0)
+    tabAlias:SetHeight(22)
+    SizeTabToText(tabAlias, 18, 70)
+    frame.tab2 = tabAlias
 
     local tabOther = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
-    tabOther:SetSize(70, 22)
-    tabOther:SetPoint("LEFT", tabAlias, "RIGHT", -6, 0)
+    tabOther:SetID(3)
     tabOther:SetText("Other")
+    tabOther:SetPoint("LEFT", tabAlias, "RIGHT", TAB_OVERLAP_X, 0)
+    tabOther:SetHeight(22)
+    SizeTabToText(tabOther, 18, 70)
+    frame.tab3 = tabOther
 
     local tabMail = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
-    tabMail:SetSize(70, 22)
-    tabMail:SetPoint("LEFT", tabOther, "RIGHT", -6, 0)
+    tabMail:SetID(4)
     tabMail:SetText("Mail")
+    tabMail:SetPoint("LEFT", tabOther, "RIGHT", TAB_OVERLAP_X, 0)
+    tabMail:SetHeight(22)
+    SizeTabToText(tabMail, 18, 70)
+    frame.tab4 = tabMail
 
     local tabTabard = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
-    tabTabard:SetSize(70, 22)
-    tabTabard:SetPoint("LEFT", tabMail, "RIGHT", -6, 0)
+    tabTabard:SetID(5)
     tabTabard:SetText("Tabard")
+    tabTabard:SetPoint("LEFT", tabMail, "RIGHT", TAB_OVERLAP_X, 0)
+    tabTabard:SetHeight(22)
+    SizeTabToText(tabTabard, 18, 70)
+    frame.tab5 = tabTabard
 
     local tabDeposit = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
-    tabDeposit:SetSize(70, 22)
-    tabDeposit:SetPoint("LEFT", tabTabard, "RIGHT", -6, 0)
+    tabDeposit:SetID(6)
     tabDeposit:SetText("Trade")
+    tabDeposit:SetPoint("LEFT", tabTabard, "RIGHT", TAB_OVERLAP_X, 0)
+    tabDeposit:SetHeight(22)
+    SizeTabToText(tabDeposit, 18, 70)
+    frame.tab6 = tabDeposit
 
     local lootPanel = CreateFrame("Frame", nil, frame)
-    lootPanel:SetPoint("TOPLEFT", frame.InsetBg, "TOPLEFT", 0, -24)
-    lootPanel:SetPoint("BOTTOMRIGHT", frame.InsetBg, "BOTTOMRIGHT", 0, 0)
+    lootPanel:SetAllPoints(content)
 
     enableModeBtn:SetParent(lootPanel)
     enableModeBtn:ClearAllPoints()
-    enableModeBtn:SetPoint("TOPLEFT", lootPanel, "TOPLEFT", 10, 24)
+    enableModeBtn:SetPoint("TOPLEFT", lootPanel, "TOPLEFT", 0, 0)
     do
       local m = GetEnableMode()
       enableModeBtn:SetText((m == "on") and "On" or ((m == "acc") and "On Acc" or "Off"))
     end
 
     local mailPanel = CreateFrame("Frame", nil, frame)
-    mailPanel:SetPoint("TOPLEFT", frame.InsetBg, "TOPLEFT", 0, -24)
-    mailPanel:SetPoint("BOTTOMRIGHT", frame.InsetBg, "BOTTOMRIGHT", 0, 0)
+    mailPanel:SetAllPoints(content)
 
     local aliasPanel = CreateFrame("Frame", nil, frame)
-    aliasPanel:SetPoint("TOPLEFT", frame.InsetBg, "TOPLEFT", 0, -24)
-    aliasPanel:SetPoint("BOTTOMRIGHT", frame.InsetBg, "BOTTOMRIGHT", 0, 0)
+    aliasPanel:SetAllPoints(content)
 
     local otherPanel = CreateFrame("Frame", nil, frame)
-    otherPanel:SetPoint("TOPLEFT", frame.InsetBg, "TOPLEFT", 0, -24)
-    otherPanel:SetPoint("BOTTOMRIGHT", frame.InsetBg, "BOTTOMRIGHT", 0, 0)
+    otherPanel:SetAllPoints(content)
 
     local tabardPanel = CreateFrame("Frame", nil, frame)
-    tabardPanel:SetPoint("TOPLEFT", frame.InsetBg, "TOPLEFT", 0, -24)
-    tabardPanel:SetPoint("BOTTOMRIGHT", frame.InsetBg, "BOTTOMRIGHT", 0, 0)
+    tabardPanel:SetAllPoints(content)
 
     local depositPanel = CreateFrame("Frame", nil, frame)
-    depositPanel:SetPoint("TOPLEFT", frame.InsetBg, "TOPLEFT", 0, -24)
-    depositPanel:SetPoint("BOTTOMRIGHT", frame.InsetBg, "BOTTOMRIGHT", 0, 0)
+    depositPanel:SetAllPoints(content)
 
     local function SelectTab(which)
       which = tostring(which or "loot"):lower()
@@ -305,29 +411,14 @@ do
         enableModeBtn:SetShown(isLoot)
       end
 
-      local function StyleTab(btn, active)
-        if not (btn and btn.GetFontString and btn.IsEnabled and btn.SetEnabled) then return end
-        btn:SetEnabled(true)
-        if btn.SetFrameLevel and frame.GetFrameLevel then
-          local base = frame:GetFrameLevel() or 0
-          btn:SetFrameLevel(base + (active and 6 or 4))
-        end
-        local fs = btn:GetFontString()
-        if fs and fs.SetTextColor then
-          if active then
-            fs:SetTextColor(1.0, 0.82, 0.0, 1)
-          else
-            fs:SetTextColor(0.70, 0.70, 0.70, 1)
-          end
-        end
-      end
-
       StyleTab(tabLoot, isLoot)
       StyleTab(tabAlias, isAlias)
       StyleTab(tabOther, isOther)
       StyleTab(tabMail, isMail)
       StyleTab(tabTabard, isTabard)
       StyleTab(tabDeposit, isDeposit)
+
+      UpdateTabZOrder(isLoot and 1 or (isAlias and 2 or (isOther and 3 or (isMail and 4 or (isTabard and 5 or 6)))) )
 
       frame._activeTab = isLoot and "loot" or (isAlias and "alias" or (isOther and "other" or (isMail and "mail" or (isTabard and "tabard" or "deposit"))))
 
@@ -342,6 +433,15 @@ do
     tabMail:SetScript("OnClick", function() SelectTab("mail") end)
     tabTabard:SetScript("OnClick", function() SelectTab("tabard") end)
     tabDeposit:SetScript("OnClick", function() SelectTab("deposit") end)
+
+    -- Initialize first tab styling + z-order.
+    StyleTab(tabLoot, true)
+    StyleTab(tabAlias, false)
+    StyleTab(tabOther, false)
+    StyleTab(tabMail, false)
+    StyleTab(tabTabard, false)
+    StyleTab(tabDeposit, false)
+    UpdateTabZOrder(1)
 
     do
       local mod = fr0z3nUI_LootIt
