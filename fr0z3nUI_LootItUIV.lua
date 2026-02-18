@@ -84,6 +84,7 @@ function UIV.Handle(msg)
     SafeCall(Print, "/fli alias del [acc|char] <itemID>")
     SafeCall(Print, "/fli alias list")
     SafeCall(Print, "/fli capture on|off|status|dump|clear|max|stacks")
+    SafeCall(Print, "/fli chatdebug on|off|toggle|status|dump")
     SafeCall(Print, "/fli status")
     return
   end
@@ -91,6 +92,66 @@ function UIV.Handle(msg)
   if cmd == "deposit" then
     -- Macro friendly: only does something when bank UI is open.
     SafeCall(RunDeposit, nil)
+    return
+  end
+
+  if cmd == "chatdebug" then
+    local parts = {}
+    for w in tostring(rest or ""):gmatch("%S+") do
+      parts[#parts + 1] = w
+    end
+    local sub = (parts[1] and parts[1]:lower()) or "status"
+
+    local function DumpChatFrames()
+      local maxN = tonumber(_G and rawget(_G, "NUM_CHAT_WINDOWS")) or 10
+      if maxN < 1 then maxN = 10 end
+      if maxN > 20 then maxN = 20 end
+
+      SafeCall(Print, "Chat windows (id -> name, shown):")
+      for i = 1, maxN do
+        local name = ""
+        if type(GetChatWindowInfo) == "function" then
+          local ok, n = pcall(GetChatWindowInfo, i)
+          if ok and type(n) == "string" then name = n end
+        end
+        if name == "" then name = "?" end
+
+        local shown = false
+        local f = _G and _G["ChatFrame" .. i]
+        if f and f.IsShown then
+          local okS, v = pcall(f.IsShown, f)
+          shown = okS and (v == true) or false
+        end
+        SafeCall(Print, string.format("  %d: %s (shown=%s)", i, name, tostring(shown)))
+      end
+      SafeCall(Print, string.format("LootIt outputChatFrame=%s", tostring(DB and DB.outputChatFrame)))
+      SafeCall(Print, string.format("LootIt other.outputChatFrame=%s", tostring(DB and DB.other and DB.other.outputChatFrame)))
+    end
+
+    if sub == "on" then
+      DB.debugChatSetup = true
+      SafeCall(Print, "Chat debug: on")
+      SafeCall(ApplyFilters)
+      return
+    end
+    if sub == "off" then
+      DB.debugChatSetup = false
+      SafeCall(Print, "Chat debug: off")
+      return
+    end
+    if sub == "toggle" then
+      DB.debugChatSetup = not (DB and DB.debugChatSetup)
+      SafeCall(Print, "Chat debug: " .. ((DB.debugChatSetup and "on") or "off"))
+      SafeCall(ApplyFilters)
+      return
+    end
+    if sub == "dump" then
+      DumpChatFrames()
+      return
+    end
+
+    SafeCall(Print, "Chat debug: " .. (((DB and DB.debugChatSetup) and "on") or "off"))
+    SafeCall(Print, "Run: /fli chatdebug dump")
     return
   end
 

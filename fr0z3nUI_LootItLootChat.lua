@@ -9,6 +9,11 @@ local env = nil
 local DB
 local CHARDB
 
+-- Forward declarations used by AddMessage hook (must be declared before the hook is defined).
+local LOOT_PATTERNS, LOOT_PREFIXES, LOOT_GROUP_PATTERNS, RECEIVE_ITEM_PATTERNS
+local BuildLootPatterns
+local MessageStartsWithLootPrefix
+
 function LootChat.SetEnv(e)
   env = e or {}
 end
@@ -54,6 +59,156 @@ local function PrintToChatFrame(msg, chatFrameID)
     return env.PrintToChatFrame(msg, chatFrameID)
   end
   return Print(msg)
+end
+
+local function GetChatWindowName(id)
+  id = tonumber(id)
+  if not id then return nil end
+  if type(GetChatWindowInfo) ~= "function" then return nil end
+  local ok, name = pcall(GetChatWindowInfo, id)
+  if ok and type(name) == "string" and name ~= "" then
+    return name
+  end
+  return nil
+end
+
+local function DebugChatSetupEnabled()
+  EnsureRefs()
+  return (DB and DB.debugChatSetup) == true
+end
+
+local function DebugPrint(line)
+  if not DebugChatSetupEnabled() then return end
+  local outFrame = (DB and DB.outputChatFrame) or 1
+  PrintToChatFrame("[LootIt ChatDebug] " .. tostring(line or ""), outFrame)
+end
+
+local addMessageHooks = nil
+local addMessageInHook = false
+
+local function HookChatFrameAddMessage(frame)
+  if not frame or type(frame.AddMessage) ~= "function" then return end
+
+  local key = tostring(frame)
+  if not addMessageHooks then addMessageHooks = {} end
+  if addMessageHooks[key] then return end
+
+  local orig = frame.AddMessage
+  addMessageHooks[key] = orig
+
+  frame.AddMessage = function(self, text, ...)
+    if addMessageInHook then
+      return orig(self, text, ...)
+    end
+
+    EnsureRefs()
+    if not (IsEnabled() and DB and DB.hideLootText) then
+      return orig(self, text, ...)
+    end
+    if type(text) ~= "string" or text == "" then
+      return orig(self, text, ...)
+    end
+
+    -- Catch messages that bypass chat event filters and are directly printed to frames.
+    if not LOOT_PREFIXES then BuildLootPatterns() end
+    if MessageStartsWithLootPrefix(text) then
+      local hasItem = (text:find("|Hitem:", 1, true) ~= nil)
+      local hasBracket = text:match("%b[]") ~= nil
+      if hasItem or hasBracket then
+        local outFrame = (DB and DB.outputChatFrame) or 1
+
+        local function GetPlayerColoredName()
+          local name = (UnitName and UnitName("player")) or "You"
+          if not (UnitClass and name) then
+            return tostring(name)
+          end
+
+          local _, classFile = UnitClass("player")
+          if C_ClassColor and C_ClassColor.GetClassColor and classFile then
+            local color = C_ClassColor.GetClassColor(classFile)
+            if color and color.WrapTextInColorCode then
+              return color:WrapTextInColorCode(name)
+            end
+          end
+          local rc = RAID_CLASS_COLORS and classFile and RAID_CLASS_COLORS[classFile]
+          if rc and rc.colorStr then
+            return "|c" .. rc.colorStr .. name .. "|r"
+          end
+          return tostring(name)
+        end
+
+        -- Reprint (if configured) so the loot isn't lost.
+        if DB and DB.echoItem then
+          local link = text:match("(|c%x%x%x%x%x%x%x%x|Hitem:%d+.-|h.-|h|r)")
+            or text:match("(|Hitem:%d+.-|h.-|h|r)")
+            or text:match("(|Hitem:%d+.-|h.-|h)")
+            or text:match("(|c%x+|Hitem:%d+.-|h.-|h|r)")
+
+          -- If we captured an uncolored link, try to upgrade to the full colored item link.
+          if link and type(link) == "string" and link ~= "" and not link:match("^|c%x%x%x%x%x%x%x%x|Hitem:") then
+            if C_Item and C_Item.GetItemInfo then
+              local _, itemLink = C_Item.GetItemInfo(link)
+              if type(itemLink) == "string" and itemLink ~= "" then
+                link = itemLink
+              end
+            end
+          end
+
+          local display = nil
+          if link then
+            -- Remove brackets in the displayed portion: |h[Name]|h -> |hName|h
+            display = link:gsub("|h%[([^%]]+)%]|h", "|h%1|h")
+          else
+            -- Fallback: use the shown [Name]
+            display = text:match("%b[]")
+          end
+
+          if display and display ~= "" then
+            local meColored = GetPlayerColoredName()
+            local out = tostring(meColored) .. ": " .. tostring(display)
+            addMessageInHook = true
+            PrintToChatFrame(out, outFrame)
+            addMessageInHook = false
+          end
+        end
+
+        if DebugChatSetupEnabled() then
+          addMessageInHook = true
+          DebugPrint(string.format(
+            "AddMessage: suppressed direct print (hasItem=%s hasBracket=%s echo=%s) text=%s",
+            tostring(hasItem),
+            tostring(hasBracket),
+            tostring((DB and DB.echoItem) and true or false),
+            tostring(text)
+          ))
+          addMessageInHook = false
+        end
+        return
+      end
+    end
+
+    return orig(self, text, ...)
+  end
+end
+
+local function HookAllChatFramesAddMessage()
+  -- Prefer CHAT_FRAMES if present; otherwise fall back to numbered frames.
+  if type(CHAT_FRAMES) == "table" then
+    for _, frameName in ipairs(CHAT_FRAMES) do
+      local f = _G and rawget(_G, frameName)
+      if f then
+        HookChatFrameAddMessage(f)
+      end
+    end
+  else
+    local n = tonumber(NUM_CHAT_WINDOWS) or 10
+    for i = 1, n do
+      local f = _G and rawget(_G, "ChatFrame" .. tostring(i))
+      if f then
+        HookChatFrameAddMessage(f)
+      end
+    end
+  end
 end
 
 local function GetDefaultMoneyConfig()
@@ -154,10 +309,10 @@ function LootChat.CaptureChatOut(eventName, out, meta)
 end
 
 -- Loot patterns
-local LOOT_PATTERNS = nil
-local LOOT_PREFIXES = nil
-local LOOT_GROUP_PATTERNS = nil
-local RECEIVE_ITEM_PATTERNS = nil
+LOOT_PATTERNS = nil
+LOOT_PREFIXES = nil
+LOOT_GROUP_PATTERNS = nil
+RECEIVE_ITEM_PATTERNS = nil
 
 local LOOT_PATTERN_KEYS
 local LOOT_GROUP_PATTERN_KEYS
@@ -206,7 +361,7 @@ LOOT_GROUP_PATTERN_KEYS = {
   "LOOT_ITEM_BONUS_ROLL_MULTIPLE",
 }
 
-local function BuildLootPatterns()
+BuildLootPatterns = function()
   local patterns = {}
   local prefixes = {}
   local groupPatterns = {}
@@ -235,11 +390,14 @@ local function BuildLootPatterns()
         receiveItemPatterns[#receiveItemPatterns + 1] = pat
       end
 
-      if k == "YOU_RECEIVE_ITEM" or k == "YOU_RECEIVE_ITEM_MULTIPLE" then
+      -- Some chat lines omit the trailing '.' (or localization differs). Allow optional period for all patterns.
+      do
         local alt = pat:gsub("%%%.%$", "%%.?$")
         if alt ~= pat then
           patterns[#patterns + 1] = alt
-          receiveItemPatterns[#receiveItemPatterns + 1] = alt
+          if k == "YOU_RECEIVE_ITEM" or k == "YOU_RECEIVE_ITEM_MULTIPLE" then
+            receiveItemPatterns[#receiveItemPatterns + 1] = alt
+          end
         end
       end
     end
@@ -264,6 +422,34 @@ local function BuildLootPatterns()
   LOOT_PREFIXES = prefixes
   LOOT_GROUP_PATTERNS = groupPatterns
   RECEIVE_ITEM_PATTERNS = receiveItemPatterns
+end
+
+local function NormalizeForPrefixMatch(s)
+  if type(s) ~= "string" then return "" end
+  -- Some client strings use non-breaking spaces; normalize them to regular spaces.
+  -- NBSP (U+00A0) in UTF-8 is \194\160, narrow NBSP (U+202F) is \226\128\175.
+  s = s:gsub("\194\160", " ")
+  s = s:gsub("\226\128\175", " ")
+  s = s:gsub("^%s+", "")
+  s = s:gsub("%s+$", "")
+  -- collapse any whitespace runs (including NBSP-ish) to a single space
+  s = s:gsub("%s+", " ")
+  return s
+end
+
+MessageStartsWithLootPrefix = function(msg)
+  if type(msg) ~= "string" or msg == "" then return false end
+  if not (LOOT_PREFIXES and #LOOT_PREFIXES > 0) then return false end
+  local tmsg = NormalizeForPrefixMatch(msg)
+  for _, prefix in ipairs(LOOT_PREFIXES) do
+    if type(prefix) == "string" and prefix ~= "" then
+      local tp = NormalizeForPrefixMatch(prefix)
+      if tp ~= "" and tmsg:sub(1, #tp) == tp then
+        return true
+      end
+    end
+  end
+  return false
 end
 
 local function StripRealmFromName(name)
@@ -372,7 +558,19 @@ end
 local function ExtractLinkFallback(msg)
   if type(msg) ~= "string" then return nil end
   return msg:match("(|c%x+|Hitem:.-|h%[.-%]|h|r)")
+    or msg:match("(|c%x+|Hitem:.-|h.-|h|r)")
     or msg:match("(|Hitem:.-|h%[.-%]|h)")
+    or msg:match("(|Hitem:.-|h.-|h)")
+end
+
+local function ExtractItemLinkRobust(msg)
+  if type(msg) ~= "string" or msg == "" then return nil end
+  -- Try to match the most common (and some uncommon) hyperlink forms.
+  return msg:match("(|c%x%x%x%x%x%x%x%x|Hitem:%d+.-|h.-|h|r)")
+    or msg:match("(|c%x%x%x%x%x%x%x%x|Hitem:%d+.-|h.-|h)")
+    or msg:match("(|Hitem:%d+.-|h.-|h|r)")
+    or msg:match("(|Hitem:%d+.-|h.-|h)")
+    or ExtractLinkFallback(msg)
 end
 
 local function NormalizeItemLink(link)
@@ -1120,12 +1318,13 @@ local function OnMoneyChat(_, _, msg, ...)
   return (handled and DB and DB.hideLootText) and true or false
 end
 
-local function OnSystemChat(_, _, msg, ...)
+local function OnSystemChat(_, eventName, msg, ...)
   EnsureRefs()
   if not IsEnabled() then return false end
   if type(msg) ~= "string" or msg == "" then return false end
 
-  LootChat.CaptureChatIn("CHAT_MSG_SYSTEM", msg)
+  local ev = (type(eventName) == "string" and eventName ~= "") and eventName or "CHAT_MSG_SYSTEM"
+  LootChat.CaptureChatIn(ev, msg)
 
   if IsLikelyMoneyMessage(msg) then
     local handled = false
@@ -1160,6 +1359,103 @@ local function OnSystemChat(_, _, msg, ...)
 
   if not LOOT_PATTERNS then BuildLootPatterns() end
 
+  -- Some loot lines (notably fishing) can show up as CHAT_MSG_SYSTEM instead of CHAT_MSG_LOOT.
+  -- If the message begins with a known loot prefix, treat it as self loot and rewrite/suppress it.
+  do
+    local prefixMatched = false
+    if LOOT_PREFIXES and #LOOT_PREFIXES > 0 then
+      local tmsg = msg:gsub("^%s+", "")
+      for _, prefix in ipairs(LOOT_PREFIXES) do
+        if type(prefix) == "string" and prefix ~= "" then
+          local tp = prefix:gsub("^%s+", "")
+          if tp ~= "" and tmsg:sub(1, #tp) == tp then
+            prefixMatched = true
+            break
+          end
+        end
+      end
+    end
+
+    if prefixMatched then
+      local link = ExtractLinkFallback(msg)
+      if not link then
+        link = msg:match("%b[]")
+      end
+
+      if not link then
+        if DebugChatSetupEnabled and DebugChatSetupEnabled() then
+          DebugPrint(string.format(
+            "OnSystemChat: loot-prefix but no link (event=%s hide=%s echo=%s) msg=%s",
+            tostring(ev),
+            tostring((DB and DB.hideLootText) and true or false),
+            tostring((DB and DB.echoItem) and true or false),
+            tostring(msg)
+          ))
+        end
+        return false
+      end
+
+      local qty
+      do
+        local escaped = EscapeLuaPattern(link)
+        qty = msg:match(escaped .. "%s*[x×]%s*(%d+)")
+          or msg:match(escaped .. "[\r\n ]*[x×]%s*(%d+)")
+          or msg:match("%s*[x×]%s*(%d+)%s*%.?$")
+      end
+
+      local handled = false
+      if DB and DB.echoItem then
+        link = NormalizeItemLink(link)
+
+        local itemID = CaptureItemIDFromLink(link)
+        if itemID and IsIgnoredItemID(itemID) then
+          LootChat.CaptureChatOut(ev, link, { handled = true, ignored = true, qty = tonumber(qty), itemID = itemID, rewrittenLoot = true })
+          return true
+        end
+
+        do
+          local n = tonumber(qty)
+          local delaySec = itemID and GetDelayPrintSecondsForItemID(itemID) or nil
+          if delaySec then
+            if DelayPrintAddItem(itemID, link, n, delaySec) then
+              LootChat.CaptureChatOut("CHAT_MSG_SYSTEM", link, { handled = true, delayed = true, delaySec = delaySec, qty = n, itemID = itemID, rewrittenLoot = true })
+              return true
+            end
+          end
+        end
+
+        link = ApplyItemLinkAlias(link)
+        local displayLink = StripDisplayedLinkBrackets(link)
+        local out = displayLink
+        local n = tonumber(qty)
+        if n and n > 1 then
+          out = string.format("%s x%d", displayLink, n)
+        end
+
+        if IsItemLevelEnabled() and type(link) == "string" and link:find("|Hitem:", 1, true) then
+          local ilvl = GetEquippableItemLevelSuffix(link)
+          if ilvl then
+            local color = link:match("^(|c%x%x%x%x%x%x%x%x)")
+            local ilvlText = color and (color .. tostring(ilvl) .. "|r") or tostring(ilvl)
+            out = out .. " " .. ilvlText
+          end
+        end
+
+        LootCombineAdd(out)
+        handled = true
+        LootChat.CaptureChatOut(ev, out, {
+          handled = handled,
+          rewrittenLoot = true,
+          combine = LootChat.LootCombineEnabled() and true or false,
+          qty = tonumber(qty),
+          itemID = CaptureItemIDFromLink(link),
+        })
+      end
+
+      return (handled and DB and DB.hideLootText) and true or false
+    end
+  end
+
   local link, qty
   for _, pat in ipairs(RECEIVE_ITEM_PATTERNS or {}) do
     local a, b = msg:match(pat)
@@ -1172,7 +1468,7 @@ local function OnSystemChat(_, _, msg, ...)
 
   if LootChat.CaptureEnabled() then
     LootChat.CaptureAppend("MATCH", {
-      event = "CHAT_MSG_SYSTEM",
+      event = ev,
       link = link,
       qty = qty,
       hasItemLink = (msg:find("|Hitem:", 1, true) ~= nil) or false,
@@ -1318,17 +1614,12 @@ local function OnLootChat(_, _, msg, author, ...)
     local hasItem = msg:find("|Hitem:", 1, true) ~= nil
     local hasCurrency = msg:find("|Hcurrency:", 1, true) ~= nil
     if (not hasItem) and (not hasCurrency) and (not IsLikelyMoneyMessage(msg)) then
-      local function Trim(s)
-        if type(s) ~= "string" then return "" end
-        s = s:gsub("^%s+", "")
-        s = s:gsub("%s+$", "")
-        return s
-      end
-
-      local tmsg = Trim(msg)
+      local tmsg = NormalizeForPrefixMatch(msg)
       for _, prefix in ipairs(LOOT_PREFIXES) do
-        if tmsg == Trim(prefix) then
-          return true
+        if type(prefix) == "string" and prefix ~= "" then
+          if tmsg == NormalizeForPrefixMatch(prefix) then
+            return true
+          end
         end
       end
     end
@@ -1365,11 +1656,28 @@ local function OnLootChat(_, _, msg, author, ...)
   local isSelfLoot = false
   local playerName
   local link, qty
+  local matchedByPattern = false
+  local handled = false
+
+  local dbgLootPrefixLine = (DebugChatSetupEnabled and DebugChatSetupEnabled()) and MessageStartsWithLootPrefix(msg) or false
+
+  -- Prefer the chat event author for self-detection; some localized/variant loot lines don't match patterns.
+  do
+    local me = (UnitName and UnitName("player")) or nil
+    if type(author) == "string" and author ~= "" and type(me) == "string" and me ~= "" then
+      local a = StripRealmFromName(author)
+      local m = StripRealmFromName(me)
+      if a ~= "" and m ~= "" and a == m then
+        isSelfLoot = true
+      end
+    end
+  end
 
   for _, pat in ipairs(LOOT_PATTERNS or {}) do
     local a, b = msg:match(pat)
     if a then
       isSelfLoot = true
+      matchedByPattern = true
       if b then
         link, qty = a, b
       else
@@ -1379,10 +1687,41 @@ local function OnLootChat(_, _, msg, author, ...)
     end
   end
 
+  -- Fallback: if patterns miss but the message starts with a known loot prefix and contains an item hyperlink,
+  -- extract the first item link and optional quantity.
+  if (not matchedByPattern) and (not link) and (LOOT_PREFIXES and #LOOT_PREFIXES > 0) then
+    local hasItem = (msg:find("|Hitem:", 1, true) ~= nil) and true or false
+    if hasItem then
+      if MessageStartsWithLootPrefix(msg) then
+        local extracted = ExtractItemLinkRobust(msg) or ExtractLinkFallback(msg)
+        if extracted then
+          isSelfLoot = true
+          matchedByPattern = true
+          link = extracted
+          do
+            local escaped = EscapeLuaPattern(extracted)
+            qty = msg:match(escaped .. "%s*[x×]%s*(%d+)")
+              or msg:match(escaped .. "[\r\n ]*[x×]%s*(%d+)")
+              or msg:match("%s*[x×]%s*(%d+)%s*%.?$")
+          end
+        else
+          -- As a last resort, use the displayed [Item Name] token.
+          local bracket = msg:match("%b[]")
+          if bracket then
+            isSelfLoot = true
+            matchedByPattern = true
+            link = bracket
+          end
+        end
+      end
+    end
+  end
+
   if not link then
     for _, pat in ipairs(LOOT_GROUP_PATTERNS or {}) do
       local a, b, c = msg:match(pat)
       if a and b then
+        matchedByPattern = true
         if IsItemLink(a) and not IsItemLink(b) then
           link, playerName, qty = a, b, c
         elseif IsItemLink(b) and not IsItemLink(a) then
@@ -1403,6 +1742,32 @@ local function OnLootChat(_, _, msg, author, ...)
     link = ExtractLinkFallback(msg)
   end
 
+  -- If the message contains an item hyperlink but our normal matcher couldn't extract it,
+  -- fall back to a very permissive hyperlink extractor.
+  if not link then
+    if msg:find("|Hitem:", 1, true) then
+      link = ExtractItemLinkRobust(msg)
+      if link then
+        isSelfLoot = true
+        matchedByPattern = true
+      end
+    end
+  end
+
+  if DebugChatSetupEnabled and DebugChatSetupEnabled() and (not matchedByPattern) then
+    local hasItem = (msg:find("|Hitem:", 1, true) ~= nil) and true or false
+    local hasCurrency = (msg:find("|Hcurrency:", 1, true) ~= nil) and true or false
+    DebugPrint(string.format(
+      "OnLootChat: pattern miss (hide=%s echo=%s hasItem=%s hasCurrency=%s author=%s) msg=%s",
+      tostring((DB and DB.hideLootText) and true or false),
+      tostring((DB and DB.echoItem) and true or false),
+      tostring(hasItem),
+      tostring(hasCurrency),
+      tostring(author),
+      tostring(msg)
+    ))
+  end
+
   if LootChat.CaptureEnabled() then
     LootChat.CaptureAppend("MATCH", {
       event = "CHAT_MSG_LOOT",
@@ -1413,6 +1778,17 @@ local function OnLootChat(_, _, msg, author, ...)
     })
   end
   if not link then
+    if DebugChatSetupEnabled and DebugChatSetupEnabled() then
+      local hasItem = (msg:find("|Hitem:", 1, true) ~= nil) and true or false
+      local hasCurrency = (msg:find("|Hcurrency:", 1, true) ~= nil) and true or false
+      local raw = tostring(msg):gsub("|", "||")
+      DebugPrint(string.format(
+        "OnLootChat: NO LINK (hasItem=%s hasCurrency=%s) msg=%s",
+        tostring(hasItem), tostring(hasCurrency), tostring(msg)
+      ))
+      -- Print a raw form (escaped pipes) so we can see the hyperlink codes in chat.
+      DebugPrint("OnLootChat: NO LINK raw=" .. raw)
+    end
     return false
   end
 
@@ -1573,8 +1949,10 @@ local function OnLootChat(_, _, msg, author, ...)
 
     if isSelfLoot then
       LootCombineAdd(out)
+      handled = true
     else
       Print(FormatOtherLine(playerName, out))
+      handled = true
     end
 
     LootChat.CaptureChatOut("CHAT_MSG_LOOT", out, {
@@ -1587,7 +1965,19 @@ local function OnLootChat(_, _, msg, author, ...)
     })
   end
 
-  return (DB and DB.hideLootText) and true or false
+  local suppress = (handled and DB and DB.hideLootText) and true or false
+  if dbgLootPrefixLine then
+    DebugPrint(string.format(
+      "OnLootChat(prefix): handled=%s suppress=%s isSelfLoot=%s link=%s qty=%s hasItem=%s",
+      tostring(handled and true or false),
+      tostring(suppress),
+      tostring(isSelfLoot and true or false),
+      tostring(link),
+      tostring(qty),
+      tostring(msg:find("|Hitem:", 1, true) ~= nil)
+    ))
+  end
+  return suppress
 end
 
 local function OnAchievementChat(_, _, msg, author, ...)
@@ -1621,6 +2011,28 @@ end
 function LootChat.ApplyFilters()
   EnsureRefs()
 
+  -- Install direct-print suppression once; only activates when enabled+hideLootText.
+  HookAllChatFramesAddMessage()
+
+  local dbg = (DB and DB.debugChatSetup) == true
+  local function D(s)
+    if not dbg then return end
+    local outFrame = (DB and DB.outputChatFrame) or 1
+    PrintToChatFrame("[LootIt ChatDebug] " .. tostring(s or ""), outFrame)
+  end
+
+  if dbg then
+    local outFrame = (DB and DB.outputChatFrame) or 1
+    local otherFrame = (DB and DB.other and DB.other.outputChatFrame) or nil
+    local outName = GetChatWindowName(outFrame) or "?"
+    local otherName = otherFrame and (GetChatWindowName(otherFrame) or "?") or "(nil)"
+    local ach = (DB and DB.other and DB.other.achievement and DB.other.achievement.enabled) and true or false
+    D(string.format(
+      "ApplyFilters begin enabled=%s output=%s('%s') other=%s('%s') achievement=%s",
+      tostring(IsEnabled()), tostring(outFrame), tostring(outName), tostring(otherFrame), tostring(otherName), tostring(ach)
+    ))
+  end
+
   if not ChatFrame_AddMessageEventFilter then
     ChatFrame_AddMessageEventFilter = _G and rawget(_G, "ChatFrame_AddMessageEventFilter")
   end
@@ -1629,10 +2041,17 @@ function LootChat.ApplyFilters()
   end
   if not (ChatFrame_AddMessageEventFilter and ChatFrame_RemoveMessageEventFilter) then return end
 
+  if dbg then
+    D(string.format("ChatFrame_AddMessageEventFilter=%s Remove=%s", type(ChatFrame_AddMessageEventFilter), type(ChatFrame_RemoveMessageEventFilter)))
+  end
+
   ChatFrame_RemoveMessageEventFilter("CHAT_MSG_LOOT", OnLootChat)
   ChatFrame_RemoveMessageEventFilter("CHAT_MSG_CURRENCY", OnCurrencyChat)
   ChatFrame_RemoveMessageEventFilter("CHAT_MSG_MONEY", OnMoneyChat)
   ChatFrame_RemoveMessageEventFilter("CHAT_MSG_SYSTEM", OnSystemChat)
+  ChatFrame_RemoveMessageEventFilter("CHAT_MSG_COMBAT_MISC_INFO", OnSystemChat)
+  ChatFrame_RemoveMessageEventFilter("CHAT_MSG_SKILL", OnSystemChat)
+  ChatFrame_RemoveMessageEventFilter("CHAT_MSG_TRADESKILLS", OnSystemChat)
   ChatFrame_RemoveMessageEventFilter("CHAT_MSG_ACHIEVEMENT", OnAchievementChat)
   ChatFrame_RemoveMessageEventFilter("CHAT_MSG_GUILD_ACHIEVEMENT", OnAchievementChat)
   if IsEnabled() then
@@ -1640,10 +2059,19 @@ function LootChat.ApplyFilters()
     ChatFrame_AddMessageEventFilter("CHAT_MSG_CURRENCY", OnCurrencyChat)
     ChatFrame_AddMessageEventFilter("CHAT_MSG_MONEY", OnMoneyChat)
     ChatFrame_AddMessageEventFilter("CHAT_MSG_SYSTEM", OnSystemChat)
+    ChatFrame_AddMessageEventFilter("CHAT_MSG_COMBAT_MISC_INFO", OnSystemChat)
+    ChatFrame_AddMessageEventFilter("CHAT_MSG_SKILL", OnSystemChat)
+    ChatFrame_AddMessageEventFilter("CHAT_MSG_TRADESKILLS", OnSystemChat)
   end
   if DB and DB.other and DB.other.achievement and DB.other.achievement.enabled then
     ChatFrame_AddMessageEventFilter("CHAT_MSG_ACHIEVEMENT", OnAchievementChat)
     ChatFrame_AddMessageEventFilter("CHAT_MSG_GUILD_ACHIEVEMENT", OnAchievementChat)
+  end
+
+  if dbg then
+    local enabled = IsEnabled() and true or false
+    local ach = (DB and DB.other and DB.other.achievement and DB.other.achievement.enabled) and true or false
+    D(string.format("ApplyFilters done (enabled=%s, achievement=%s)", tostring(enabled), tostring(ach)))
   end
 end
 

@@ -123,6 +123,10 @@ local DEFAULTS = {
   debugCaptureMax = 200,
   debugCaptureStacks = false,
 
+  -- Debug: print chat filter setup & ChatFrame mapping hints.
+  -- Use via: /fli chatdebug on|off|toggle|status|dump
+  debugChatSetup = false,
+
   tabard = {
     enabled = true,
     delay = 0.75,
