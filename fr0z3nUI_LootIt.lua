@@ -3643,6 +3643,7 @@ do
       IsMailNotifierEnabled = IsMailNotifierEnabled,
       IsMailEditorOpen = IsMailEditorOpen,
       ToggleConfigUI = ToggleConfigUI,
+      Clamp = Clamp,
       Print = Print,
     })
 
@@ -3696,6 +3697,56 @@ SlashCmdList.FR0Z3NUI_LOOTIT = function(msg)
   Print("LootIt slash handler not available.")
 end
 
+local function SafeUpdateMailNotifier()
+  if type(UpdateMailNotifier) ~= "function" then return end
+  pcall(UpdateMailNotifier)
+end
+
+local _mailNotifierBootstrapTicker
+local function BootstrapMailNotifier()
+  -- Mail state can arrive a bit after login; do a short refresh loop so the
+  -- notifier appears without needing to open the /fli UI.
+  if not (C_Timer and C_Timer.NewTicker and C_Timer.After) then
+    SafeUpdateMailNotifier()
+    return
+  end
+
+  -- If a bootstrap loop is already running, just force an update now.
+  if _mailNotifierBootstrapTicker then
+    SafeUpdateMailNotifier()
+    return
+  end
+
+  local tries = 0
+  local maxTries = 18 -- ~20-25s depending on ticker interval
+  local interval = 1.25
+
+  local function Tick()
+    tries = tries + 1
+    SafeUpdateMailNotifier()
+
+    local stop = (tries >= maxTries)
+    if not stop then
+      local has = (HasNewMail and HasNewMail()) and true or false
+      if has then
+        local mn = (LI and LI.Mail and LI.Mail.GetMailNotifier and LI.Mail.GetMailNotifier()) or nil
+        if mn and mn.IsShown and mn:IsShown() then
+          stop = true
+        end
+      end
+    end
+
+    if stop and _mailNotifierBootstrapTicker and _mailNotifierBootstrapTicker.Cancel then
+      _mailNotifierBootstrapTicker:Cancel()
+      _mailNotifierBootstrapTicker = nil
+    end
+  end
+
+  Tick()
+  C_Timer.After(0.75, Tick)
+  _mailNotifierBootstrapTicker = C_Timer.NewTicker(interval, Tick, maxTries)
+end
+
 local f = CreateFrame("Frame")
 f:RegisterEvent("PLAYER_LOGIN")
 f:RegisterEvent("PLAYER_ENTERING_WORLD")
@@ -3703,6 +3754,7 @@ f:RegisterEvent("PLAYER_GUILD_UPDATE")
 f:RegisterEvent("MERCHANT_SHOW")
 f:RegisterEvent("MERCHANT_CLOSED")
 f:RegisterEvent("UPDATE_PENDING_MAIL")
+f:RegisterEvent("MAIL_INBOX_UPDATE")
 f:RegisterEvent("GUILDBANKFRAME_OPENED")
 f:RegisterEvent("GUILDBANKFRAME_CLOSED")
 f:RegisterEvent("BANKFRAME_OPENED")
@@ -3726,14 +3778,14 @@ f:SetScript("OnEvent", function(_, event, arg1)
     end
     ApplyFilters()
     ApplyFiltersSoon(1)
-    C_Timer.After(1, UpdateMailNotifier)
+    BootstrapMailNotifier()
     if UpdateDepositButtonVisibility then
       C_Timer.After(0.25, UpdateDepositButtonVisibility)
     end
   elseif event == "PLAYER_ENTERING_WORLD" then
     UpdateSeenGuilds()
     ApplyFiltersSoon(0.5)
-    C_Timer.After(1, UpdateMailNotifier)
+    BootstrapMailNotifier()
     if UpdateDepositButtonVisibility then
       C_Timer.After(0.25, UpdateDepositButtonVisibility)
     end
@@ -3775,9 +3827,12 @@ f:SetScript("OnEvent", function(_, event, arg1)
       UpdateDepositButtonVisibility()
     end
   elseif event == "UPDATE_PENDING_MAIL" then
-    C_Timer.After(0.5, UpdateMailNotifier)
+    BootstrapMailNotifier()
+  elseif event == "MAIL_INBOX_UPDATE" then
+    -- Extra safety: some clients update HasNewMail/UI state later than UPDATE_PENDING_MAIL.
+    BootstrapMailNotifier()
   elseif event == "PLAYER_REGEN_DISABLED" or event == "PLAYER_REGEN_ENABLED" then
-    UpdateMailNotifier()
+    SafeUpdateMailNotifier()
   elseif event == "LOOT_OPENED" or event == "LOOT_READY" then
     -- Other addons can remove chat filters at runtime; re-apply here so loot lines are still rewritten.
     ApplyFilters()

@@ -15,6 +15,25 @@ do
     return Mail._notifierEnv or {}
   end
 
+  local function ClampValue(v, mn, mx)
+    local env = GetEnv()
+    local clampFn = (env and rawget(env, "Clamp")) or (_G and rawget(_G, "Clamp"))
+    if type(clampFn) == "function" then
+      local ok, res = pcall(clampFn, v, mn, mx)
+      if ok then
+        return res
+      end
+    end
+
+    v = tonumber(v)
+    mn = tonumber(mn)
+    mx = tonumber(mx)
+    if not v then return mn end
+    if mn and v < mn then return mn end
+    if mx and v > mx then return mx end
+    return v
+  end
+
   local MAIL_TOY_KATY_STAMPWHISTLE = 156833
 
   local MailNotifier
@@ -178,7 +197,7 @@ do
 
     local a = mnc and mnc.ui and tonumber(mnc.ui.alpha)
     if a and modelFrame.SetAlpha then
-      modelFrame:SetAlpha(Clamp(a, 0.10, 1.00))
+      modelFrame:SetAlpha(ClampValue(a, 0.10, 1.00))
     end
   end
 
@@ -226,9 +245,9 @@ do
     local mnc = MailNotifyCfg()
     if not mnc then return end
     mnc.ui = mnc.ui or {}
-    local w = Clamp(mnc.ui.w or 200, 40, 600)
-    local h = Clamp(mnc.ui.h or 220, 40, 600)
-    local a = Clamp(mnc.ui.alpha or 0.5, 0.10, 1.00)
+    local w = ClampValue(mnc.ui.w or 200, 40, 600)
+    local h = ClampValue(mnc.ui.h or 220, 40, 600)
+    local a = ClampValue(mnc.ui.alpha or 0.5, 0.10, 1.00)
     mnc.ui.w, mnc.ui.h, mnc.ui.alpha = w, h, a
 
     local frame = CreateFrame("Frame", "fr0z3nUI_LootIt_MailNotifier", UIParent)
@@ -299,7 +318,7 @@ do
       else
         local z = tonumber(mnc4.model.zoom)
         if not z then z = 1.0 end
-        z = Clamp(z + (delta * 0.08), 0.20, 3.00)
+        z = ClampValue(z + (delta * 0.08), 0.20, 3.00)
         mnc4.model.zoom = z
         Mail.ModelApplyZoom(self.model, z)
       end
@@ -364,10 +383,10 @@ do
     if mn and mn.ui then
       frame:ClearAllPoints()
       frame:SetPoint(mn.ui.point or "TOPRIGHT", UIParent, mn.ui.point or "TOPRIGHT", mn.ui.x or 0, mn.ui.y or 0)
-      local w = Clamp(mn.ui.w or frame:GetWidth() or 200, 40, 600)
-      local h = Clamp(mn.ui.h or frame:GetHeight() or 220, 40, 600)
+      local w = ClampValue(mn.ui.w or frame:GetWidth() or 200, 40, 600)
+      local h = ClampValue(mn.ui.h or frame:GetHeight() or 220, 40, 600)
       local currentAlpha = (frame.model and frame.model.GetAlpha and frame.model:GetAlpha()) or 1
-      local a = Clamp(mn.ui.alpha or currentAlpha, 0.10, 1.00)
+      local a = ClampValue(mn.ui.alpha or currentAlpha, 0.10, 1.00)
       mn.ui.w, mn.ui.h, mn.ui.alpha = w, h, a
       frame:SetSize(w, h)
       if frame.model and frame.model.SetAlpha then
@@ -424,6 +443,24 @@ function LI.Mail.BuildTab(mailPanel, mailUI, env)
   local ModelSetRotation = env.ModelSetRotation or LI.Mail.ModelSetRotation or function(...) end
   local ModelApplyZoom = env.ModelApplyZoom or LI.Mail.ModelApplyZoom or function(...) end
   local GetMailNotifier = env.GetMailNotifier or LI.Mail.GetMailNotifier or function(...) return nil end
+
+  local _ClampFn = (type(rawget(env, "Clamp")) == "function") and rawget(env, "Clamp") or (_G and rawget(_G, "Clamp"))
+  local function ClampValue(v, mn, mx)
+    if type(_ClampFn) == "function" then
+      local ok, res = pcall(_ClampFn, v, mn, mx)
+      if ok then
+        return res
+      end
+    end
+
+    v = tonumber(v)
+    mn = tonumber(mn)
+    mx = tonumber(mx)
+    if not v then return mn end
+    if mn and v < mn then return mn end
+    if mx and v > mx then return mx end
+    return v
+  end
 
   local reloadBtn = env.reloadBtn
 
@@ -515,7 +552,7 @@ function LI.Mail.BuildTab(mailPanel, mailUI, env)
     else
       local z = tonumber(mnc.model.zoom)
       if not z then z = 1.0 end
-      z = Clamp(z + (delta * 0.08), 0.20, 3.00)
+      z = ClampValue(z + (delta * 0.08), 0.20, 3.00)
       mnc.model.zoom = z
       ModelApplyZoom(self, z)
     end
@@ -620,9 +657,9 @@ function LI.Mail.BuildTab(mailPanel, mailUI, env)
     if not mnc then return end
     mnc.ui = mnc.ui or {}
 
-    local w = Clamp(mnc.ui.w or 200, 40, 600)
-    local h = Clamp(mnc.ui.h or 220, 40, 600)
-    local a = Clamp(mnc.ui.alpha or 0.5, 0.10, 1.00)
+    local w = ClampValue(mnc.ui.w or 200, 40, 600)
+    local h = ClampValue(mnc.ui.h or 220, 40, 600)
+    local a = ClampValue(mnc.ui.alpha or 0.5, 0.10, 1.00)
     mnc.ui.w, mnc.ui.h, mnc.ui.alpha = w, h, a
 
     local mn = GetMailNotifier() or CreateMailNotifier()
@@ -938,9 +975,9 @@ function LI.Mail.BuildTab(mailPanel, mailUI, env)
       mnc.ui = mnc.ui or {}
       mnc.model = mnc.model or {}
 
-      local w = Clamp(mnc.ui.w or 200, 40, 600)
-      local h = Clamp(mnc.ui.h or 220, 40, 600)
-      local a = Clamp(mnc.ui.alpha or 0.5, 0.10, 1.00)
+      local w = ClampValue(mnc.ui.w or 200, 40, 600)
+      local h = ClampValue(mnc.ui.h or 220, 40, 600)
+      local a = ClampValue(mnc.ui.alpha or 0.5, 0.10, 1.00)
       wBox:SetText(tostring(math.floor(w + 0.5)))
       hBox:SetText(tostring(math.floor(h + 0.5)))
       alphaSlider:SetValue(a)
@@ -955,7 +992,7 @@ function LI.Mail.BuildTab(mailPanel, mailUI, env)
       end
       UIDropDownMenu_SetSelectedID(strataDD, selected)
 
-      local z = Clamp(mnc.model.zoom or 0.9, 0.20, 3.00)
+      local z = ClampValue(mnc.model.zoom or 0.9, 0.20, 3.00)
       zoomSlider:SetValue(z)
 
       local anim = tonumber(mnc.model.anim) or 0
@@ -1013,7 +1050,7 @@ function LI.Mail.BuildTab(mailPanel, mailUI, env)
       local mnc = MailNotifyCfg()
       if not mnc then return end
       mnc.ui = mnc.ui or {}
-      mnc.ui.alpha = Clamp(v, 0.10, 1.00)
+      mnc.ui.alpha = ClampValue(v, 0.10, 1.00)
       ApplyNotifierSizingAndAlpha()
       if preview and preview.SetAlpha then
         preview:SetAlpha(mnc.ui.alpha)
@@ -1026,7 +1063,7 @@ function LI.Mail.BuildTab(mailPanel, mailUI, env)
       local mnc = MailNotifyCfg()
       if not mnc then return end
       mnc.model = mnc.model or {}
-      mnc.model.zoom = Clamp(v, 0.20, 3.00)
+      mnc.model.zoom = ClampValue(v, 0.20, 3.00)
       ApplyMailModelToFrame(preview)
       UpdateMailNotifier()
     end)
