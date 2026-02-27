@@ -424,9 +424,70 @@ function LI.Trade.BuildTab(depositPanel)
   restockBtn:SetText("Restock")
   restockBtn:Hide()
 
+  local function _GetColorRGB(c)
+    if type(c) ~= "table" then return nil end
+    if type(c.GetRGB) == "function" then
+      local ok, r, g, b = pcall(c.GetRGB, c)
+      if ok and r and g and b then return r, g, b end
+    end
+    if c.r and c.g and c.b then
+      return c.r, c.g, c.b
+    end
+    if c[1] and c[2] and c[3] then
+      return c[1], c[2], c[3]
+    end
+    return nil
+  end
+
   local function SetRestockBtnVisual(on)
     if not (restockBtn and restockBtn.SetText) then return end
-    restockBtn:SetText(on and "|cffffff00Restock|r" or "Restock")
+    restockBtn._liRestockOn = (on == true)
+    restockBtn:SetText("Restock")
+
+    -- Prefer font objects: UIPanelButtonTemplate's OnEnter/OnLeave will otherwise
+    -- overwrite text colors and make the button look permanently yellow.
+    if restockBtn.SetNormalFontObject then
+      local gfNormal = rawget(_G, "GameFontNormal")
+      local gfDis = rawget(_G, "GameFontDisable")
+      if gfDis and restockBtn.SetDisabledFontObject then
+        restockBtn:SetDisabledFontObject(gfDis)
+      end
+      if on == true then
+        -- ON: yellow
+        if gfNormal then restockBtn:SetNormalFontObject(gfNormal) end
+        if gfNormal and restockBtn.SetHighlightFontObject then restockBtn:SetHighlightFontObject(gfNormal) end
+      else
+        -- OFF: grey
+        if gfDis then restockBtn:SetNormalFontObject(gfDis) end
+        if gfDis and restockBtn.SetHighlightFontObject then restockBtn:SetHighlightFontObject(gfDis) end
+      end
+      return
+    end
+
+    local fs = (restockBtn.GetFontString and restockBtn:GetFontString())
+    if not (fs and fs.SetTextColor) then return end
+
+    -- NOTE: UIPanelButtonTemplate uses yellow-ish text by default (GameFontNormal),
+    -- so embedding a yellow color code makes it look permanently "on".
+    -- Use Blizzard's standard font colors to make on/off obvious.
+    local enabled = (restockBtn.IsEnabled and restockBtn:IsEnabled()) and true or false
+    local r, g, b
+    if not enabled then
+      r, g, b = _GetColorRGB(rawget(_G, "DISABLED_FONT_COLOR") or rawget(_G, "GRAY_FONT_COLOR"))
+    else
+      local onColor = rawget(_G, "NORMAL_FONT_COLOR")
+      local offColor = rawget(_G, "GRAY_FONT_COLOR") or rawget(_G, "DISABLED_FONT_COLOR")
+      r, g, b = _GetColorRGB((on == true) and onColor or offColor)
+    end
+    if r and g and b then
+      fs:SetTextColor(r, g, b, 1)
+    end
+  end
+
+  -- Keep visual state consistent when other code enables/disables the button.
+  if restockBtn and restockBtn.HookScript then
+    restockBtn:HookScript("OnEnable", function() SetRestockBtnVisual(restockBtn._liRestockOn == true) end)
+    restockBtn:HookScript("OnDisable", function() SetRestockBtnVisual(restockBtn._liRestockOn == true) end)
   end
 
   local actionBtn = CreateFrame("Button", nil, depositPanel, "UIPanelButtonTemplate")
@@ -1051,14 +1112,53 @@ function LI.Trade.BuildTab(depositPanel)
     local charDisabled = (type(stores.charDisabledTbl) == "table" and stores.charDisabledTbl[id] == true) and true or false
 
     local restockOn = false
+    local effectiveSource = nil
+    local effectiveCount = nil
     if mode ~= "deposit" then
       local rAcc = NormalizeRule(type(stores.accTbl) == "table" and stores.accTbl[id])
       local rChar = NormalizeRule(type(stores.charTbl) == "table" and stores.charTbl[id])
       local rRealm = NormalizeRule(type(stores.realmTbl) == "table" and stores.realmTbl[id])
-      restockOn = ((rAcc and rAcc.restock) or (rChar and rChar.restock) or (rRealm and rRealm.restock)) and true or false
+
+      -- Restock should reflect the *effective active* rule (ignores disabled rules),
+      -- otherwise it can look permanently "on" even though the rule is disabled.
+      if hasAccRule and (not accDisabled) and (not accDisabledOnRealm) and (not accDisabledOnChar) then
+        effectiveSource = "acc"
+      elseif hasRealmRule and (not realmDisabled) and (not realmDisabledOnChar) then
+        effectiveSource = "realm"
+      elseif hasCharRule and (not charDisabled) then
+        effectiveSource = "char"
+      end
+
+      if effectiveSource == "acc" then
+        restockOn = (rAcc and rAcc.restock == true) and true or false
+        effectiveCount = (rAcc and rAcc.count ~= nil) and tonumber(rAcc.count) or nil
+      elseif effectiveSource == "realm" then
+        restockOn = (rRealm and rRealm.restock == true) and true or false
+        effectiveCount = (rRealm and rRealm.count ~= nil) and tonumber(rRealm.count) or nil
+      elseif effectiveSource == "char" then
+        restockOn = (rChar and rChar.restock == true) and true or false
+        effectiveCount = (rChar and rChar.count ~= nil) and tonumber(rChar.count) or nil
+      else
+        restockOn = false
+        effectiveCount = nil
+      end
+
       if (not hasAccRule) and (not hasCharRule) and (not hasRealmRule) then
         restockOn = (depositPanel._pendingRestockID == id and depositPanel._pendingRestock == true) and true or false
       end
+    end
+
+    -- Keep the Target box in sync with the effective active rule.
+    -- This prevents confusing cases where a rule exists but the Target field looks empty.
+    if targetBox and targetBox.SetText and (mode == "buy" or mode == "sell") then
+      local n = tonumber(effectiveCount)
+      if n ~= nil then
+        n = math.floor(n)
+        if n < 0 then n = 0 end
+        if n > 9999 then n = 9999 end
+      end
+      targetBox:SetText((n ~= nil and n > 0) and tostring(n) or "")
+      if UpdateTargetPlaceholder then pcall(UpdateTargetPlaceholder) end
     end
 
     local flags = GetDepositItemFlags(id)
@@ -1460,8 +1560,14 @@ function LI.Trade.BuildTab(depositPanel)
       -- (Move behavior is implemented in those buttons' click handlers.)
     end
 
-    restockBtn:Enable()
-    SetRestockBtnVisual(restockOn)
+    local isBuy = (mode == "buy")
+    if isBuy then
+      restockBtn:Enable()
+      SetRestockBtnVisual(restockOn)
+    else
+      restockBtn:Disable()
+      SetRestockBtnVisual(false)
+    end
   end
 
   local function NormalizeBankTarget(t)
@@ -1718,11 +1824,32 @@ function LI.Trade.BuildTab(depositPanel)
     return nil
   end
 
+  local function ExtractItemIDFromLink(link)
+    if type(link) ~= "string" or link == "" then return nil end
+    local id = link:match("Hitem:(%d+):")
+    if not id then id = link:match("item:(%d+)") end
+    id = id and tonumber(id) or nil
+    if id and id > 0 then return id end
+    return nil
+  end
+
   local function TrySetIDFromCursor()
     if type(GetCursorInfo) ~= "function" then return false end
-    local kind, itemID = GetCursorInfo()
-    if kind ~= "item" then return false end
-    itemID = tonumber(itemID)
+    local kind, a1, a2 = GetCursorInfo()
+    local itemID = nil
+
+    if kind == "item" then
+      itemID = tonumber(a1) or ExtractItemIDFromLink(a2) or ExtractItemIDFromLink(a1)
+    elseif kind == "merchant" then
+      local idx = tonumber(a1)
+      if idx and idx > 0 and type(GetMerchantItemLink) == "function" then
+        local link = GetMerchantItemLink(idx)
+        itemID = ExtractItemIDFromLink(link)
+      end
+    else
+      return false
+    end
+
     if not itemID or itemID <= 0 then return false end
     if type(ClearCursor) == "function" then
       ClearCursor()
@@ -1740,6 +1867,17 @@ function LI.Trade.BuildTab(depositPanel)
     if button ~= "LeftButton" then return end
     TrySetIDFromCursor()
   end)
+
+  -- Let you drop onto the Trade panel too (useful for dragging from the merchant window).
+  if depositPanel and depositPanel.EnableMouse then
+    depositPanel:EnableMouse(true)
+  end
+  if depositPanel and depositPanel.SetScript then
+    depositPanel:SetScript("OnMouseUp", function(_, button)
+      if button ~= "LeftButton" then return end
+      TrySetIDFromCursor()
+    end)
+  end
 
   local function ApplyTargetToExistingRules()
     local id = GetCurrentID()
@@ -1867,6 +2005,16 @@ function LI.Trade.BuildTab(depositPanel)
     UpdateFoodDiffPlaceholder()
     UpdateTargetPlaceholder()
     UpdateKeepPlaceholder()
+
+    -- Ensure Restock visual state isn't stale when switching modes.
+    if isBuy then
+      local id = GetCurrentID()
+      if id then
+        UpdateScopeButtons(id)
+      else
+        SetRestockBtnVisual(false)
+      end
+    end
 
     if isDeposit then
       -- Bank + GBTab above the Character/Realm/Account row, with one button-height gap.
@@ -1998,6 +2146,58 @@ function LI.Trade.BuildTab(depositPanel)
     local reloadBtn = parent and parent._reloadBtn
 
     if parent and reloadBtn and reloadBtn.SetPoint then
+      local dbgBtn = CreateFrame("Button", nil, depositPanel, "UIPanelButtonTemplate")
+      dbgBtn:SetSize(70, 22)
+      dbgBtn:SetPoint("RIGHT", reloadBtn, "LEFT", -6, 0)
+
+      local function RefreshTradeDebugBtn()
+        local on = (LI and LI.Trade and LI.Trade._debugOn == true) and true or false
+        dbgBtn._liDbgOn = (on == true)
+        dbgBtn:SetText("Debug")
+
+        -- Stable toggle colors (UIPanelButtonTemplate defaults to yellow).
+        if dbgBtn.SetNormalFontObject then
+          local gfOn = rawget(_G, "GameFontNormal")
+          local gfOff = rawget(_G, "GameFontDisable")
+          local gfDis = rawget(_G, "GameFontDisable")
+          if gfDis and dbgBtn.SetDisabledFontObject then
+            dbgBtn:SetDisabledFontObject(gfDis)
+          end
+          if on == true then
+            if gfOn then dbgBtn:SetNormalFontObject(gfOn) end
+            if gfOn and dbgBtn.SetHighlightFontObject then dbgBtn:SetHighlightFontObject(gfOn) end
+          else
+            if gfOff then dbgBtn:SetNormalFontObject(gfOff) end
+            if gfOff and dbgBtn.SetHighlightFontObject then dbgBtn:SetHighlightFontObject(gfOff) end
+          end
+          return
+        end
+
+        local fs = (dbgBtn.GetFontString and dbgBtn:GetFontString())
+        if fs and fs.SetTextColor then
+          if on == true then
+            fs:SetTextColor(1, 0.82, 0, 1)
+          else
+            fs:SetTextColor(0.5, 0.5, 0.5, 1)
+          end
+        end
+      end
+
+      RefreshTradeDebugBtn()
+      dbgBtn:SetScript("OnClick", function()
+        LI.Trade = LI.Trade or {}
+        LI.Trade._debugOn = (LI.Trade._debugOn ~= true) and true or false
+        RefreshTradeDebugBtn()
+        Print("Trade debug: " .. (LI.Trade._debugOn and "On" or "Off"))
+      end)
+
+      if dbgBtn and dbgBtn.HookScript then
+        dbgBtn:HookScript("OnEnable", function() RefreshTradeDebugBtn() end)
+        dbgBtn:HookScript("OnDisable", function() RefreshTradeDebugBtn() end)
+        dbgBtn:HookScript("OnEnter", function() RefreshTradeDebugBtn() end)
+        dbgBtn:HookScript("OnLeave", function() RefreshTradeDebugBtn() end)
+      end
+
       local itemsBtn = CreateFrame("Button", nil, depositPanel, "UIPanelButtonTemplate")
       itemsBtn:SetSize(90, 22)
       itemsBtn:SetPoint("BOTTOMRIGHT", reloadBtn, "TOPRIGHT", 0, 6)

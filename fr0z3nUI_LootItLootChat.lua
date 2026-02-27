@@ -14,6 +14,11 @@ local LOOT_PATTERNS, LOOT_PREFIXES, LOOT_GROUP_PATTERNS, RECEIVE_ITEM_PATTERNS
 local BuildLootPatterns
 local MessageStartsWithLootPrefix
 
+-- Forward declarations for helpers used by AddMessage hook.
+local ParseCoinsFromMoneyMessage
+local FormatMoney
+local IsLikelyMoneyMessage
+
 function LootChat.SetEnv(e)
   env = e or {}
 end
@@ -28,6 +33,18 @@ local function EnsureRefs()
   if env and env.GetCharDB then
     CHARDB = env.GetCharDB()
   end
+end
+
+local function IsSecretString(v)
+  return type(issecretvalue) == "function" and issecretvalue(v)
+end
+
+local function IsNonEmptyPublicString(v)
+  -- IMPORTANT: Secret string values cannot be compared (even to "") and will throw.
+  -- Always check issecretvalue() BEFORE any string comparisons or string operations.
+  if type(v) ~= "string" then return false end
+  if IsSecretString(v) then return false end
+  return v ~= ""
 end
 
 local function IsEnabled()
@@ -86,6 +103,43 @@ end
 local addMessageHooks = nil
 local addMessageInHook = false
 
+-- Some loot-related messages bypass chat event filters and are printed directly to frames.
+-- We use localized global strings to build safe prefix checks for money/currency lines.
+local DIRECT_MONEY_PREFIXES
+local DIRECT_CURRENCY_PREFIXES
+
+local function BuildDirectPrefixes(keys)
+  local out = {}
+  for _, k in ipairs(keys or {}) do
+    local gs = _G and rawget(_G, k)
+    if type(gs) == "string" and gs ~= "" then
+      local prefix = gs:match("^(.-)%%[sd]")
+      if prefix and prefix ~= "" then
+        out[#out + 1] = prefix
+      end
+    end
+  end
+  return out
+end
+
+local function MessageStartsWithAnyPrefix(msg, prefixes)
+  if type(msg) ~= "string" then return false end
+  if IsSecretString(msg) then return false end
+  if msg == "" then return false end
+  if type(prefixes) ~= "table" or #prefixes == 0 then return false end
+  -- Minimal normalization: trim leading whitespace.
+  local s = msg:gsub("^%s+", "")
+  for _, p in ipairs(prefixes) do
+    if type(p) == "string" and p ~= "" then
+      local tp = p:gsub("^%s+", "")
+      if tp ~= "" and s:sub(1, #tp) == tp then
+        return true
+      end
+    end
+  end
+  return false
+end
+
 local function HookChatFrameAddMessage(frame)
   if not frame or type(frame.AddMessage) ~= "function" then return end
 
@@ -105,16 +159,35 @@ local function HookChatFrameAddMessage(frame)
     if not (IsEnabled() and DB and DB.hideLootText) then
       return orig(self, text, ...)
     end
-    if type(text) ~= "string" or text == "" then
+    if not IsNonEmptyPublicString(text) then
       return orig(self, text, ...)
     end
 
     -- Catch messages that bypass chat event filters and are directly printed to frames.
     if not LOOT_PREFIXES then BuildLootPatterns() end
-    if MessageStartsWithLootPrefix(text) then
-      local hasItem = (text:find("|Hitem:", 1, true) ~= nil)
-      local hasBracket = text:match("%b[]") ~= nil
-      if hasItem or hasBracket then
+    if not DIRECT_MONEY_PREFIXES then
+      DIRECT_MONEY_PREFIXES = BuildDirectPrefixes({ "LOOT_MONEY", "LOOT_MONEY_SPLIT" })
+    end
+    if not DIRECT_CURRENCY_PREFIXES then
+      DIRECT_CURRENCY_PREFIXES = BuildDirectPrefixes({
+        "CURRENCY_GAINED",
+        "CURRENCY_GAINED_MULTIPLE",
+        "CURRENCY_GAINED_SELF",
+        "CURRENCY_GAINED_SELF_MULTIPLE",
+      })
+    end
+
+    local startsLoot = MessageStartsWithLootPrefix(text)
+    local startsMoney = MessageStartsWithAnyPrefix(text, DIRECT_MONEY_PREFIXES)
+    local startsCurrency = MessageStartsWithAnyPrefix(text, DIRECT_CURRENCY_PREFIXES)
+
+    if startsLoot or startsMoney or startsCurrency then
+      local hasItem = (string.find(text, "|Hitem:", 1, true) ~= nil)
+      local hasCurrency = (string.find(text, "|Hcurrency:", 1, true) ~= nil)
+      local hasBracket = (string.match(text, "%b[]") ~= nil)
+      local isMoney = (IsLikelyMoneyMessage and IsLikelyMoneyMessage(text)) and true or false
+
+      if hasItem or hasCurrency or hasBracket or isMoney then
         local outFrame = (DB and DB.outputChatFrame) or 1
 
         local function GetPlayerColoredName()
@@ -139,31 +212,39 @@ local function HookChatFrameAddMessage(frame)
 
         -- Reprint (if configured) so the loot isn't lost.
         if DB and DB.echoItem then
-          local link = text:match("(|c%x%x%x%x%x%x%x%x|Hitem:%d+.-|h.-|h|r)")
-            or text:match("(|Hitem:%d+.-|h.-|h|r)")
-            or text:match("(|Hitem:%d+.-|h.-|h)")
-            or text:match("(|c%x+|Hitem:%d+.-|h.-|h|r)")
+          local display = nil
 
-          -- If we captured an uncolored link, try to upgrade to the full colored item link.
-          if link and type(link) == "string" and link ~= "" and not link:match("^|c%x%x%x%x%x%x%x%x|Hitem:") then
-            if C_Item and C_Item.GetItemInfo then
-              local _, itemLink = C_Item.GetItemInfo(link)
-              if type(itemLink) == "string" and itemLink ~= "" then
-                link = itemLink
+          if isMoney and ParseCoinsFromMoneyMessage and FormatMoney then
+            local coins = ParseCoinsFromMoneyMessage(text)
+            display = FormatMoney(coins)
+          else
+            local link = string.match(text, "(|c%x%x%x%x%x%x%x%x|Hitem:%d+.-|h.-|h|r)")
+              or string.match(text, "(|Hitem:%d+.-|h.-|h|r)")
+              or string.match(text, "(|Hitem:%d+.-|h.-|h)")
+              or string.match(text, "(|c%x+|Hitem:%d+.-|h.-|h|r)")
+              or string.match(text, "(|c%x%x%x%x%x%x%x%x|Hcurrency:%d+.-|h.-|h|r)")
+              or string.match(text, "(|Hcurrency:%d+.-|h.-|h)")
+
+            -- If we captured an uncolored item link, try to upgrade to the full colored item link.
+            if link and type(link) == "string" and string.len(link) > 0 and not string.match(link, "^|c%x%x%x%x%x%x%x%x|Hitem:") and string.find(link, "|Hitem:", 1, true) then
+              if C_Item and C_Item.GetItemInfo then
+                local _, itemLink = C_Item.GetItemInfo(link)
+                if type(itemLink) == "string" and string.len(itemLink) > 0 then
+                  link = itemLink
+                end
               end
+            end
+
+            if link then
+              -- Remove brackets in the displayed portion: |h[Name]|h -> |hName|h
+              display = string.gsub(link, "|h%[([^%]]+)%]|h", "|h%1|h")
+            else
+              -- Fallback: use the shown [Name]
+              display = string.match(text, "%b[]")
             end
           end
 
-          local display = nil
-          if link then
-            -- Remove brackets in the displayed portion: |h[Name]|h -> |hName|h
-            display = link:gsub("|h%[([^%]]+)%]|h", "|h%1|h")
-          else
-            -- Fallback: use the shown [Name]
-            display = text:match("%b[]")
-          end
-
-          if display and display ~= "" then
+          if type(display) == "string" and string.len(display) > 0 then
             local meColored = GetPlayerColoredName()
             local out = tostring(meColored) .. ": " .. tostring(display)
             addMessageInHook = true
@@ -175,9 +256,14 @@ local function HookChatFrameAddMessage(frame)
         if DebugChatSetupEnabled() then
           addMessageInHook = true
           DebugPrint(string.format(
-            "AddMessage: suppressed direct print (hasItem=%s hasBracket=%s echo=%s) text=%s",
+            "AddMessage: suppressed direct print (loot=%s money=%s currency=%s hasItem=%s hasCur=%s hasBracket=%s isMoney=%s echo=%s) text=%s",
+            tostring(startsLoot),
+            tostring(startsMoney),
+            tostring(startsCurrency),
             tostring(hasItem),
+            tostring(hasCurrency),
             tostring(hasBracket),
+            tostring(isMoney),
             tostring((DB and DB.echoItem) and true or false),
             tostring(text)
           ))
@@ -425,26 +511,26 @@ BuildLootPatterns = function()
 end
 
 local function NormalizeForPrefixMatch(s)
-  if type(s) ~= "string" then return "" end
+  if not IsNonEmptyPublicString(s) then return "" end
   -- Some client strings use non-breaking spaces; normalize them to regular spaces.
   -- NBSP (U+00A0) in UTF-8 is \194\160, narrow NBSP (U+202F) is \226\128\175.
-  s = s:gsub("\194\160", " ")
-  s = s:gsub("\226\128\175", " ")
-  s = s:gsub("^%s+", "")
-  s = s:gsub("%s+$", "")
+  s = string.gsub(s, "\194\160", " ")
+  s = string.gsub(s, "\226\128\175", " ")
+  s = string.gsub(s, "^%s+", "")
+  s = string.gsub(s, "%s+$", "")
   -- collapse any whitespace runs (including NBSP-ish) to a single space
-  s = s:gsub("%s+", " ")
+  s = string.gsub(s, "%s+", " ")
   return s
 end
 
 MessageStartsWithLootPrefix = function(msg)
-  if type(msg) ~= "string" or msg == "" then return false end
+  if not IsNonEmptyPublicString(msg) then return false end
   if not (LOOT_PREFIXES and #LOOT_PREFIXES > 0) then return false end
   local tmsg = NormalizeForPrefixMatch(msg)
   for _, prefix in ipairs(LOOT_PREFIXES) do
-    if type(prefix) == "string" and prefix ~= "" then
+    if type(prefix) == "string" and string.len(prefix) > 0 then
       local tp = NormalizeForPrefixMatch(prefix)
-      if tp ~= "" and tmsg:sub(1, #tp) == tp then
+      if string.len(tp) > 0 and string.find(tmsg, tp, 1, true) == 1 then
         return true
       end
     end
@@ -454,11 +540,11 @@ end
 
 local function StripRealmFromName(name)
   if type(name) ~= "string" then return name end
-  return name:match("^([^%-]+)") or name
+  return string.match(name, "^([^%-]+)") or name
 end
 
 local function IsItemLink(text)
-  return type(text) == "string" and text:find("|Hitem:", 1, true) ~= nil
+  return type(text) == "string" and string.find(text, "|Hitem:", 1, true) ~= nil
 end
 
 local function ColorizeByClass(classFile, text)
@@ -557,49 +643,49 @@ end
 
 local function ExtractLinkFallback(msg)
   if type(msg) ~= "string" then return nil end
-  return msg:match("(|c%x+|Hitem:.-|h%[.-%]|h|r)")
-    or msg:match("(|c%x+|Hitem:.-|h.-|h|r)")
-    or msg:match("(|Hitem:.-|h%[.-%]|h)")
-    or msg:match("(|Hitem:.-|h.-|h)")
+  return string.match(msg, "(|c%x+|Hitem:.-|h%[.-%]|h|r)")
+    or string.match(msg, "(|c%x+|Hitem:.-|h.-|h|r)")
+    or string.match(msg, "(|Hitem:.-|h%[.-%]|h)")
+    or string.match(msg, "(|Hitem:.-|h.-|h)")
 end
 
 local function ExtractItemLinkRobust(msg)
-  if type(msg) ~= "string" or msg == "" then return nil end
+  if not IsNonEmptyPublicString(msg) then return nil end
   -- Try to match the most common (and some uncommon) hyperlink forms.
-  return msg:match("(|c%x%x%x%x%x%x%x%x|Hitem:%d+.-|h.-|h|r)")
-    or msg:match("(|c%x%x%x%x%x%x%x%x|Hitem:%d+.-|h.-|h)")
-    or msg:match("(|Hitem:%d+.-|h.-|h|r)")
-    or msg:match("(|Hitem:%d+.-|h.-|h)")
+  return string.match(msg, "(|c%x%x%x%x%x%x%x%x|Hitem:%d+.-|h.-|h|r)")
+    or string.match(msg, "(|c%x%x%x%x%x%x%x%x|Hitem:%d+.-|h.-|h)")
+    or string.match(msg, "(|Hitem:%d+.-|h.-|h|r)")
+    or string.match(msg, "(|Hitem:%d+.-|h.-|h)")
     or ExtractLinkFallback(msg)
 end
 
 local function NormalizeItemLink(link)
-  if type(link) ~= "string" or link == "" then return link end
-  if link:match("^|c%x%x%x%x%x%x%x%x|Hitem:") then
+  if type(link) ~= "string" or string.len(link) == 0 then return link end
+  if string.match(link, "^|c%x%x%x%x%x%x%x%x|Hitem:") then
     return link
   end
 
   do
     local name = link
-    local bracketName = link:match("^%[([^%]]+)%]$")
-    if bracketName and bracketName ~= "" then
+    local bracketName = string.match(link, "^%[([^%]]+)%]$")
+    if bracketName and string.len(bracketName) > 0 then
       name = bracketName
     end
 
-    if name and not name:match("|Hitem:") then
+    if name and not string.match(name, "|Hitem:") then
       if C_Item and C_Item.GetItemInfo then
         local _, itemLink = C_Item.GetItemInfo(name)
-        if type(itemLink) == "string" and itemLink ~= "" then
+        if type(itemLink) == "string" and string.len(itemLink) > 0 then
           return itemLink
         end
       end
     end
   end
 
-  if link:match("|Hitem:") then
+  if string.match(link, "|Hitem:") then
     if C_Item and C_Item.GetItemInfo then
       local _, itemLink = C_Item.GetItemInfo(link)
-      if type(itemLink) == "string" and itemLink ~= "" then
+      if type(itemLink) == "string" and string.len(itemLink) > 0 then
         return itemLink
       end
     end
@@ -609,27 +695,27 @@ local function NormalizeItemLink(link)
 end
 
 local function StripDisplayedLinkBrackets(link)
-  if type(link) ~= "string" or link == "" then return link end
-  return link:gsub("|h%[([^%]]+)%]|h", "|h%1|h")
+  if type(link) ~= "string" or string.len(link) == 0 then return link end
+  return string.gsub(link, "|h%[([^%]]+)%]|h", "|h%1|h")
 end
 
 local function GetItemIDFromLink(link)
-  if type(link) ~= "string" or link == "" then return nil end
-  local id = link:match("|Hitem:(%d+)")
+  if type(link) ~= "string" or string.len(link) == 0 then return nil end
+  local id = string.match(link, "|Hitem:(%d+)")
   if not id then return nil end
   return tonumber(id)
 end
 
 local function GetCurrencyIDFromLink(link)
-  if type(link) ~= "string" or link == "" then return nil end
-  local id = link:match("|Hcurrency:(%d+)")
+  if type(link) ~= "string" or string.len(link) == 0 then return nil end
+  local id = string.match(link, "|Hcurrency:(%d+)")
   if not id then return nil end
   return tonumber(id)
 end
 
 local function ApplyItemLinkAlias(link)
   EnsureRefs()
-  if type(link) ~= "string" or link == "" then return link end
+  if type(link) ~= "string" or string.len(link) == 0 then return link end
   local id = GetItemIDFromLink(link)
   if not id then return link end
 
@@ -758,14 +844,14 @@ end
 
 local function ExtractCurrencyLinkFallback(msg)
   if type(msg) ~= "string" then return nil end
-  return msg:match("(|c%x+|Hcurrency:.-|h%[.-%]|h|r)")
-    or msg:match("(|Hcurrency:.-|h%[.-%]|h)")
+  return string.match(msg, "(|c%x+|Hcurrency:.-|h%[.-%]|h|r)")
+    or string.match(msg, "(|Hcurrency:.-|h%[.-%]|h)")
 end
 
 local function ExtractAchievementLinkFallback(msg)
   if type(msg) ~= "string" then return nil end
-  return msg:match("(|c%x+|Hachievement:.-|h%[.-%]|h|r)")
-    or msg:match("(|Hachievement:.-|h%[.-%]|h)")
+  return string.match(msg, "(|c%x+|Hachievement:.-|h%[.-%]|h|r)")
+    or string.match(msg, "(|Hachievement:.-|h%[.-%]|h)")
 end
 
 local function AppendSuffixInsideColorReset(text, suffix)
@@ -1055,7 +1141,7 @@ end
 local function OnCurrencyChat(_, _, msg, ...)
   EnsureRefs()
   if not IsEnabled() then return false end
-  if type(msg) ~= "string" or msg == "" then return false end
+  if not IsNonEmptyPublicString(msg) then return false end
 
   LootChat.CaptureChatIn("CHAT_MSG_CURRENCY", msg)
 
@@ -1063,23 +1149,31 @@ local function OnCurrencyChat(_, _, msg, ...)
 
   local link, qty
   for _, pat in ipairs(CURRENCY_PATTERNS or {}) do
-    local a, b = msg:match(pat)
+    local a, b = string.match(msg, pat)
     if a then
       if b then
-        local aIsLink = type(a) == "string" and a:find("|Hcurrency:", 1, true) ~= nil
-        local bIsLink = type(b) == "string" and b:find("|Hcurrency:", 1, true) ~= nil
+        local aIsLink = type(a) == "string" and string.find(a, "|Hcurrency:", 1, true) ~= nil
+        local bIsLink = type(b) == "string" and string.find(b, "|Hcurrency:", 1, true) ~= nil
 
         if aIsLink and not bIsLink then
           link, qty = a, b
         elseif bIsLink and not aIsLink then
           link, qty = b, a
         else
-          if tonumber(a) and not tonumber(b) then
+          -- Neither capture looks like a currency hyperlink.
+          -- Prefer any real link embedded in the message; otherwise treat the non-numeric capture as the currency name.
+          local aNum = tonumber(a)
+          local bNum = tonumber(b)
+          if aNum and not bNum then
             qty = a
-          elseif tonumber(b) and not tonumber(a) then
+            link = ExtractCurrencyLinkFallback(msg) or b
+          elseif bNum and not aNum then
             qty = b
+            link = ExtractCurrencyLinkFallback(msg) or a
+          else
+            link = ExtractCurrencyLinkFallback(msg) or a
+            qty = qty or b
           end
-          link = ExtractCurrencyLinkFallback(msg) or a
         end
       else
         link = a
@@ -1095,18 +1189,28 @@ local function OnCurrencyChat(_, _, msg, ...)
     return false
   end
 
+  -- Guard: never allow a bare number to become the "link" (this produces outputs like "16").
+  if type(link) == "string" and tonumber(link) ~= nil and string.find(link, "|Hcurrency:", 1, true) == nil then
+    qty = qty or link
+    link = ExtractCurrencyLinkFallback(msg) or msg:match("%b[]")
+    if not link then
+      -- Nothing useful to show; still allow suppression via hideLootText.
+      return (DB and DB.hideLootText) and true or false
+    end
+  end
+
   if not qty then
     local escaped = EscapeLuaPattern(link)
-    qty = msg:match(escaped .. "%s*[x×]%s*(%d+)")
-      or msg:match(escaped .. "[\r\n ]*[x×]%s*(%d+)")
-      or msg:match("%s*[x×]%s*(%d+)%s*%.?$")
+    qty = string.match(msg, escaped .. "%s*[x×]%s*(%d+)")
+      or string.match(msg, escaped .. "[\r\n ]*[x×]%s*(%d+)")
+      or string.match(msg, "%s*[x×]%s*(%d+)%s*%.?$")
   end
 
   local n = tonumber(qty)
   local currencyID = GetCurrencyIDFromLink(link)
   if currencyID and C_CurrencyInfo and C_CurrencyInfo.GetCurrencyLink then
     local built = C_CurrencyInfo.GetCurrencyLink(currencyID, (n and n > 0) and n or 0)
-    if type(built) == "string" and built ~= "" then
+    if type(built) == "string" and string.len(built) > 0 then
       link = built
     end
   end
@@ -1137,7 +1241,8 @@ local function OnCurrencyChat(_, _, msg, ...)
     })
   end
 
-  return (handled and DB and DB.hideLootText) and true or false
+  -- Even when we choose not to echo/combine currency, still suppress the default line if configured.
+  return (DB and DB.hideLootText) and true or false
 end
 
 -- Money patterns
@@ -1171,13 +1276,13 @@ local function BuildMoneyPatterns()
   MONEY_PREFIXES = prefixes
 end
 
-local function ParseCoinsFromMoneyMessage(msg)
-  if type(msg) ~= "string" or msg == "" then return nil end
+ParseCoinsFromMoneyMessage = function(msg)
+  if not IsNonEmptyPublicString(msg) then return nil end
 
   local function numBeforeTexture(textureNeedle)
-    local s = msg:match("([%d,]+)%s*|T.-" .. textureNeedle .. ".-|t")
+    local s = string.match(msg, "([%d,]+)%s*|T.-" .. textureNeedle .. ".-|t")
     if not s then return nil end
-    s = s:gsub(",", "")
+    s = string.gsub(s, ",", "")
     return tonumber(s)
   end
 
@@ -1186,13 +1291,13 @@ local function ParseCoinsFromMoneyMessage(msg)
   local copper = numBeforeTexture("UI%-CopperIcon")
 
   if not (gold or silver or copper) then
-    local lower = msg:lower()
+    local lower = string.lower(msg)
 
     local function numBeforeToken(token)
       if type(token) ~= "string" or token == "" then return nil end
-      local n = lower:match("([%d,]+)%s*" .. EscapeLuaPattern(token:lower()))
+      local n = string.match(lower, "([%d,]+)%s*" .. EscapeLuaPattern(string.lower(token)))
       if not n then return nil end
-      n = n:gsub(",", "")
+      n = string.gsub(n, ",", "")
       return tonumber(n)
     end
 
@@ -1211,7 +1316,7 @@ local function ParseCoinsFromMoneyMessage(msg)
   }
 end
 
-local function FormatMoney(coins)
+FormatMoney = function(coins)
   if type(coins) ~= "table" then return nil end
   EnsureRefs()
   local m = (DB and type(DB.money) == "table") and DB.money or GetDefaultMoneyConfig()
@@ -1234,32 +1339,32 @@ local function FormatMoney(coins)
   return table.concat(parts, " ")
 end
 
-local function IsLikelyMoneyMessage(msg)
-  if type(msg) ~= "string" or msg == "" then return false end
+IsLikelyMoneyMessage = function(msg)
+  if not IsNonEmptyPublicString(msg) then return false end
 
-  if msg:find("UI%-GoldIcon") or msg:find("UI%-SilverIcon") or msg:find("UI%-CopperIcon") then
+  if string.find(msg, "UI%-GoldIcon") or string.find(msg, "UI%-SilverIcon") or string.find(msg, "UI%-CopperIcon") then
     return true
   end
 
-  local lower = msg:lower()
+  local lower = string.lower(msg)
 
   if not MONEY_PATTERNS then BuildMoneyPatterns() end
 
   for _, pat in ipairs(MONEY_PATTERNS or {}) do
-    if msg:match(pat) then
+    if string.match(msg, pat) then
       return true
     end
   end
 
   for _, prefix in ipairs(MONEY_PREFIXES or {}) do
-    if msg:sub(1, #prefix) == prefix then
+    if type(prefix) == "string" and string.len(prefix) > 0 and string.find(msg, prefix, 1, true) == 1 then
       return true
     end
   end
 
   local function hasToken(token)
     if type(token) ~= "string" or token == "" then return false end
-    return lower:find(token:lower(), 1, true) ~= nil
+    return string.find(lower, string.lower(token), 1, true) ~= nil
   end
   if hasToken((_G and rawget(_G, "GOLD")) or "gold")
     or hasToken((_G and rawget(_G, "SILVER")) or "silver")
@@ -1269,7 +1374,7 @@ local function IsLikelyMoneyMessage(msg)
 
   local function hasNumberBeforeToken(token)
     if type(token) ~= "string" or token == "" then return false end
-    return lower:match("[%d,]+%s*" .. EscapeLuaPattern(token:lower())) ~= nil
+    return string.match(lower, "[%d,]+%s*" .. EscapeLuaPattern(string.lower(token))) ~= nil
   end
   if hasNumberBeforeToken((_G and rawget(_G, "GOLD_AMOUNT_SYMBOL")) or "g")
     or hasNumberBeforeToken((_G and rawget(_G, "SILVER_AMOUNT_SYMBOL")) or "s")
@@ -1283,7 +1388,7 @@ end
 local function OnMoneyChat(_, _, msg, ...)
   EnsureRefs()
   if not IsEnabled() then return false end
-  if type(msg) ~= "string" or msg == "" then return false end
+  if not IsNonEmptyPublicString(msg) then return false end
 
   LootChat.CaptureChatIn("CHAT_MSG_MONEY", msg)
 
@@ -1315,13 +1420,14 @@ local function OnMoneyChat(_, _, msg, ...)
     end
   end
 
-  return (handled and DB and DB.hideLootText) and true or false
+  -- Even when we choose not to echo/combine money, still suppress the default line if configured.
+  return (DB and DB.hideLootText) and true or false
 end
 
 local function OnSystemChat(_, eventName, msg, ...)
   EnsureRefs()
   if not IsEnabled() then return false end
-  if type(msg) ~= "string" or msg == "" then return false end
+  if not IsNonEmptyPublicString(msg) then return false end
 
   local ev = (type(eventName) == "string" and eventName ~= "") and eventName or "CHAT_MSG_SYSTEM"
   LootChat.CaptureChatIn(ev, msg)
@@ -1354,7 +1460,8 @@ local function OnSystemChat(_, eventName, msg, ...)
       end
     end
 
-    return (handled and DB and DB.hideLootText) and true or false
+    -- Even when we choose not to echo/combine money, still suppress the default line if configured.
+    return (DB and DB.hideLootText) and true or false
   end
 
   if not LOOT_PATTERNS then BuildLootPatterns() end
@@ -1552,31 +1659,31 @@ local pendingAsyncLoot = {}
 local function OnLootChat(_, _, msg, author, ...)
   EnsureRefs()
   if not IsEnabled() then return false end
-  if type(msg) ~= "string" or msg == "" then return false end
+  if not IsNonEmptyPublicString(msg) then return false end
 
   LootChat.CaptureChatIn("CHAT_MSG_LOOT", msg, author)
 
   if not LOOT_PATTERNS then BuildLootPatterns() end
 
-  if msg:find("|Hcurrency:", 1, true) then
+  if string.find(msg, "|Hcurrency:", 1, true) then
     local handled = false
 
     local link = (ExtractCurrencyLinkFallback and ExtractCurrencyLinkFallback(msg))
-      or msg:match("(|Hcurrency:%d+.-|h.-|h)")
-      or msg:match("(|c%x%x%x%x%x%x%x%x|Hcurrency:%d+.-|h.-|h|r)")
+      or string.match(msg, "(|Hcurrency:%d+.-|h.-|h)")
+      or string.match(msg, "(|c%x%x%x%x%x%x%x%x|Hcurrency:%d+.-|h.-|h|r)")
 
     if link and DB and DB.echoItem then
       local qty
       local escaped = EscapeLuaPattern(link)
-      qty = msg:match(escaped .. "%s*[x×]%s*(%d+)")
-        or msg:match(escaped .. "[\r\n ]*[x×]%s*(%d+)")
-        or msg:match("%s*[x×]%s*(%d+)%s*%.?$")
+      qty = string.match(msg, escaped .. "%s*[x×]%s*(%d+)")
+        or string.match(msg, escaped .. "[\r\n ]*[x×]%s*(%d+)")
+        or string.match(msg, "%s*[x×]%s*(%d+)%s*%.?$")
 
       local n = tonumber(qty)
       local currencyID = (GetCurrencyIDFromLink and GetCurrencyIDFromLink(link)) or nil
       if currencyID and C_CurrencyInfo and C_CurrencyInfo.GetCurrencyLink then
         local built = C_CurrencyInfo.GetCurrencyLink(currencyID, (n and n > 0) and n or 0)
-        if type(built) == "string" and built ~= "" then
+        if type(built) == "string" and string.len(built) > 0 then
           link = built
         end
       end
@@ -1607,17 +1714,19 @@ local function OnLootChat(_, _, msg, author, ...)
       })
     end
 
-    return (handled and DB and DB.hideLootText) and true or false
+    -- Even when we choose not to echo/combine currency, still suppress the default line if configured.
+    return (DB and DB.hideLootText) and true or false
   end
 
   if (DB and DB.hideLootText) and (LOOT_PREFIXES and #LOOT_PREFIXES > 0) then
-    local hasItem = msg:find("|Hitem:", 1, true) ~= nil
-    local hasCurrency = msg:find("|Hcurrency:", 1, true) ~= nil
+    local hasItem = string.find(msg, "|Hitem:", 1, true) ~= nil
+    local hasCurrency = string.find(msg, "|Hcurrency:", 1, true) ~= nil
     if (not hasItem) and (not hasCurrency) and (not IsLikelyMoneyMessage(msg)) then
       local tmsg = NormalizeForPrefixMatch(msg)
       for _, prefix in ipairs(LOOT_PREFIXES) do
-        if type(prefix) == "string" and prefix ~= "" then
-          if tmsg == NormalizeForPrefixMatch(prefix) then
+        if type(prefix) == "string" and string.len(prefix) > 0 then
+          local tp = NormalizeForPrefixMatch(prefix)
+          if string.len(tp) > 0 and string.find(tmsg, tp, 1, true) == 1 and string.len(tmsg) == string.len(tp) then
             return true
           end
         end
@@ -1650,7 +1759,8 @@ local function OnLootChat(_, _, msg, author, ...)
         })
       end
     end
-    return (handled and DB and DB.hideLootText) and true or false
+    -- Even when we choose not to echo/combine money, still suppress the default line if configured.
+    return (DB and DB.hideLootText) and true or false
   end
 
   local isSelfLoot = false
@@ -1974,7 +2084,7 @@ local function OnLootChat(_, _, msg, author, ...)
       tostring(isSelfLoot and true or false),
       tostring(link),
       tostring(qty),
-      tostring(msg:find("|Hitem:", 1, true) ~= nil)
+      tostring(string.find(msg, "|Hitem:", 1, true) ~= nil)
     ))
   end
   return suppress
@@ -1985,7 +2095,7 @@ local function OnAchievementChat(_, _, msg, author, ...)
   if not (DB and DB.other and DB.other.achievement and DB.other.achievement.enabled) then
     return false
   end
-  if type(msg) ~= "string" or msg == "" then
+  if not IsNonEmptyPublicString(msg) then
     return false
   end
 
@@ -1995,7 +2105,7 @@ local function OnAchievementChat(_, _, msg, author, ...)
   end
 
   local name = StripRealmFromName(author)
-  if type(name) ~= "string" or name == "" then
+  if not IsNonEmptyPublicString(name) then
     name = "Character"
   end
 
