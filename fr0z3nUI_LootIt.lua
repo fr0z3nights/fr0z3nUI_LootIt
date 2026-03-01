@@ -529,9 +529,6 @@ local function DepositCfgChar()
   CHARDB.deposit.itemsCharDisabled = (type(CHARDB.deposit.itemsCharDisabled) == "table") and CHARDB.deposit.itemsCharDisabled or {}
   CHARDB.deposit.disableAcc = (type(CHARDB.deposit.disableAcc) == "table") and CHARDB.deposit.disableAcc or {}
   CHARDB.deposit.disableRealm = (type(CHARDB.deposit.disableRealm) == "table") and CHARDB.deposit.disableRealm or {}
-  CHARDB.deposit.buyItemsChar = (type(CHARDB.deposit.buyItemsChar) == "table") and CHARDB.deposit.buyItemsChar or {}
-  CHARDB.deposit.buyItemsCharDisabled = (type(CHARDB.deposit.buyItemsCharDisabled) == "table") and CHARDB.deposit.buyItemsCharDisabled or {}
-  CHARDB.deposit.buyDisableAcc = (type(CHARDB.deposit.buyDisableAcc) == "table") and CHARDB.deposit.buyDisableAcc or {}
   CHARDB.deposit.buyDisableRealm = (type(CHARDB.deposit.buyDisableRealm) == "table") and CHARDB.deposit.buyDisableRealm or {}
   CHARDB.deposit.sellItemsChar = (type(CHARDB.deposit.sellItemsChar) == "table") and CHARDB.deposit.sellItemsChar or {}
   CHARDB.deposit.sellItemsCharDisabled = (type(CHARDB.deposit.sellItemsCharDisabled) == "table") and CHARDB.deposit.sellItemsCharDisabled or {}
@@ -3270,6 +3267,15 @@ end
 local _useKeyCacheByID = {}
 local _foodUseCacheByID = {}
 
+local function IsFoodDrinkItemID(itemID)
+  itemID = tonumber(itemID)
+  if not itemID or itemID <= 0 then return false end
+  if not (C_Item and type(C_Item.GetItemInfoInstant) == "function") then return false end
+  local ok, _, _, _, _, _, classID, subClassID = pcall(C_Item.GetItemInfoInstant, itemID)
+  if not ok then return false end
+  return (tonumber(classID) == 0) and (tonumber(subClassID) == 5)
+end
+
 local function NormalizeUseText_Generic(s)
   if type(s) ~= "string" then return nil end
   local t = s:lower()
@@ -3290,7 +3296,8 @@ local function ParseFoodDrinkUseLine(s)
   local low = s:lower()
   if not low:find("^use:", 1) then return nil end
   if not low:find("restores", 1, true) then return nil end
-  if not low:find("maximum health", 1, true) then return nil end
+  -- Tooltip text varies; accept "health" with %.
+  if not low:find("health", 1, true) then return nil end
 
   -- Example (2026+):
   -- "Use: Restores 7% of your maximum health and mana every second over 20 sec."
@@ -3300,6 +3307,11 @@ local function ParseFoodDrinkUseLine(s)
 
   local dur = low:match("over%s+(%d+)%s*sec") or low:match("for%s+(%d+)%s*sec")
   dur = dur and tonumber(dur) or nil
+
+  -- Avoid false positives: %health food/drink typically has a duration.
+  if dur == nil and not low:find("every second", 1, true) then
+    return nil
+  end
 
   local hasMana = (low:find("mana", 1, true) ~= nil)
   return {
@@ -3314,6 +3326,12 @@ local function GetFoodDrinkTupleForItemID(itemID)
   if not itemID or itemID <= 0 then return nil end
   if _foodUseCacheByID[itemID] ~= nil then
     return _foodUseCacheByID[itemID]
+  end
+
+  -- Only treat actual food/drink items as "food restock" candidates.
+  if not IsFoodDrinkItemID(itemID) then
+    _foodUseCacheByID[itemID] = false
+    return nil
   end
 
   local tuple = nil
@@ -3336,8 +3354,10 @@ end
 
 local function GetFoodDrinkCategoryKey(tuple)
   if type(tuple) ~= "table" then return nil end
-  -- Category is intentionally coarse: health-only vs health+mana.
-  return "foodrestores|mana:" .. ((tuple.hasMana and "1") or "0")
+  -- Category is intentionally coarse: any %health-restoring food/drink.
+  -- We intentionally do NOT split by "also restores mana" so non-mana classes
+  -- can still buy the best %health option when it happens to be health+mana.
+  return "foodrestores"
 end
 
 local function FoodDrinkScore(tuple)
@@ -3361,7 +3381,7 @@ local function GetUseKeyForItemID(itemID)
   local fd = GetFoodDrinkTupleForItemID(itemID)
   if type(fd) == "table" then
     local score = FoodDrinkScore(fd) or 0
-    local k = (GetFoodDrinkCategoryKey(fd) or "foodrestores") .. "|score:" .. tostring(score) .. "|mana:" .. ((fd.hasMana and "1") or "0")
+    local k = (GetFoodDrinkCategoryKey(fd) or "foodrestores") .. "|score:" .. tostring(score)
     _useKeyCacheByID[itemID] = k
     return k
   end
@@ -3475,7 +3495,21 @@ local function GetMerchantIndexForItemID(itemID)
   return nil
 end
 
-local function GetBestMerchantFoodDrinkForCategory(categoryKey)
+local function GetItemRequiredPlayerLevel(itemID)
+  itemID = tonumber(itemID)
+  if not itemID or itemID <= 0 then return nil end
+  if type(GetItemInfo) ~= "function" then return nil end
+  -- GetItemInfo returns: name, link, quality, itemLevel, requiredLevel, ...
+  local ok, _, _, _, reqLevel = pcall(GetItemInfo, itemID)
+  if not ok then return nil end
+  reqLevel = tonumber(reqLevel)
+  if reqLevel and reqLevel > 0 then
+    return reqLevel
+  end
+  return nil
+end
+
+local function GetBestMerchantFoodDrinkForCategory(categoryKey, usesMana)
   if type(categoryKey) ~= "string" or categoryKey == "" then return nil end
   if type(GetMerchantNumItems) ~= "function" then return nil end
   local n = tonumber(GetMerchantNumItems()) or 0
@@ -3485,17 +3519,29 @@ local function GetBestMerchantFoodDrinkForCategory(categoryKey)
 
   local function isUsableForPlayer(id)
     if not pl then return true end
-    if type(GetItemInfo) == "function" then
-      local _, _, _, _, reqLevel = GetItemInfo(id)
-      reqLevel = tonumber(reqLevel)
-      if reqLevel and reqLevel > 0 and reqLevel > pl then
+    local reqLevel = GetItemRequiredPlayerLevel(id)
+    -- If item info isn't cached yet, treat as not usable (avoid buying unusable items).
+    if reqLevel == nil then
+      return false
+    end
+    if reqLevel > pl then
+      return false
+    end
+    if C_Item and type(C_Item.IsUsableItem) == "function" then
+      local okU, usable = pcall(C_Item.IsUsableItem, id)
+      if okU and usable == false then
+        return false
+      end
+    elseif type(IsUsableItem) == "function" then
+      local okU, usable = pcall(IsUsableItem, id)
+      if okU and usable == false then
         return false
       end
     end
     return true
   end
 
-  local best = { idx = nil, itemID = nil, score = nil, pct = nil }
+  local best = { idx = nil, itemID = nil, score = nil, pct = nil, unitPrice = nil }
 
   for i = 1, n do
     local link = type(GetMerchantItemLink) == "function" and GetMerchantItemLink(i) or nil
@@ -3507,8 +3553,119 @@ local function GetBestMerchantFoodDrinkForCategory(categoryKey)
         if type(t) == "table" and GetFoodDrinkCategoryKey(t) == categoryKey then
           local sc = FoodDrinkScore(t) or nil
           if sc then
-            if (not best.idx) or sc > (best.score or 0) then
-              best.idx, best.itemID, best.score, best.pct = i, id, sc, tonumber(t.pct) or nil
+            local price, qty = nil, nil
+            if C_MerchantFrame and type(C_MerchantFrame.GetItemInfo) == "function" then
+              local okI, info = pcall(C_MerchantFrame.GetItemInfo, i)
+              if okI and type(info) == "table" then
+                price = tonumber(info.price)
+                qty = tonumber(info.stackCount or info.quantity)
+              end
+            end
+            if price == nil and type(GetMerchantItemInfo) == "function" then
+              local okI, _, _, p, q = pcall(GetMerchantItemInfo, i)
+              if okI then
+                price = tonumber(p)
+                qty = tonumber(q)
+              end
+            end
+            if qty == nil or qty <= 0 then qty = 1 end
+            local unit = (price and price > 0) and (price / qty) or nil
+
+            local better = false
+            if not best.idx then
+              better = true
+            elseif sc > (best.score or 0) then
+              better = true
+            elseif sc == (best.score or 0) then
+              if unit ~= nil and (best.unitPrice == nil or unit < best.unitPrice) then
+                better = true
+              end
+            end
+
+            if better then
+              best.idx, best.itemID, best.score, best.pct, best.unitPrice = i, id, sc, tonumber(t.pct) or nil, unit
+            end
+          end
+        end
+      end
+    end
+  end
+
+  if not best.idx then return nil end
+  return best
+end
+
+local function GetBestMerchantItemForUseKey(useKey, usesMana)
+  if type(useKey) ~= "string" or useKey == "" then return nil end
+  if type(GetMerchantNumItems) ~= "function" then return nil end
+  local n = tonumber(GetMerchantNumItems()) or 0
+  if n <= 0 then return nil end
+
+  local pl = (type(UnitLevel) == "function") and tonumber(UnitLevel("player")) or nil
+
+  local function isUsableForPlayer(id)
+    if not pl then return true end
+    local reqLevel = GetItemRequiredPlayerLevel(id)
+    if reqLevel == nil then
+      return false
+    end
+    if reqLevel > pl then
+      return false
+    end
+    if C_Item and type(C_Item.IsUsableItem) == "function" then
+      local okU, usable = pcall(C_Item.IsUsableItem, id)
+      if okU and usable == false then
+        return false
+      end
+    elseif type(IsUsableItem) == "function" then
+      local okU, usable = pcall(IsUsableItem, id)
+      if okU and usable == false then
+        return false
+      end
+    end
+    return true
+  end
+
+  local best = { idx = nil, itemID = nil, unitPrice = nil }
+
+  for i = 1, n do
+    local link = type(GetMerchantItemLink) == "function" and GetMerchantItemLink(i) or nil
+    if type(link) == "string" then
+      local id = link:match("Hitem:(%d+):")
+      id = id and tonumber(id) or nil
+      if id and id > 0 and isUsableForPlayer(id) then
+        local k = GetUseKeyForItemID(id)
+        if k and k == useKey then
+          if (usesMana == false) and (k:sub(-7) == "|mana:1") then
+            -- Non-mana classes: skip mana-tagged use items.
+          else
+            local price, qty = nil, nil
+            if C_MerchantFrame and type(C_MerchantFrame.GetItemInfo) == "function" then
+              local okI, info = pcall(C_MerchantFrame.GetItemInfo, i)
+              if okI and type(info) == "table" then
+                price = tonumber(info.price)
+                qty = tonumber(info.stackCount or info.quantity)
+              end
+            end
+            if price == nil and type(GetMerchantItemInfo) == "function" then
+              local okI, _, _, p, q = pcall(GetMerchantItemInfo, i)
+              if okI then
+                price = tonumber(p)
+                qty = tonumber(q)
+              end
+            end
+            if qty == nil or qty <= 0 then qty = 1 end
+            local unit = (price and price > 0) and (price / qty) or nil
+
+            local better = false
+            if not best.idx then
+              better = true
+            elseif unit ~= nil and (best.unitPrice == nil or unit < best.unitPrice) then
+              better = true
+            end
+
+            if better then
+              best.idx, best.itemID, best.unitPrice = i, id, unit
             end
           end
         end
@@ -3704,6 +3861,7 @@ end
 -- Merchant session buy tracking (used to avoid double-buying on fast tickers).
 local _liMerchantBuyBaselineHave
 local _liMerchantBuySessionBought
+local _liMerchantNotSoldWarned
 
 local function RunMerchantTradeOnce(skipFoodSell)
   local mode = GetTradeMode()
@@ -3751,6 +3909,21 @@ LI.RunDeposit = RunDeposit
   local usesMana = PlayerUsesMana()
   local ops = 0
   local maxOps = 200
+
+  local function GetRestockGroupKey(itemID)
+    itemID = tonumber(itemID)
+    if not itemID or itemID <= 0 then return nil end
+    local fd = GetFoodDrinkTupleForItemID(itemID)
+    local cat = fd and GetFoodDrinkCategoryKey(fd) or nil
+    if cat then
+      return "food:" .. tostring(cat)
+    end
+    local key = GetUseKeyForItemID(itemID)
+    if key then
+      return "use:" .. tostring(key)
+    end
+    return nil
+  end
 
   -- Prevent double-buying across fast merchant ticker ticks by tracking what we've
   -- already requested this merchant session. Bag counts can lag behind.
@@ -3846,170 +4019,215 @@ LI.RunDeposit = RunDeposit
   end
 
   if mode == "buy" then
+    -- Restock grouping: if multiple rules are restock-equivalent, only act once per group.
+    local restockGroupTarget = {}
+    local restockGroupSeed = {}
+    for itemID, r in pairs(rules) do
+      itemID = tonumber(itemID)
+      local target = r and tonumber(r.count) or nil
+      if itemID and itemID > 0 and r and r.restock == true and target and target > 0 then
+        local gk = GetRestockGroupKey(itemID)
+        if gk then
+          local cur = tonumber(restockGroupTarget[gk])
+          if (cur == nil) or (target > cur) then
+            restockGroupTarget[gk] = target
+          end
+          if restockGroupSeed[gk] == nil then
+            restockGroupSeed[gk] = itemID
+          end
+        end
+      end
+    end
+
     for itemID, r in pairs(rules) do
       if ops >= maxOps then break end
       local target = r and tonumber(r.count) or nil
       if target and target > 0 then
-        local current = 0
-        if r.restock == true then
-          -- Food/drink: pick strongest matching item sold by this merchant,
-          -- and count bag items that are >= that strength.
-          local fd = GetFoodDrinkTupleForItemID(itemID)
-          local cat = fd and GetFoodDrinkCategoryKey(fd) or nil
-          if cat then
-            local best = GetBestMerchantFoodDrinkForCategory(cat)
-            local skipLowerTierVendor = false
-            if best and best.score then
-              -- If the merchant is "lower end" than what we already have, don't buy downgrades.
-              local maxBag = GetMaxFoodDrinkScoreInBags(cat)
-              if maxBag and maxBag > best.score then
-                skipLowerTierVendor = true
-                if Print then
-                  Print("Restock skipped (merchant lower tier): " .. (GetItemNameSafe(itemID) or tostring(itemID)))
+        local skipThisRule = false
+        if r and r.restock == true then
+          local gk = GetRestockGroupKey(itemID)
+          if gk and restockGroupSeed[gk] ~= nil and restockGroupSeed[gk] ~= itemID then
+            -- Skip: another rule is the seed for this restock group.
+            skipThisRule = true
+          end
+          if gk and restockGroupTarget[gk] ~= nil then
+            target = tonumber(restockGroupTarget[gk]) or target
+          end
+        end
+        if not skipThisRule then
+          local current = 0
+          if r.restock == true then
+            -- Food/drink: pick strongest matching item sold by this merchant,
+            -- and count bag items that are >= that strength.
+            local fd = GetFoodDrinkTupleForItemID(itemID)
+            local cat = fd and GetFoodDrinkCategoryKey(fd) or nil
+            if cat then
+              local best = GetBestMerchantFoodDrinkForCategory(cat, usesMana)
+              local skipLowerTierVendor = false
+              if best and best.score then
+                -- If the merchant is "lower end" than what we already have, don't buy downgrades.
+                local maxBag = GetMaxFoodDrinkScoreInBags(cat)
+                if maxBag and maxBag > best.score then
+                  skipLowerTierVendor = true
+                  if Print then
+                    Print("Restock skipped (merchant lower tier): " .. (GetItemNameSafe(itemID) or tostring(itemID)))
+                  end
                 end
               end
-            end
 
-            if skipLowerTierVendor then
-              -- Treat as satisfied so this rule won't buy from this vendor.
-              current = target
-            else
-              local desiredScore = (best and best.score) or FoodDrinkScore(fd) or 0
-              local desiredHasMana = (cat:sub(-1) == "1")
-              if (not usesMana) and desiredHasMana then
-                -- Non-mana classes: treat mana food as a different pool; do not restock it implicitly.
-                current = GetHaveCount(itemID)
+              if skipLowerTierVendor then
+                -- Treat as satisfied so this rule won't buy from this vendor.
+                current = target
               else
+                local desiredScore = (best and best.score) or FoodDrinkScore(fd) or 0
                 current = CountFoodDrinkAtOrAboveInBags(cat, desiredScore)
                 if best and best.itemID then
                   current = current + GetPendingBought(best.itemID)
                 end
               end
-            end
-          else
-            local key = GetUseKeyForItemID(itemID)
-            if key then
-              local hasMana = (key:sub(-7) == "|mana:1")
-              if (not usesMana) and hasMana then
-                -- Non-mana classes: treat mana food as a different pool; do not restock it implicitly.
-                current = GetHaveCount(itemID)
-              else
-                current = CountEquivalentByUseKeyInBags(key)
-                current = current + GetPendingBought(itemID)
-              end
             else
-              current = GetHaveCount(itemID)
-            end
-          end
-        else
-          current = GetHaveCount(itemID)
-        end
-
-        local need = target - current
-        if need > 0 then
-          local freeSlots = GetFreeBackpackSlots()
-          if freeSlots ~= nil and freeSlots <= 0 then
-            if Print and LI and LI.Trade and LI.Trade._debugOn == true then
-              Print("Restock: no free bag slots; skipping buys.")
-            end
-            return ops
-          end
-
-          local buyID, idx = itemID, nil
-
-          if r.restock == true then
-            local fd = GetFoodDrinkTupleForItemID(itemID)
-            local cat = fd and GetFoodDrinkCategoryKey(fd) or nil
-            if cat then
-              local best = GetBestMerchantFoodDrinkForCategory(cat)
-              if best and best.idx and best.itemID then
-                buyID, idx = best.itemID, best.idx
-              end
-            end
-          end
-
-          if Print and r.restock == true and LI and LI.Trade and LI.Trade._debugOn == true then
-            local t = GetFoodDrinkTupleForItemID(buyID)
-            if type(t) == "table" and type(t.pct) == "number" then
-              local reqLevel = nil
-              if type(GetItemInfo) == "function" then
-                local okI, _, _, _, _, req = pcall(GetItemInfo, buyID)
-                reqLevel = okI and tonumber(req) or nil
-              end
-              if reqLevel and reqLevel > 0 then
-                Print("Best usable vendor food: " .. tostring(t.pct) .. "% (req " .. tostring(reqLevel) .. ")")
-              else
-                Print("Best usable vendor food: " .. tostring(t.pct) .. "%")
-              end
-            end
-          end
-
-          if not idx then
-            idx = GetMerchantIndexForItemID(buyID)
-          end
-          if idx and type(BuyMerchantItem) == "function" then
-            local bi = GetMerchantItemBuyInfo(idx) or {}
-            local name = bi.name
-            local price = bi.price
-            local vendorQty = tonumber(bi.quantity) or 1
-            if vendorQty <= 0 then vendorQty = 1 end
-
-            -- BuyMerchantItem's quantity parameter is the number of *items* to buy.
-            -- The merchant UI may display a "xN" quantity, but addons can still request arbitrary amounts.
-            local availItems = tonumber(bi.numAvailable)
-            if availItems == nil or availItems < 0 then
-              availItems = need
-            end
-            if availItems <= 0 then
-              -- out of stock
-            else
-              local buyCount = need
-              if buyCount > availItems then buyCount = availItems end
-
-              local maxCall = tonumber(bi.maxStack) or 0
-              if maxCall > 0 and buyCount > maxCall then buyCount = maxCall end
-
-              -- Safety cap to avoid huge buys if APIs misreport.
-              if buyCount > 200 then buyCount = 200 end
-
-              local p = tonumber(price) or 0
-              if p > 0 and type(GetMoney) == "function" then
-                local money = tonumber(GetMoney()) or 0
-                local maxAffordable = math.floor(money / p)
-                if maxAffordable < buyCount then buyCount = maxAffordable end
-              end
-
-              if buyCount > 0 then
-                if Print and LI and LI.Trade and LI.Trade._debugOn == true then
-                  Print(
-                    "Restock buy tick: idx=" .. tostring(idx) ..
-                    ", id=" .. tostring(buyID) ..
-                    ", target=" .. tostring(target) ..
-                    ", current=" .. tostring(current) ..
-                    ", need=" .. tostring(need) ..
-                    ", vendorQty=" .. tostring(vendorQty) ..
-                    ", buy=" .. tostring(buyCount) ..
-                    ", avail=" .. tostring(availItems) ..
-                    ", maxStack=" .. tostring(bi.maxStack)
-                  )
-                end
-                pcall(BuyMerchantItem, idx, buyCount)
-                if type(_liMerchantBuySessionBought) == "table" then
-                  local id = tonumber(buyID)
-                  if id and id > 0 then
-                    _liMerchantBuySessionBought[id] = (tonumber(_liMerchantBuySessionBought[id]) or 0) + buyCount
+              local key = GetUseKeyForItemID(itemID)
+              if key then
+                local hasMana = (key:sub(-7) == "|mana:1")
+                if (not usesMana) and hasMana then
+                  -- Non-mana classes: do not restock mana items.
+                  current = target
+                else
+                  local best = GetBestMerchantItemForUseKey(key, usesMana)
+                  current = CountEquivalentByUseKeyInBags(key)
+                  if best and best.itemID then
+                    current = current + GetPendingBought(best.itemID)
                   end
                 end
-                ops = ops + 1
-                if Print then
-                  Print("Buying: " .. tostring(buyCount) .. "x " .. (name or (GetItemNameSafe(buyID) or tostring(buyID))))
-                end
-                return ops
+              else
+                current = GetHaveCount(itemID)
               end
             end
           else
-            if Print then
-              Print("Cannot buy (not sold by this merchant): " .. (GetItemNameSafe(buyID) or tostring(buyID)))
+            current = GetHaveCount(itemID)
+          end
+
+          local need = target - current
+          if need > 0 then
+            local freeSlots = GetFreeBackpackSlots()
+            if freeSlots ~= nil and freeSlots <= 0 then
+              if Print and LI and LI.Trade and LI.Trade._debugOn == true then
+                Print("Restock: no free bag slots; skipping buys.")
+              end
+              return ops
+            end
+
+            local buyID, idx = itemID, nil
+
+            if r.restock == true then
+              local fd = GetFoodDrinkTupleForItemID(itemID)
+              local cat = fd and GetFoodDrinkCategoryKey(fd) or nil
+              if cat then
+                local best = GetBestMerchantFoodDrinkForCategory(cat, usesMana)
+                if best and best.idx and best.itemID then
+                  buyID, idx = best.itemID, best.idx
+                else
+                  buyID, idx = nil, nil
+                end
+              else
+                local key = GetUseKeyForItemID(itemID)
+                if key then
+                  local best = GetBestMerchantItemForUseKey(key, usesMana)
+                  if best and best.idx and best.itemID then
+                    buyID, idx = best.itemID, best.idx
+                  else
+                    buyID, idx = nil, nil
+                  end
+                else
+                  buyID, idx = nil, nil
+                end
+              end
+            end
+
+            if buyID and Print and r.restock == true and LI and LI.Trade and LI.Trade._debugOn == true then
+              local t = GetFoodDrinkTupleForItemID(buyID)
+              if type(t) == "table" and type(t.pct) == "number" then
+                local reqLevel = GetItemRequiredPlayerLevel(buyID)
+                if reqLevel and reqLevel > 0 then
+                  Print("Best usable vendor food: " .. tostring(t.pct) .. "% (req " .. tostring(reqLevel) .. ")")
+                else
+                  Print("Best usable vendor food: " .. tostring(t.pct) .. "%")
+                end
+              end
+            end
+
+            if buyID and (not idx) then
+              idx = GetMerchantIndexForItemID(buyID)
+            end
+            if buyID and idx and type(BuyMerchantItem) == "function" then
+              local bi = GetMerchantItemBuyInfo(idx) or {}
+              local name = bi.name
+              local price = bi.price
+              local vendorQty = tonumber(bi.quantity) or 1
+              if vendorQty <= 0 then vendorQty = 1 end
+
+              -- BuyMerchantItem's quantity parameter is the number of *items* to buy.
+              -- The merchant UI may display a "xN" quantity, but addons can still request arbitrary amounts.
+              local availItems = tonumber(bi.numAvailable)
+              if availItems == nil or availItems < 0 then
+                availItems = need
+              end
+              if availItems <= 0 then
+                -- out of stock
+              else
+                local buyCount = need
+                if buyCount > availItems then buyCount = availItems end
+
+                local maxCall = tonumber(bi.maxStack) or 0
+                if maxCall > 0 and buyCount > maxCall then buyCount = maxCall end
+
+                -- Safety cap to avoid huge buys if APIs misreport.
+                if buyCount > 200 then buyCount = 200 end
+
+                local p = tonumber(price) or 0
+                if p > 0 and type(GetMoney) == "function" then
+                  local money = tonumber(GetMoney()) or 0
+                  local maxAffordable = math.floor(money / p)
+                  if maxAffordable < buyCount then buyCount = maxAffordable end
+                end
+
+                if buyCount > 0 then
+                  if Print and LI and LI.Trade and LI.Trade._debugOn == true then
+                    Print(
+                      "Restock buy tick: idx=" .. tostring(idx) ..
+                      ", id=" .. tostring(buyID) ..
+                      ", target=" .. tostring(target) ..
+                      ", current=" .. tostring(current) ..
+                      ", need=" .. tostring(need) ..
+                      ", vendorQty=" .. tostring(vendorQty) ..
+                      ", buy=" .. tostring(buyCount) ..
+                      ", avail=" .. tostring(availItems) ..
+                      ", maxStack=" .. tostring(bi.maxStack)
+                    )
+                  end
+                  pcall(BuyMerchantItem, idx, buyCount)
+                  if type(_liMerchantBuySessionBought) == "table" then
+                    local id = tonumber(buyID)
+                    if id and id > 0 then
+                      _liMerchantBuySessionBought[id] = (tonumber(_liMerchantBuySessionBought[id]) or 0) + buyCount
+                    end
+                  end
+                  ops = ops + 1
+                  if Print then
+                    Print("Buying: " .. tostring(buyCount) .. "x " .. (name or (GetItemNameSafe(buyID) or tostring(buyID))))
+                  end
+                  return ops
+                end
+              end
+            else
+              if buyID and Print and LI and LI.Trade and LI.Trade._debugOn == true then
+                if type(_liMerchantNotSoldWarned) ~= "table" then _liMerchantNotSoldWarned = {} end
+                local warnID = tonumber(buyID) or buyID
+                if _liMerchantNotSoldWarned[warnID] ~= true then
+                  _liMerchantNotSoldWarned[warnID] = true
+                  Print("Cannot buy (not sold by this merchant): " .. (GetItemNameSafe(buyID) or tostring(buyID)))
+                end
+              end
             end
           end
         end
@@ -4064,6 +4282,7 @@ local function StopMerchantTradeTicker()
   _liMerchantIdleTicks = 0
   _liMerchantBuyBaselineHave = nil
   _liMerchantBuySessionBought = nil
+  _liMerchantNotSoldWarned = nil
 end
 
 local function StartMerchantTradeTicker()
@@ -4071,6 +4290,7 @@ local function StartMerchantTradeTicker()
 
   _liMerchantBuyBaselineHave = {}
   _liMerchantBuySessionBought = {}
+  _liMerchantNotSoldWarned = {}
 
   if not (C_Timer and type(C_Timer.NewTicker) == "function") then
     RunMerchantTradeOnce(false)

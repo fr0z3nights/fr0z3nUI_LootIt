@@ -1064,6 +1064,12 @@ function LI.Trade.BuildTab(depositPanel)
       edit:ClearFocus()
     end
 
+    -- When scope actions succeed, the entry is reset; clear Target too.
+    -- (Restock toggles should NOT reset the entry and are handled separately.)
+    if targetBox and targetBox.SetText then
+      targetBox:SetText("")
+    end
+
     if nameLabel and nameLabel.SetText then
       nameLabel:SetText("")
     end
@@ -1096,7 +1102,8 @@ function LI.Trade.BuildTab(depositPanel)
     end
   end
 
-  UpdateScopeButtons = function(id)
+  -- preserveTarget: optional flag used by Restock to avoid wiping in-progress Target input.
+  UpdateScopeButtons = function(id, preserveTarget)
     depositPanel._liScopeID = id
 
     local mode = GetTradeMode()
@@ -1210,15 +1217,20 @@ function LI.Trade.BuildTab(depositPanel)
     end
 
     -- Keep the Target box in sync with the effective active rule.
-    -- This prevents confusing cases where a rule exists but the Target field looks empty.
+    -- Default behavior: if there is no effective rule, clear the Target box.
+    -- Restock uses preserveTarget=true so it doesn't wipe in-progress input.
     if targetBox and targetBox.SetText and (mode == "buy" or mode == "sell") then
       local n = tonumber(effectiveCount)
       if n ~= nil then
         n = math.floor(n)
         if n < 0 then n = 0 end
         if n > 9999 then n = 9999 end
+        targetBox:SetText((n > 0) and tostring(n) or "")
+      else
+        if preserveTarget ~= true then
+          targetBox:SetText("")
+        end
       end
-      targetBox:SetText((n ~= nil and n > 0) and tostring(n) or "")
       if UpdateTargetPlaceholder then pcall(UpdateTargetPlaceholder) end
     end
 
@@ -1994,6 +2006,19 @@ function LI.Trade.BuildTab(depositPanel)
     if mode == "sell" then return end
     local stores = GetScopeStores(mode)
 
+    -- Preserve any uncommitted Target value while toggling Restock.
+    -- (UpdateScopeButtons syncs the Target box from the effective rule and can overwrite user input.)
+    local prevTargetText = (targetBox and targetBox.GetText and targetBox:GetText()) or nil
+    local function UpdateScopeButtonsPreserveTarget()
+      UpdateScopeButtons(id, true)
+      if prevTargetText ~= nil and prevTargetText ~= "" and targetBox and targetBox.SetText and targetBox.GetText then
+        if targetBox:GetText() ~= prevTargetText then
+          targetBox:SetText(prevTargetText)
+          if UpdateTargetPlaceholder then pcall(UpdateTargetPlaceholder) end
+        end
+      end
+    end
+
     local pendingRestockID = depositPanel._pendingRestockID
     local pendingRestock = depositPanel._pendingRestock
     local function TogglePendingForID(x)
@@ -2025,7 +2050,7 @@ function LI.Trade.BuildTab(depositPanel)
     if not hasAnyRule then
       local on = TogglePendingForID(id)
       SetRestockBtnVisual(on)
-      UpdateScopeButtons(id)
+      UpdateScopeButtonsPreserveTarget()
       return
     end
 
@@ -2046,7 +2071,7 @@ function LI.Trade.BuildTab(depositPanel)
     -- Update the button immediately even if some other UI refresh is delayed.
     SetRestockBtnVisual(nextVal)
 
-    UpdateScopeButtons(id)
+    UpdateScopeButtonsPreserveTarget()
   end)
 
   depositPanel._RefreshModeUI = function(self)
