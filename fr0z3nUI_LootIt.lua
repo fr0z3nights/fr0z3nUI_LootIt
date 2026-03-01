@@ -2,9 +2,12 @@ local ADDON = ...
 
 local PREFIX = "|cff00ccff[LI]|r "
 
+local SANITY_VERSION = "260301-002"
+
 local LI = fr0z3nUI_LootIt or {}
 fr0z3nUI_LootIt = LI
 LI.PREFIX = PREFIX
+LI.SANITY_VERSION = SANITY_VERSION
 
 local function Print(msg)
   local frame = DEFAULT_CHAT_FRAME
@@ -94,8 +97,6 @@ local DEFAULTS = {
     flushOnMerchantClose = true,
   },
 
-  -- Loot-output styling: suppress tabard iLvl suffix below this iLvl (0 disables).
-  ignoreTabardLootBelowIlvl = 10,
   mailNotify = {
     enabled = true,
   },
@@ -127,18 +128,19 @@ local DEFAULTS = {
   -- Use via: /fli chatdebug on|off|toggle|status|dump
   debugChatSetup = false,
 
-  tabard = {
-    enabled = true,
-    delay = 0.75,
-    hideRepBarWhenNoChampion = false,
-    modeByContext = {
-      solo = "nochange",
-      city = "closest",
-      dungeon = "closest",
-      raid = "nochange",
-      pvp = "nochange",
+  tax = {
+    enabled = false,
+    rate = 0, -- percent (0..100)
+    quiet = false,
+    due = 0, -- copper
+    paidToDate = 0, -- copper
+    sources = {
+      vendor = true,
+      questLoot = true, -- CHAT_MSG_MONEY
+      systemMoney = false, -- CHAT_MSG_SYSTEM (off by default)
+      mail = true,
     },
-    tabardMap = {},
+    autoPayOnGuildBankOpen = false,
   },
 
   -- Deposit helper (bank open + command/button pressed).
@@ -442,6 +444,7 @@ local function DepositCfgAcc()
   if DB.deposit.stackPull == nil then DB.deposit.stackPull = false end -- legacy; replaced by stackPullByItem
   DB.deposit.stackPullByItem = (type(DB.deposit.stackPullByItem) == "table") and DB.deposit.stackPullByItem or {}
   DB.deposit.keepByItem = (type(DB.deposit.keepByItem) == "table") and DB.deposit.keepByItem or {}
+  DB.deposit.keepScopeByItem = (type(DB.deposit.keepScopeByItem) == "table") and DB.deposit.keepScopeByItem or {}
   DB.deposit.itemsAcc = (type(DB.deposit.itemsAcc) == "table") and DB.deposit.itemsAcc or {}
   DB.deposit.itemsAccDisabled = (type(DB.deposit.itemsAccDisabled) == "table") and DB.deposit.itemsAccDisabled or {}
   DB.deposit.itemsAccDisableRealm = (type(DB.deposit.itemsAccDisableRealm) == "table") and DB.deposit.itemsAccDisableRealm or {}
@@ -710,6 +713,40 @@ local function GetGuildBankItemLinkSafe(tab, slot)
     return link
   end
   return nil
+end
+
+local function CountItemInGuildBankTab(tab, itemID)
+  if not IsGuildBankOpen() then return 0 end
+  tab = tonumber(tab)
+  itemID = tonumber(itemID)
+  if not tab or tab <= 0 then return 0 end
+  if not itemID or itemID <= 0 then return 0 end
+
+  if QueryGuildBankTabIfNeeded then
+    QueryGuildBankTabIfNeeded(tab)
+  end
+
+  local maxSlots = _G and rawget(_G, "MAX_GUILDBANK_SLOTS_PER_TAB")
+  maxSlots = tonumber(maxSlots) or 98
+
+  local total = 0
+  for slot = 1, maxSlots do
+    local link = GetGuildBankItemLinkSafe(tab, slot)
+    if type(link) == "string" then
+      local id = tonumber(string.match(link, "item:(%d+)"))
+      if id and id == itemID then
+        local okI, _, count = false, nil, nil
+        if type(GetGuildBankItemInfo) == "function" then
+          okI, _, count = pcall(GetGuildBankItemInfo, tab, slot)
+        end
+        count = okI and tonumber(count) or nil
+        if count and count > 0 then
+          total = total + count
+        end
+      end
+    end
+  end
+  return total
 end
 
 local function GetResetToken(resetKind)
@@ -1291,6 +1328,15 @@ local function GetEffectiveKeepAmount(itemID)
   return v
 end
 
+local function GetEffectiveKeepScope(itemID)
+  itemID = tonumber(itemID)
+  if not itemID or itemID <= 0 then return "K" end
+  local cfg = DepositCfgAcc()
+  local v = (cfg and type(cfg.keepScopeByItem) == "table") and cfg.keepScopeByItem[itemID] or nil
+  if v == "S" then return "S" end
+  return "K"
+end
+
 local function IsStackPullEnabledForItem(itemID)
   itemID = tonumber(itemID)
   if not itemID or itemID <= 0 then return false end
@@ -1304,6 +1350,34 @@ local function CountItemInPlayerBags(itemID)
   if not (C_Container and type(C_Container.GetContainerNumSlots) == "function") then return 0 end
   local total = 0
   for bag = 0, 6 do
+    local okN, n = pcall(C_Container.GetContainerNumSlots, bag)
+    n = okN and tonumber(n) or 0
+    if n and n > 0 then
+      for slot = 1, n do
+        local info = nil
+        if type(C_Container.GetContainerItemInfo) == "function" then
+          local ok, v = pcall(C_Container.GetContainerItemInfo, bag, slot)
+          info = ok and v or nil
+        end
+        if info and tonumber(info.itemID) == itemID then
+          local stack = tonumber(info.stackCount)
+          total = total + (stack or 1)
+        end
+      end
+    end
+  end
+  return total
+end
+
+local function CountItemInContainerBags(sourceBags, itemID)
+  if type(sourceBags) ~= "table" then return 0 end
+  itemID = tonumber(itemID)
+  if not itemID or itemID <= 0 then return 0 end
+  if not (C_Container and type(C_Container.GetContainerNumSlots) == "function") then return 0 end
+
+  local total = 0
+  for i = 1, #sourceBags do
+    local bag = sourceBags[i]
     local okN, n = pcall(C_Container.GetContainerNumSlots, bag)
     n = okN and tonumber(n) or 0
     if n and n > 0 then
@@ -1421,6 +1495,20 @@ local function RunDepositGuild()
     end
   end
 
+  -- Store scope (S): keep amount in this guild tab; deposit up to Keep, withdraw excess.
+  local storeHave = {}
+  do
+    for itemID in pairs(targets) do
+      itemID = tonumber(itemID)
+      if itemID and itemID > 0 then
+        local keep = GetEffectiveKeepAmount(itemID)
+        if keep > 0 and GetEffectiveKeepScope(itemID) == "S" then
+          storeHave[itemID] = CountItemInGuildBankTab(tab, itemID)
+        end
+      end
+    end
+  end
+
   local moved = 0
   local movedLines = {}
   local skippedSoulbound = 0
@@ -1448,12 +1536,23 @@ local function RunDepositGuild()
           local depositCount = stack
           local keep = GetEffectiveKeepAmount(itemID)
           if keep > 0 then
-            local current = CountItemInPlayerBags(itemID)
-            local excess = (current or 0) - keep
-            if excess <= 0 then
-              depositCount = 0
-            elseif excess < depositCount then
-              depositCount = excess
+            local scope = GetEffectiveKeepScope(itemID)
+            if scope == "S" then
+              local have = tonumber(storeHave[itemID]) or 0
+              local need = keep - have
+              if need <= 0 then
+                depositCount = 0
+              elseif need < depositCount then
+                depositCount = need
+              end
+            else
+              local current = CountItemInPlayerBags(itemID)
+              local excess = (current or 0) - keep
+              if excess <= 0 then
+                depositCount = 0
+              elseif excess < depositCount then
+                depositCount = excess
+              end
             end
           end
 
@@ -1487,6 +1586,9 @@ local function RunDepositGuild()
               local okMove, why = DepositToGuildBankOnce(bag, slot, tab, bankSlot, depositCount ~= stack and depositCount or nil)
               if okMove then
                 moved = moved + 1
+                if keep > 0 and GetEffectiveKeepScope(itemID) == "S" then
+                  storeHave[itemID] = (tonumber(storeHave[itemID]) or 0) + (tonumber(depositCount) or 0)
+                end
                 if moved <= 15 then
                   movedLines[#movedLines + 1] = tostring(link or itemID) .. " x" .. tostring(depositCount)
                 end
@@ -1502,6 +1604,39 @@ local function RunDepositGuild()
     if moved >= maxMoves then break end
   end
 
+  local storeMoved = 0
+  do
+    for itemID in pairs(targets) do
+      itemID = tonumber(itemID)
+      if itemID and itemID > 0 then
+        local keep = GetEffectiveKeepAmount(itemID)
+        if keep > 0 and GetEffectiveKeepScope(itemID) == "S" then
+          local have = tonumber(storeHave[itemID])
+          if have == nil then
+            have = CountItemInGuildBankTab(tab, itemID)
+          end
+          local excess = (have or 0) - keep
+          if excess > 0 then
+            local did, why = WithdrawFromGuildBankToBags(tab, itemID, excess)
+            if why then
+              if tostring(why) == "No bag space" then
+                Print("Store withdraw blocked (guild): bags are full (free bag space and retry deposit)")
+              else
+                Print("Store withdraw blocked (guild): " .. tostring(why))
+              end
+              return moved > 0
+            end
+            did = tonumber(did) or 0
+            if did > 0 then
+              storeMoved = storeMoved + did
+              storeHave[itemID] = (have or 0) - did
+            end
+          end
+        end
+      end
+    end
+  end
+
   if moved > 0 then
     Print("Deposited: " .. tostring(moved) .. " move(s)")
     for i = 1, #movedLines do
@@ -1513,6 +1648,13 @@ local function RunDepositGuild()
     if skippedSoulbound > 0 then
       Print("Skipped soulbound: " .. tostring(skippedSoulbound))
     end
+    if storeMoved > 0 then
+      Print("Withdrew (store): " .. tostring(storeMoved) .. " item(s)")
+    end
+    return true
+  end
+  if storeMoved > 0 then
+    Print("Withdrew (store): " .. tostring(storeMoved) .. " item(s)")
     return true
   end
   -- Nothing left to deposit; run a cleanup pass like BankStack /sort guild.
@@ -1576,6 +1718,8 @@ local function RunDepositPersonalBank()
     return false
   end
 
+  local bankBags = GetPersonalBankBagIDs and GetPersonalBankBagIDs() or nil
+
   local moved = 0
   local movedLines = {}
   local maxMoves = 200
@@ -1583,7 +1727,6 @@ local function RunDepositPersonalBank()
   -- Optional Stack Pull: withdraw a partial stack from the bank first (per item), but only
   -- when the player has enough in bags to fill it.
   do
-    local bankBags = GetPersonalBankBagIDs and GetPersonalBankBagIDs() or nil
     local touched = {}
     if type(bankBags) == "table" and #bankBags > 0 and C_Container and type(C_Container.GetContainerNumSlots) == "function" then
       for itemID in pairs(targets) do
@@ -1632,6 +1775,22 @@ local function RunDepositPersonalBank()
     end
   end
 
+  -- Store scope (S): keep amount in bank; deposit up to Keep, withdraw excess.
+  local storeHave = {}
+  do
+    if type(bankBags) == "table" and #bankBags > 0 then
+      for itemID in pairs(targets) do
+        itemID = tonumber(itemID)
+        if itemID and itemID > 0 then
+          local keep = GetEffectiveKeepAmount(itemID)
+          if keep > 0 and GetEffectiveKeepScope(itemID) == "S" then
+            storeHave[itemID] = CountItemInContainerBags(bankBags, itemID)
+          end
+        end
+      end
+    end
+  end
+
   for bag = 0, 6 do
     local n = 0
     if C_Container and type(C_Container.GetContainerNumSlots) == "function" then
@@ -1653,12 +1812,23 @@ local function RunDepositPersonalBank()
           local depositCount = stack
           local keep = GetEffectiveKeepAmount(itemID)
           if keep > 0 then
-            local current = CountItemInPlayerBags(itemID)
-            local excess = (current or 0) - keep
-            if excess <= 0 then
-              depositCount = 0
-            elseif excess < depositCount then
-              depositCount = excess
+            local scope = GetEffectiveKeepScope(itemID)
+            if scope == "S" then
+              local have = tonumber(storeHave[itemID]) or 0
+              local need = keep - have
+              if need <= 0 then
+                depositCount = 0
+              elseif need < depositCount then
+                depositCount = need
+              end
+            else
+              local current = CountItemInPlayerBags(itemID)
+              local excess = (current or 0) - keep
+              if excess <= 0 then
+                depositCount = 0
+              elseif excess < depositCount then
+                depositCount = excess
+              end
             end
           end
 
@@ -1672,6 +1842,9 @@ local function RunDepositPersonalBank()
             local okMove = DepositToPersonalBankOnce(bag, slot, depositCount ~= stack and depositCount or nil)
             if okMove then
               moved = moved + 1
+              if keep > 0 and GetEffectiveKeepScope(itemID) == "S" then
+                storeHave[itemID] = (tonumber(storeHave[itemID]) or 0) + (tonumber(depositCount) or 0)
+              end
               if moved <= 15 then
                 movedLines[#movedLines + 1] = tostring(link or itemID) .. " x" .. tostring(depositCount)
               end
@@ -1686,6 +1859,41 @@ local function RunDepositPersonalBank()
     if moved >= maxMoves then break end
   end
 
+  local storeMoved = 0
+  do
+    if type(bankBags) == "table" and #bankBags > 0 then
+      for itemID in pairs(targets) do
+        itemID = tonumber(itemID)
+        if itemID and itemID > 0 then
+          local keep = GetEffectiveKeepAmount(itemID)
+          if keep > 0 and GetEffectiveKeepScope(itemID) == "S" then
+            local have = tonumber(storeHave[itemID])
+            if have == nil then
+              have = CountItemInContainerBags(bankBags, itemID)
+            end
+            local excess = (have or 0) - keep
+            if excess > 0 then
+              local did, why = WithdrawFromContainerBagsToBags(bankBags, itemID, excess)
+              if why then
+                if tostring(why) == "No bag space" then
+                  Print("Store withdraw blocked (bank): bags are full (free bag space and retry deposit)")
+                else
+                  Print("Store withdraw blocked (bank): " .. tostring(why))
+                end
+                return moved > 0
+              end
+              did = tonumber(did) or 0
+              if did > 0 then
+                storeMoved = storeMoved + did
+                storeHave[itemID] = (have or 0) - did
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+
   if moved > 0 then
     Print("Deposited: " .. tostring(moved) .. " move(s)")
     for i = 1, #movedLines do
@@ -1694,6 +1902,13 @@ local function RunDepositPersonalBank()
     if moved > #movedLines then
       Print("  (and " .. tostring(moved - #movedLines) .. " more)")
     end
+    if storeMoved > 0 then
+      Print("Withdrew (store): " .. tostring(storeMoved) .. " item(s)")
+    end
+    return true
+  end
+  if storeMoved > 0 then
+    Print("Withdrew (store): " .. tostring(storeMoved) .. " item(s)")
     return true
   end
   -- Nothing left to deposit; run a cleanup pass like BankStack /sort bank.
@@ -2072,6 +2287,24 @@ local function RunDepositWarband()
     return false
   end
 
+  local warbankBags = {}
+  do
+    local selectedTab = GetSelectedAccountBankTabBagID()
+    local all = {}
+    if selectedTab then
+      all[1] = selectedTab
+    elseif Enum and Enum.BagIndex then
+      local e = Enum.BagIndex
+      all = { e.AccountBankTab_1, e.AccountBankTab_2, e.AccountBankTab_3, e.AccountBankTab_4, e.AccountBankTab_5 }
+    end
+    for i = 1, #all do
+      local b = all[i]
+      if IsAccountBankBagID(b) then
+        warbankBags[#warbankBags + 1] = b
+      end
+    end
+  end
+
   -- Optional workaround (Stack Pull): For stackable items, if Warbank already has
   -- a partial stack (count < max stack), withdraw that partial stack to bags first, then deposit.
   do
@@ -2148,6 +2381,22 @@ local function RunDepositWarband()
   local moved = 0
   local movedLines = {}
   local maxMoves = 200
+
+  -- Store scope (S): keep amount in warbank; deposit up to Keep, withdraw excess.
+  local storeHave = {}
+  do
+    if type(warbankBags) == "table" and #warbankBags > 0 then
+      for itemID in pairs(targets) do
+        itemID = tonumber(itemID)
+        if itemID and itemID > 0 then
+          local keep = GetEffectiveKeepAmount(itemID)
+          if keep > 0 and GetEffectiveKeepScope(itemID) == "S" then
+            storeHave[itemID] = CountItemInContainerBags(warbankBags, itemID)
+          end
+        end
+      end
+    end
+  end
   for bag = 0, 6 do
     local n = 0
     if C_Container and type(C_Container.GetContainerNumSlots) == "function" then
@@ -2169,12 +2418,23 @@ local function RunDepositWarband()
           local depositCount = stack
           local keep = GetEffectiveKeepAmount(itemID)
           if keep > 0 then
-            local current = CountItemInPlayerBags(itemID)
-            local excess = (current or 0) - keep
-            if excess <= 0 then
-              depositCount = 0
-            elseif excess < depositCount then
-              depositCount = excess
+            local scope = GetEffectiveKeepScope(itemID)
+            if scope == "S" then
+              local have = tonumber(storeHave[itemID]) or 0
+              local need = keep - have
+              if need <= 0 then
+                depositCount = 0
+              elseif need < depositCount then
+                depositCount = need
+              end
+            else
+              local current = CountItemInPlayerBags(itemID)
+              local excess = (current or 0) - keep
+              if excess <= 0 then
+                depositCount = 0
+              elseif excess < depositCount then
+                depositCount = excess
+              end
             end
           end
 
@@ -2188,6 +2448,9 @@ local function RunDepositWarband()
             local okMove, why = DepositToWarbankOnce(bag, slot, itemID, depositCount ~= stack and depositCount or nil)
             if okMove then
               moved = moved + 1
+              if keep > 0 and GetEffectiveKeepScope(itemID) == "S" then
+                storeHave[itemID] = (tonumber(storeHave[itemID]) or 0) + (tonumber(depositCount) or 0)
+              end
               if moved <= 15 then
                 movedLines[#movedLines + 1] = tostring(link or itemID) .. " x" .. tostring(depositCount)
               end
@@ -2202,6 +2465,41 @@ local function RunDepositWarband()
     if moved >= maxMoves then break end
   end
 
+  local storeMoved = 0
+  do
+    if type(warbankBags) == "table" and #warbankBags > 0 then
+      for itemID in pairs(targets) do
+        itemID = tonumber(itemID)
+        if itemID and itemID > 0 then
+          local keep = GetEffectiveKeepAmount(itemID)
+          if keep > 0 and GetEffectiveKeepScope(itemID) == "S" then
+            local have = tonumber(storeHave[itemID])
+            if have == nil then
+              have = CountItemInContainerBags(warbankBags, itemID)
+            end
+            local excess = (have or 0) - keep
+            if excess > 0 then
+              local did, why = WithdrawFromContainerBagsToBags(warbankBags, itemID, excess)
+              if why then
+                if tostring(why) == "No bag space" then
+                  Print("Store withdraw blocked (warbank): bags are full (free bag space and retry deposit)")
+                else
+                  Print("Store withdraw blocked (warbank): " .. tostring(why))
+                end
+                return moved > 0
+              end
+              did = tonumber(did) or 0
+              if did > 0 then
+                storeMoved = storeMoved + did
+                storeHave[itemID] = (have or 0) - did
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+
   if moved > 0 then
     Print("Deposited: " .. tostring(moved) .. " move(s)")
     for i = 1, #movedLines do
@@ -2210,6 +2508,13 @@ local function RunDepositWarband()
     if moved > #movedLines then
       Print("  (and " .. tostring(moved - #movedLines) .. " more)")
     end
+    if storeMoved > 0 then
+      Print("Withdrew (store): " .. tostring(storeMoved) .. " item(s)")
+    end
+    return true
+  end
+  if storeMoved > 0 then
+    Print("Withdrew (store): " .. tostring(storeMoved) .. " item(s)")
     return true
   end
   -- Nothing left to deposit; run a cleanup pass like BankStack /sort account.
@@ -2582,7 +2887,8 @@ local function RunKeepTopUpForTarget(target, targets)
     itemID = tonumber(itemID)
     if itemID and itemID > 0 then
       local keep = GetEffectiveKeepAmount(itemID)
-      if keep > 0 then
+      local scope = GetEffectiveKeepScope(itemID)
+      if keep > 0 and scope ~= "S" then
         local have = CountItemInPlayerBags(itemID)
         if have < keep then
           local need = keep - have
@@ -4142,6 +4448,7 @@ do
       EnsureDB = EnsureDB,
       GetDB = function() return DB end,
       GetCharDB = function() return CHARDB end,
+      SANITY_VERSION = SANITY_VERSION,
       IsEnabled = IsEnabled,
       ToggleConfigUI = ToggleConfigUI,
       CreateConfigUI = CreateConfigUI,
@@ -4225,6 +4532,8 @@ local f = CreateFrame("Frame")
 f:RegisterEvent("PLAYER_LOGIN")
 f:RegisterEvent("PLAYER_ENTERING_WORLD")
 f:RegisterEvent("PLAYER_GUILD_UPDATE")
+f:RegisterEvent("CHAT_MSG_MONEY")
+f:RegisterEvent("CHAT_MSG_SYSTEM")
 f:RegisterEvent("MERCHANT_SHOW")
 f:RegisterEvent("MERCHANT_CLOSED")
 f:RegisterEvent("UPDATE_PENDING_MAIL")
@@ -4245,9 +4554,9 @@ f:SetScript("OnEvent", function(_, event, arg1)
   if event == "PLAYER_LOGIN" then
     UpdateSeenGuilds()
     do
-      local tabard = _G and rawget(_G, "fr0z3nUI_LootItTabard")
-      if tabard and tabard.Init then
-        tabard.Init(DB, CHARDB)
+      local tax = LI and LI.Tax
+      if tax and tax.Init then
+        tax.Init(DB, CHARDB, { Print = Print })
       end
     end
     ApplyFilters()
@@ -4265,12 +4574,25 @@ f:SetScript("OnEvent", function(_, event, arg1)
     end
   elseif event == "PLAYER_GUILD_UPDATE" then
     UpdateSeenGuilds()
+  elseif event == "CHAT_MSG_MONEY" or event == "CHAT_MSG_SYSTEM" then
+    local tax = LI and LI.Tax
+    if tax and tax.OnMoneyMessage then
+      tax.OnMoneyMessage(event, arg1)
+    end
   elseif event == "MERCHANT_SHOW" then
     StartMerchantTradeTicker()
+    local tax = LI and LI.Tax
+    if tax and tax.OnMerchantShow then
+      tax.OnMerchantShow()
+    end
   elseif event == "MERCHANT_CLOSED" then
     StopMerchantTradeTicker()
     if DB and DB.delayPrint and DB.delayPrint.flushOnMerchantClose then
       DelayPrintFlushAll()
+    end
+    local tax = LI and LI.Tax
+    if tax and tax.OnMerchantClosed then
+      tax.OnMerchantClosed()
     end
   elseif event == "PLAYER_INTERACTION_MANAGER_FRAME_SHOW" or event == "PLAYER_INTERACTION_MANAGER_FRAME_HIDE" then
     local it = (Enum and Enum.PlayerInteractionType) and Enum.PlayerInteractionType or nil
@@ -4278,6 +4600,12 @@ f:SetScript("OnEvent", function(_, event, arg1)
     local isBanker = (it and it.Banker and arg1 == it.Banker) and true or false
     local isAccountBanker = (it and it.AccountBanker and arg1 == it.AccountBanker) and true or false
     local isGuildBanker = (it and it.GuildBanker and arg1 == it.GuildBanker) and true or false
+    do
+      local tax = LI and LI.Tax
+      if tax and tax.OnInteraction then
+        tax.OnInteraction(isShow, arg1)
+      end
+    end
     if isBanker then
       _bankInteractionOpen = isShow
     elseif isAccountBanker then

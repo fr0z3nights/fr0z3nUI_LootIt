@@ -42,6 +42,21 @@ DB.deposit = {
     [1710]  = 40,     -- Greater Healing Potion (example)
   },
 
+  -- Per-item Keep Scope (Deposit mode)
+  -- "K" (default when unset): Keep in Bags
+  --   - Deposits down to Keep in bags (so you keep the amount on your character)
+  --   - May withdraw from the chosen target to top bags back up to Keep
+  -- "S": Store in Bank
+  --   - Deposits up to Keep into the chosen target
+  --   - If the chosen target already has more than Keep, it will attempt to withdraw the excess back to bags
+  -- Notes:
+  -- - If keepScopeByItem[itemID] is nil/absent, behavior defaults to "K".
+  -- - Store-scope excess withdraw requires free bag space.
+  keepScopeByItem = {
+    [1710] = "K",
+    [19019] = "S",
+  },
+
   ------------------------------------------------------------------------------
   -- DEPOSIT RULES (Account scope)
   ------------------------------------------------------------------------------

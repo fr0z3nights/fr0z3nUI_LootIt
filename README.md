@@ -1,6 +1,6 @@
 # fr0z3nUI LootIt
 
-Loot chat cleaner + a small config UI. Also includes a Tabard helper module (for reputation tabard swapping).
+Loot chat cleaner + a small config UI. Also includes a Tax helper tab.
 
 ## Install
 1. Copy the folder `fr0z3nUI_LootIt` into:
@@ -37,14 +37,9 @@ Loot chat cleaner + a small config UI. Also includes a Tabard helper module (for
 - `/fli repair` — reapply filters
 - `/fli debugfilters` — print chat-filter install status
 
-## Tabard module (optional convenience)
-- `/fli tabard swap` — force a tabard swap check
-- `/fli tabard debug` — prints debug info
-
-Legacy alias (deprecated):
-- `/ftm swap` / `/ftm debug`
-
-(There’s also a “Tabard” tab inside LootIt options for the main toggle.)
+## Tax tab
+- Configure the rate and sources in the “Tax” tab inside LootIt options.
+- Optional auto-pay can deposit the due amount when opening the guild bank.
 
 ## SavedVariables
 - Account: `fr0z3nUI_LootItDB`

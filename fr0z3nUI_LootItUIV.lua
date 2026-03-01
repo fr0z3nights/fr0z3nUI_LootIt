@@ -40,6 +40,11 @@ function UIV.Handle(msg)
   cmd = (cmd and cmd:lower()) or ""
 
   local function Status()
+    local sanity = e.SANITY_VERSION
+    if sanity and sanity ~= "" then
+      SafeCall(Print, "sanity=" .. tostring(sanity))
+    end
+
     local mode
     if CHARDB and CHARDB.enabledOverride == true then
       mode = "on"
@@ -70,8 +75,6 @@ function UIV.Handle(msg)
     SafeCall(Print, "/fli selfname on|off")
     SafeCall(Print, "/fli prefix <text>|default (leave blank to clear)")
     SafeCall(Print, "/fli ignore <itemID>")
-    SafeCall(Print, "/fli tabard swap")
-    SafeCall(Print, "/fli tabard debug")
     SafeCall(Print, "/fli mail on|off|toggle|test")
     SafeCall(Print, "/fli mail model player")
     SafeCall(Print, "/fli mail model katy")
@@ -196,34 +199,6 @@ function UIV.Handle(msg)
     local on = not (DB.ignoredItemIDs[id] == true)
     DB.ignoredItemIDs[id] = on and true or nil
     SafeCall(Print, string.format("Ignore %s: %d", on and "enabled" or "disabled", id))
-    return
-  end
-
-  if cmd == "tabard" then
-    local sub = tostring(rest or ""):lower():gsub("^%s+", ""):gsub("%s+$", "")
-    local tabard = _G and rawget(_G, "fr0z3nUI_LootItTabard")
-    if sub == "" or sub == "help" or sub == "?" then
-      SafeCall(Print, "Tabard commands:")
-      SafeCall(Print, "  /fli tabard swap")
-      SafeCall(Print, "  /fli tabard debug")
-      return
-    end
-
-    if not (tabard and (tabard.MaybeSwap or tabard.Debug)) then
-      SafeCall(Print, "Tabard module not loaded.")
-      return
-    end
-
-    if sub == "swap" then
-      if tabard.MaybeSwap then tabard.MaybeSwap("cmd") end
-      return
-    end
-    if sub == "debug" then
-      if tabard.Debug then tabard.Debug() end
-      return
-    end
-
-    SafeCall(Print, "Unknown tabard command. Try: /fli tabard help")
     return
   end
 

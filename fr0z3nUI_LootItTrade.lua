@@ -514,6 +514,12 @@ function LI.Trade.BuildTab(depositPanel)
   end
   keepBox:Hide()
 
+  -- Keep scope (Deposit mode): K = keep in bags, S = store in bank (withdraw excess)
+  local keepScopeBtn = CreateFrame("Button", nil, depositPanel, "UIPanelButtonTemplate")
+  keepScopeBtn:SetSize(22, BTN_H)
+  keepScopeBtn:SetText("K")
+  keepScopeBtn:Hide()
+
   -- Stack Pull toggle (Deposit mode): optional workaround to reduce stacking issues.
   local spBtn = CreateFrame("Button", nil, depositPanel, "UIPanelButtonTemplate")
   spBtn:SetSize(28, BTN_H)
@@ -566,6 +572,21 @@ function LI.Trade.BuildTab(depositPanel)
     UpdateKeepPlaceholder()
   end
 
+  local function GetKeepScopeForID(id)
+    id = tonumber(id)
+    if not id or id <= 0 then return "K" end
+    local cfg = DepositCfgAcc()
+    local v = (cfg and type(cfg.keepScopeByItem) == "table") and cfg.keepScopeByItem[id] or nil
+    if v == "S" then return "S" end
+    return "K"
+  end
+
+  local function RefreshKeepScopeBtn(id)
+    if not (keepScopeBtn and keepScopeBtn.SetText) then return end
+    local s = GetKeepScopeForID(id)
+    keepScopeBtn:SetText(s)
+  end
+
   keepBox:SetScript("OnEnterPressed", function(self)
     self:ClearFocus()
     ApplyKeepFromBox()
@@ -573,6 +594,30 @@ function LI.Trade.BuildTab(depositPanel)
   keepBox:SetScript("OnEscapePressed", function(self)
     self:ClearFocus()
     ApplyKeepFromBox()
+  end)
+
+  keepScopeBtn:SetScript("OnClick", function()
+    local cfg = DepositCfgAcc()
+    if not cfg then return end
+
+    local id = tonumber(edit and edit.GetText and edit:GetText() or "")
+    if not id or id <= 0 then
+      RefreshKeepScopeBtn(nil)
+      return
+    end
+
+    cfg.keepScopeByItem = (type(cfg.keepScopeByItem) == "table") and cfg.keepScopeByItem or {}
+    if cfg.keepScopeByItem[id] == "S" then
+      cfg.keepScopeByItem[id] = nil
+    else
+      cfg.keepScopeByItem[id] = "S"
+    end
+
+    if UpdateScopeButtons then
+      UpdateScopeButtons(id)
+    else
+      RefreshKeepScopeBtn(id)
+    end
   end)
 
   -- Place Guild button above the Deposit button.
@@ -739,6 +784,12 @@ function LI.Trade.BuildTab(depositPanel)
       return "Target (Sell)", "Sell down to this count in bags.", "0 = sell all."
     end
     return "Target", "Used in Buy/Sell modes.", nil
+  end)
+
+  SetDynamicTip(keepScopeBtn, function()
+    local id = tonumber(edit and edit.GetText and edit:GetText() or "")
+    local s = GetKeepScopeForID(id)
+    return "Keep Scope", "K = keep this many in bags", "S = store this many in bank; withdraw excess", "Current: " .. tostring(s)
   end)
 
   local function GetItemNameSafe(id)
@@ -1064,6 +1115,11 @@ function LI.Trade.BuildTab(depositPanel)
       restockBtn:Disable()
       SetRestockBtnVisual(false)
 
+      if keepScopeBtn then
+        if keepScopeBtn.Disable then keepScopeBtn:Disable() end
+        if keepScopeBtn.SetText then keepScopeBtn:SetText("K") end
+      end
+
       if keepBox and keepBox.SetText then
         keepBox:SetText("")
       end
@@ -1081,6 +1137,11 @@ function LI.Trade.BuildTab(depositPanel)
       if v > 9999 then v = 9999 end
       keepBox:SetText((v > 0) and tostring(v) or "")
       if UpdateKeepPlaceholder then pcall(UpdateKeepPlaceholder) end
+
+      if keepScopeBtn then
+        if keepScopeBtn.Enable then keepScopeBtn:Enable() end
+        RefreshKeepScopeBtn(id)
+      end
     end
 
     btnAcc:Enable()
@@ -1996,6 +2057,7 @@ function LI.Trade.BuildTab(depositPanel)
     bankBtn:SetShown(isDeposit)
     guildTabBtn:SetShown(isDeposit)
     keepBox:SetShown(isDeposit)
+    keepScopeBtn:SetShown(isDeposit)
     spBtn:SetShown(isDeposit)
     targetBox:SetShown(not isDeposit)
     restockBtn:SetShown(isBuy)
@@ -2024,10 +2086,18 @@ function LI.Trade.BuildTab(depositPanel)
       guildTabBtn:ClearAllPoints()
       guildTabBtn:SetPoint("BOTTOMRIGHT", depositPanel, "BOTTOMRIGHT", -10, rowY)
       keepBox:ClearAllPoints()
-      -- Keep + SP are centered as a group.
+      keepScopeBtn:ClearAllPoints()
+
+      -- Scope + Keep + SP are centered as a group.
+      local scopeGap = 2
       local spGap = 4
+      local scopeW = (keepScopeBtn and keepScopeBtn.GetWidth and keepScopeBtn:GetWidth()) or 22
+      local keepW = (keepBox and keepBox.GetWidth and keepBox:GetWidth()) or 44
       local spW = (spBtn and spBtn.GetWidth and spBtn:GetWidth()) or 28
-      keepBox:SetPoint("BOTTOM", depositPanel, "BOTTOM", -((spW + spGap) / 2), rowY)
+      local totalW = scopeW + scopeGap + keepW + spGap + spW
+
+      keepScopeBtn:SetPoint("BOTTOMLEFT", depositPanel, "BOTTOM", -(totalW / 2), rowY)
+      keepBox:SetPoint("LEFT", keepScopeBtn, "RIGHT", scopeGap, 0)
       spBtn:ClearAllPoints()
       spBtn:SetPoint("LEFT", keepBox, "RIGHT", spGap, 0)
 
@@ -2040,6 +2110,7 @@ function LI.Trade.BuildTab(depositPanel)
       else
         keepBox:SetText("")
       end
+      RefreshKeepScopeBtn(id)
       UpdateKeepPlaceholder()
       RefreshSPBtn()
     end
@@ -2380,6 +2451,9 @@ function LI.Trade.BuildTab(depositPanel)
           if cfg and type(cfg.keepByItem) == "table" then
             cfg.keepByItem[id] = nil
           end
+          if cfg and type(cfg.keepScopeByItem) == "table" then
+            cfg.keepScopeByItem[id] = nil
+          end
         end
       end
 
@@ -2513,7 +2587,8 @@ function LI.Trade.BuildTab(depositPanel)
             k = k and math.floor(k) or 0
             if k < 1 then k = 0 end
             if k > 9999 then k = 9999 end
-            keepTxt = "  K:" .. tostring(k)
+            local s = (cfg and type(cfg.keepScopeByItem) == "table" and cfg.keepScopeByItem[id] == "S") and "S" or "K"
+            keepTxt = "  " .. s .. ":" .. tostring(k)
           end
           row.txt:SetText(name .. " (" .. tostring(id) .. ")  [" .. scopeTxt .. "]" .. keepTxt)
 

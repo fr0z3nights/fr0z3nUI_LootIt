@@ -349,18 +349,18 @@ do
     SizeTabToText(tabMail, 18, 70)
     frame.tab4 = tabMail
 
-    local tabTabard = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
-    tabTabard:SetID(5)
-    tabTabard:SetText("Tabard")
-    tabTabard:SetPoint("LEFT", tabMail, "RIGHT", TAB_OVERLAP_X, 0)
-    tabTabard:SetHeight(22)
-    SizeTabToText(tabTabard, 18, 70)
-    frame.tab5 = tabTabard
+    local tabTax = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
+    tabTax:SetID(5)
+    tabTax:SetText("Tax")
+    tabTax:SetPoint("LEFT", tabMail, "RIGHT", TAB_OVERLAP_X, 0)
+    tabTax:SetHeight(22)
+    SizeTabToText(tabTax, 18, 70)
+    frame.tab5 = tabTax
 
     local tabDeposit = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
     tabDeposit:SetID(6)
     tabDeposit:SetText("Trade")
-    tabDeposit:SetPoint("LEFT", tabTabard, "RIGHT", TAB_OVERLAP_X, 0)
+    tabDeposit:SetPoint("LEFT", tabTax, "RIGHT", TAB_OVERLAP_X, 0)
     tabDeposit:SetHeight(22)
     SizeTabToText(tabDeposit, 18, 70)
     frame.tab6 = tabDeposit
@@ -385,8 +385,8 @@ do
     local otherPanel = CreateFrame("Frame", nil, frame)
     otherPanel:SetAllPoints(content)
 
-    local tabardPanel = CreateFrame("Frame", nil, frame)
-    tabardPanel:SetAllPoints(content)
+    local taxPanel = CreateFrame("Frame", nil, frame)
+    taxPanel:SetAllPoints(content)
 
     local depositPanel = CreateFrame("Frame", nil, frame)
     depositPanel:SetAllPoints(content)
@@ -397,14 +397,14 @@ do
       local isAlias = (which == "alias")
       local isOther = (which == "other")
       local isMail = (which == "mail")
-      local isTabard = (which == "tabard")
+      local isTax = (which == "tax")
       local isDeposit = (which == "deposit")
 
       lootPanel:SetShown(isLoot)
       aliasPanel:SetShown(isAlias)
       otherPanel:SetShown(isOther)
       mailPanel:SetShown(isMail)
-      tabardPanel:SetShown(isTabard)
+      taxPanel:SetShown(isTax)
       depositPanel:SetShown(isDeposit)
 
       if enableModeBtn and enableModeBtn.SetShown then
@@ -415,12 +415,12 @@ do
       StyleTab(tabAlias, isAlias)
       StyleTab(tabOther, isOther)
       StyleTab(tabMail, isMail)
-      StyleTab(tabTabard, isTabard)
+      StyleTab(tabTax, isTax)
       StyleTab(tabDeposit, isDeposit)
 
-      UpdateTabZOrder(isLoot and 1 or (isAlias and 2 or (isOther and 3 or (isMail and 4 or (isTabard and 5 or 6)))) )
+      UpdateTabZOrder(isLoot and 1 or (isAlias and 2 or (isOther and 3 or (isMail and 4 or (isTax and 5 or 6)))) )
 
-      frame._activeTab = isLoot and "loot" or (isAlias and "alias" or (isOther and "other" or (isMail and "mail" or (isTabard and "tabard" or "deposit"))))
+      frame._activeTab = isLoot and "loot" or (isAlias and "alias" or (isOther and "other" or (isMail and "mail" or (isTax and "tax" or "deposit"))))
 
       ApplyMailNotifierInteractivity()
     end
@@ -431,7 +431,7 @@ do
     tabAlias:SetScript("OnClick", function() SelectTab("alias") end)
     tabOther:SetScript("OnClick", function() SelectTab("other") end)
     tabMail:SetScript("OnClick", function() SelectTab("mail") end)
-    tabTabard:SetScript("OnClick", function() SelectTab("tabard") end)
+    tabTax:SetScript("OnClick", function() SelectTab("tax") end)
     tabDeposit:SetScript("OnClick", function() SelectTab("deposit") end)
 
     -- Initialize first tab styling + z-order.
@@ -439,7 +439,7 @@ do
     StyleTab(tabAlias, false)
     StyleTab(tabOther, false)
     StyleTab(tabMail, false)
-    StyleTab(tabTabard, false)
+    StyleTab(tabTax, false)
     StyleTab(tabDeposit, false)
     UpdateTabZOrder(1)
 
@@ -452,18 +452,8 @@ do
 
     do
       local mod = fr0z3nUI_LootIt
-      local tabMod = _G and rawget(_G, "fr0z3nUI_LootItTabard")
-      if tabMod and type(tabMod.BuildTab) == "function" then
-        tabMod.BuildTab(tabardPanel, {
-          EnsureDB = EnsureDB,
-          GetDB = function() return DB end,
-          GetCharDB = function() return CHARDB end,
-          Clamp = Clamp,
-          SetCheckBoxText = SetCheckBoxText,
-        })
-      elseif mod and mod.TabardUI and type(mod.TabardUI.BuildTab) == "function" then
-        -- Backward-compat: older split UI module.
-        mod.TabardUI.BuildTab(tabardPanel, {
+      if mod and mod.Tax and type(mod.Tax.BuildTab) == "function" then
+        mod.Tax.BuildTab(taxPanel, {
           EnsureDB = EnsureDB,
           GetDB = function() return DB end,
           GetCharDB = function() return CHARDB end,
