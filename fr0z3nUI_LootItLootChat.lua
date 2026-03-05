@@ -1385,6 +1385,10 @@ IsLikelyMoneyMessage = function(msg)
   return false
 end
 
+-- Public: shared money parsing for other LootIt modules (e.g., Tax).
+LootChat.IsLikelyMoneyMessage = IsLikelyMoneyMessage
+LootChat.ParseCoinsFromMoneyMessage = ParseCoinsFromMoneyMessage
+
 local function OnMoneyChat(_, _, msg, ...)
   EnsureRefs()
   if not IsEnabled() then return false end

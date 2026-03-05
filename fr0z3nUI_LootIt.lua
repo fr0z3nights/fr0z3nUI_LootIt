@@ -2,7 +2,7 @@ local ADDON = ...
 
 local PREFIX = "|cff00ccff[LI]|r "
 
-local SANITY_VERSION = "260301-002"
+local SANITY_VERSION = "260305-018"
 
 local LI = fr0z3nUI_LootIt or {}
 fr0z3nUI_LootIt = LI
