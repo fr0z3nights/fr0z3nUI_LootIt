@@ -2,6 +2,10 @@
 
 Format: `YYMMDD-###` (sanity stamp) — short summary.
 
+## 260309-001
+- Tax UI: removed Pay Now/Auto Pay controls (auto-pay only); moved owed-scope text into the owed tooltip.
+- Tax: added optional WarBank tracking + auto-pay on account bank open; WarBank uses character-only owed with its own Clear Due.
+
 ## 260305-001
 - Tax tab UI revamp: borderless Tax% input, centered due/total, text-toggle sources, unified buttons, added Reload UI.
 - Added per-character Min Gold (default 2000g): keeps a minimum in bags; deposits only above Min Gold; can auto-borrow from guild bank to reach Min Gold and adds that amount to Due.

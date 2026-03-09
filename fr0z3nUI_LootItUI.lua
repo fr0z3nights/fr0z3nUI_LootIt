@@ -243,11 +243,35 @@ do
       if fs and fs.SetText then
         fs:SetText("Combat")
         if IsMailCombatOn() then
-          fs:SetTextColor(1.0, 0.82, 0.0, 1)
+          local c = rawget(_G, "GREEN_FONT_COLOR")
+          if c and type(c.GetRGB) == "function" then
+            local r, g, b = c:GetRGB()
+            fs:SetTextColor(r or 0.20, g or 1.00, b or 0.20, 1)
+          elseif type(c) == "table" and c.r and c.g and c.b then
+            fs:SetTextColor(c.r, c.g, c.b, c.a or 1)
+          else
+            fs:SetTextColor(0.20, 1.00, 0.20, 1)
+          end
         else
           fs:SetTextColor(0.55, 0.55, 0.55, 1)
         end
       end
+    end
+
+    local function GetMailNotifyScope()
+      RefreshRefs()
+      return (CHARDB and CHARDB.mailNotifyScope == "char") and "char" or "acc"
+    end
+
+    local function SetMailNotifyScope(scope)
+      RefreshRefs()
+      scope = tostring(scope or ""):lower()
+      if scope == "char" or scope == "character" then
+        CHARDB.mailNotifyScope = "char"
+      else
+        CHARDB.mailNotifyScope = nil
+      end
+      UpdateMailNotifier()
     end
 
     local enableModeBtn = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
@@ -509,6 +533,8 @@ do
         mod.Mail.BuildTab(mailPanel, mailUI, {
           EnsureDB = EnsureDB,
           MailNotifyCfg = MailNotifyCfg,
+          GetMailNotifyScope = GetMailNotifyScope,
+          SetMailNotifyScope = SetMailNotifyScope,
           GetMailNotifyMode = GetMailNotifyMode,
           SetMailNotifyMode = SetMailNotifyMode,
           RefreshMailNotifyModeButton = RefreshMailNotifyModeButton,

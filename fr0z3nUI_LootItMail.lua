@@ -7,6 +7,21 @@ do
   local Mail = LI.Mail
   Mail._notifierEnv = Mail._notifierEnv or {}
 
+  -- While the mailbox UI is open, hide the notifier so it doesn't overlap the mailbox.
+  -- Core toggles this via interaction events; UpdateMailNotifier enforces it.
+  Mail._mailboxOpen = (Mail._mailboxOpen == true)
+
+  function Mail.SetMailboxOpen(isOpen)
+    Mail._mailboxOpen = (isOpen == true)
+    if Mail._mailboxOpen and MailNotifier and MailNotifier.Hide then
+      MailNotifier:Hide()
+    end
+  end
+
+  function Mail.IsMailboxOpen()
+    return (Mail._mailboxOpen == true)
+  end
+
   function Mail.SetNotifierEnv(env)
     Mail._notifierEnv = (type(env) == "table") and env or {}
   end
@@ -273,6 +288,11 @@ do
       mnc2.ui.point = point or "TOPRIGHT"
       mnc2.ui.x = x or 0
       mnc2.ui.y = y or 0
+
+      local mail = LI and LI.Mail
+      if mail and type(mail._refreshEditorViewControls) == "function" then
+        mail._refreshEditorViewControls()
+      end
     end)
 
     local model = CreateFrame("DressUpModel", nil, frame)
@@ -369,6 +389,12 @@ do
     local IsMailNotifierEnabled = env.IsMailNotifierEnabled or function(...) return false end
 
     EnsureDB()
+
+    -- If the mailbox UI is open, keep the notifier hidden.
+    if Mail.IsMailboxOpen() then
+      if MailNotifier then MailNotifier:Hide() end
+      return
+    end
     if not IsMailNotifierEnabled() then
       if MailNotifier then MailNotifier:Hide() end
       return
@@ -431,6 +457,8 @@ function LI.Mail.BuildTab(mailPanel, mailUI, env)
 
   local EnsureDB = env.EnsureDB or function(...) end
   local MailNotifyCfg = env.MailNotifyCfg or function(...) return nil end
+  local GetMailNotifyScope = env.GetMailNotifyScope or function(...) return "acc" end
+  local SetMailNotifyScope = env.SetMailNotifyScope or function(...) end
   local GetMailNotifyMode = env.GetMailNotifyMode or function(...) return "off" end
   local SetMailNotifyMode = env.SetMailNotifyMode or function(...) end
   local RefreshMailNotifyModeButton = env.RefreshMailNotifyModeButton or function(...) end
@@ -484,30 +512,75 @@ function LI.Mail.BuildTab(mailPanel, mailUI, env)
   end)
   RefreshMailNotifyModeButton()
 
-  mailUI.combatBtn = CreateFrame("Button", nil, mailPanel, "UIPanelButtonTemplate")
-  mailUI.combatBtn:SetSize(90, 20)
-  mailUI.combatBtn:SetPoint("LEFT", mailUI.notifyModeBtn, "RIGHT", 10, 0)
-  mailUI.combatBtn:SetScript("OnClick", function()
-    EnsureDB()
-    local mn = MailNotifyCfg()
-    if not mn then return end
-    local on = (mn.showInCombat ~= false)
-    mn.showInCombat = on and false or true
-    UpdateMailNotifier()
+  local function RefreshMailScopeButton()
+    local btn = mailUI and mailUI.mailScopeBtn
+    if not (btn and btn.SetText) then return end
+    local s = tostring(GetMailNotifyScope() or "acc"):lower()
+    btn:SetText((s == "char") and "Character" or "Account")
+  end
+
+  mailUI.mailScopeBtn = CreateFrame("Button", nil, mailPanel, "UIPanelButtonTemplate")
+  mailUI.mailScopeBtn:SetSize(100, 20)
+  mailUI.mailScopeBtn:SetPoint("LEFT", mailUI.notifyModeBtn, "RIGHT", 10, 0)
+  mailUI.mailScopeBtn:SetScript("OnClick", function()
+    local cur = tostring(GetMailNotifyScope() or "acc"):lower()
+    local nextScope = (cur == "char") and "acc" or "char"
+    SetMailNotifyScope(nextScope)
+    RefreshMailScopeButton()
     RefreshMailCombatButton()
+    if mailPanel and mailPanel.modelUI and mailPanel.modelUI.Refresh then
+      mailPanel.modelUI:Refresh()
+    end
   end)
-  RefreshMailCombatButton()
+  RefreshMailScopeButton()
 
   -- Embedded mail model editor (replaces the old pop-out window).
   local modelUI = CreateFrame("Frame", nil, mailPanel)
   modelUI:SetPoint("TOPLEFT", mailUI.notifyModeBtn, "BOTTOMLEFT", -2, -2)
-  modelUI:SetPoint("BOTTOMRIGHT", mailPanel, "BOTTOMRIGHT", -12, 46)
+  modelUI:SetPoint("BOTTOMRIGHT", mailPanel, "BOTTOMRIGHT", -12, 34)
   mailPanel.modelUI = modelUI
 
   local preview = CreateFrame("DressUpModel", nil, modelUI)
   preview:SetPoint("TOPLEFT", modelUI, "TOPLEFT", 2, 0)
-  preview:SetSize(210, 285)
+  preview:SetSize(189, 231)
   modelUI.preview = preview
+
+  local rightCol = CreateFrame("Frame", nil, modelUI)
+  rightCol:SetPoint("TOPLEFT", preview, "TOPRIGHT", 18, 24)
+  rightCol:SetPoint("BOTTOMRIGHT", modelUI, "BOTTOMRIGHT", -12, 6)
+
+  local rightBottomRow = CreateFrame("Frame", nil, modelUI)
+  rightBottomRow:SetPoint("BOTTOMLEFT", rightCol, "BOTTOMLEFT", 0, 0)
+  rightBottomRow:SetPoint("BOTTOMRIGHT", rightCol, "BOTTOMRIGHT", 0, 0)
+  rightBottomRow:SetHeight(24)
+
+  local zoomLabel = modelUI:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+  zoomLabel:SetPoint("TOPLEFT", preview, "BOTTOMLEFT", 0, -10)
+  zoomLabel:SetText("Zoom")
+
+  local zoomSlider = CreateFrame("Slider", "fr0z3nUI_LootIt_MailModelPickerZoom", modelUI, "OptionsSliderTemplate")
+  zoomSlider:SetPoint("LEFT", zoomLabel, "RIGHT", 18, 0)
+  zoomSlider:SetWidth(150)
+  zoomSlider:SetMinMaxValues(0.20, 3.00)
+  zoomSlider:SetValueStep(0.05)
+  if zoomSlider.SetObeyStepOnDrag then zoomSlider:SetObeyStepOnDrag(true) end
+  _G[zoomSlider:GetName() .. "Low"]:SetText("0.2")
+  _G[zoomSlider:GetName() .. "High"]:SetText("3.0")
+  _G[zoomSlider:GetName() .. "Text"]:SetText(" ")
+
+  local alphaLabel = modelUI:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+  alphaLabel:SetPoint("TOPLEFT", zoomLabel, "BOTTOMLEFT", 0, -14)
+  alphaLabel:SetText("Alpha")
+
+  local alphaSlider = CreateFrame("Slider", "fr0z3nUI_LootIt_MailModelPickerAlpha", modelUI, "OptionsSliderTemplate")
+  alphaSlider:SetPoint("LEFT", alphaLabel, "RIGHT", 18, 0)
+  alphaSlider:SetWidth(150)
+  alphaSlider:SetMinMaxValues(0.10, 1.00)
+  alphaSlider:SetValueStep(0.05)
+  if alphaSlider.SetObeyStepOnDrag then alphaSlider:SetObeyStepOnDrag(true) end
+  _G[alphaSlider:GetName() .. "Low"]:SetText("0.1")
+  _G[alphaSlider:GetName() .. "High"]:SetText("1.0")
+  _G[alphaSlider:GetName() .. "Text"]:SetText(" ")
 
   local RefreshViewControls
 
@@ -582,7 +655,9 @@ function LI.Mail.BuildTab(mailPanel, mailUI, env)
   end
 
   local kindLabel = modelUI:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-  kindLabel:SetPoint("TOPLEFT", preview, "TOPRIGHT", 18, 2)
+  kindLabel:SetPoint("TOPLEFT", rightCol, "TOPLEFT", 0, 0)
+  kindLabel:SetWidth(70)
+  kindLabel:SetJustifyH("LEFT")
   kindLabel:SetText("Type")
 
   local function NewRadio(text)
@@ -592,17 +667,19 @@ function LI.Mail.BuildTab(mailPanel, mailUI, env)
   end
 
   local rPlayer = NewRadio("Player")
-  rPlayer:SetPoint("TOPLEFT", kindLabel, "BOTTOMLEFT", -2, -6)
+  rPlayer:SetPoint("TOPLEFT", kindLabel, "BOTTOMLEFT", -2, -8)
   local rNPC = NewRadio("NPCID")
-  rNPC:SetPoint("TOPLEFT", rPlayer, "BOTTOMLEFT", 0, -6)
+  rNPC:SetPoint("TOPLEFT", rPlayer, "BOTTOMLEFT", 0, -8)
   local rDisplay = NewRadio("DisplayID")
-  rDisplay:SetPoint("TOPLEFT", rNPC, "BOTTOMLEFT", 0, -6)
+  rDisplay:SetPoint("TOPLEFT", rNPC, "BOTTOMLEFT", 0, -8)
   local rFile = NewRadio("FileID")
-  rFile:SetPoint("TOPLEFT", rDisplay, "BOTTOMLEFT", 0, -6)
+  rFile:SetPoint("TOPLEFT", rDisplay, "BOTTOMLEFT", 0, -8)
   modelUI.rPlayer, modelUI.rNPC, modelUI.rDisplay, modelUI.rFile = rPlayer, rNPC, rDisplay, rFile
 
   local idLabel = modelUI:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-  idLabel:SetPoint("LEFT", kindLabel, "RIGHT", 64, 0)
+  idLabel:SetPoint("LEFT", kindLabel, "RIGHT", 14, 0)
+  idLabel:SetWidth(28)
+  idLabel:SetJustifyH("LEFT")
   idLabel:SetText("ID")
 
   local idBox = CreateFrame("EditBox", nil, modelUI, "InputBoxTemplate")
@@ -613,11 +690,11 @@ function LI.Mail.BuildTab(mailPanel, mailUI, env)
   modelUI.idBox = idBox
 
   local presetKaty = NewPresetButton("Katy", 132969)
-  presetKaty:SetPoint("TOPLEFT", idBox, "BOTTOMLEFT", 0, -6)
+  presetKaty:SetPoint("TOPLEFT", idBox, "BOTTOMLEFT", 0, -8)
   local presetDalaran = NewPresetButton("Dalaran", 104230)
-  presetDalaran:SetPoint("TOPLEFT", presetKaty, "BOTTOMLEFT", 0, -4)
+  presetDalaran:SetPoint("TOPLEFT", presetKaty, "BOTTOMLEFT", 0, -6)
   local presetPlagued = NewPresetButton("Plagued", 155971)
-  presetPlagued:SetPoint("TOPLEFT", presetDalaran, "BOTTOMLEFT", 0, -4)
+  presetPlagued:SetPoint("TOPLEFT", presetDalaran, "BOTTOMLEFT", 0, -6)
 
   local function GetKind()
     if rNPC:GetChecked() then return "npc" end
@@ -694,7 +771,7 @@ function LI.Mail.BuildTab(mailPanel, mailUI, env)
 
   local apply = CreateFrame("Button", nil, modelUI, "UIPanelButtonTemplate")
   apply:SetSize(90, 22)
-  apply:SetPoint("TOPLEFT", preview, "BOTTOMLEFT", 0, -8)
+  apply:SetPoint("TOPLEFT", zoomLabel, "BOTTOMLEFT", 0, -10)
   apply:SetText("Apply")
   apply:SetScript("OnClick", function()
     PreviewSpec()
@@ -702,7 +779,7 @@ function LI.Mail.BuildTab(mailPanel, mailUI, env)
   end)
 
   local reset = CreateFrame("Button", nil, modelUI, "UIPanelButtonTemplate")
-  reset:SetSize(90, 22)
+  reset:SetSize(60, 22)
   reset:SetPoint("LEFT", apply, "RIGHT", 10, 0)
   reset:SetText("Reset")
   reset:SetScript("OnClick", function()
@@ -737,19 +814,52 @@ function LI.Mail.BuildTab(mailPanel, mailUI, env)
     if RefreshViewControls then RefreshViewControls() end
   end)
 
+  mailUI.combatBtn = CreateFrame("Button", nil, modelUI, "UIPanelButtonTemplate")
+  mailUI.combatBtn:SetSize(90, 22)
+  mailUI.combatBtn:SetPoint("LEFT", reset, "RIGHT", 10, 0)
+  mailUI.combatBtn:SetScript("OnClick", function()
+    EnsureDB()
+    local mn = MailNotifyCfg()
+    if not mn then return end
+    local on = (mn.showInCombat ~= false)
+    mn.showInCombat = on and false or true
+    UpdateMailNotifier()
+    RefreshMailCombatButton()
+  end)
+  RefreshMailCombatButton()
+
   -- Mail notifier mode + combat buttons are anchored at the top of the tab.
 
-  local function BuildMailNotifierViewControls()
-    local viewContent = CreateFrame("Frame", nil, modelUI)
-    viewContent:SetPoint("TOPLEFT", rFile, "BOTTOMLEFT", -2, -10)
-    viewContent:SetPoint("BOTTOMRIGHT", modelUI, "BOTTOMRIGHT", -12, 64)
+  local viewContent
 
-    local viewLabel = viewContent:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-    viewLabel:SetPoint("TOPLEFT", viewContent, "TOPLEFT", 6, -4)
-    viewLabel:SetText("View")
+  local function BuildMailNotifierViewControls()
+    viewContent = CreateFrame("Frame", nil, modelUI)
+    viewContent:SetPoint("TOPLEFT", rFile, "BOTTOMLEFT", -2, -6)
+    -- Leave a dedicated bottom row on the right for Combat+Apply.
+    viewContent:SetPoint("BOTTOMRIGHT", rightBottomRow, "TOPRIGHT", 0, 0)
+
+    local xyLabel = viewContent:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    xyLabel:SetPoint("TOPLEFT", viewContent, "TOPLEFT", 6, -6)
+    xyLabel:SetWidth(90)
+    xyLabel:SetJustifyH("LEFT")
+    xyLabel:SetText("Notifier X/Y")
+
+    local xBox = CreateFrame("EditBox", nil, viewContent, "InputBoxTemplate")
+    xBox:SetSize(46, 20)
+    xBox:SetPoint("LEFT", xyLabel, "RIGHT", 10, 0)
+    xBox:SetAutoFocus(false)
+    xBox:SetJustifyH("CENTER")
+
+    local yBox = CreateFrame("EditBox", nil, viewContent, "InputBoxTemplate")
+    yBox:SetSize(46, 20)
+    yBox:SetPoint("LEFT", xBox, "RIGHT", 10, 0)
+    yBox:SetAutoFocus(false)
+    yBox:SetJustifyH("CENTER")
 
     local wLabel = viewContent:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    wLabel:SetPoint("TOPLEFT", viewLabel, "BOTTOMLEFT", 0, -10)
+    wLabel:SetPoint("TOPLEFT", xyLabel, "BOTTOMLEFT", 0, -16)
+    wLabel:SetWidth(90)
+    wLabel:SetJustifyH("LEFT")
     wLabel:SetText("Notifier W/H")
 
     local wBox = CreateFrame("EditBox", nil, viewContent, "InputBoxTemplate")
@@ -764,32 +874,73 @@ function LI.Mail.BuildTab(mailPanel, mailUI, env)
     hBox:SetAutoFocus(false)
     hBox:SetJustifyH("CENTER")
 
-    local applyWH = CreateFrame("Button", nil, viewContent, "UIPanelButtonTemplate")
-    applyWH:SetSize(54, 20)
-    applyWH:SetPoint("LEFT", hBox, "RIGHT", 10, 0)
-    applyWH:SetText("Set")
+    local _inRefresh = false
+    local function RefreshXYWHBoxesFromConfig()
+      EnsureDB()
+      local mnc = MailNotifyCfg()
+      if not mnc then return end
+      mnc.ui = mnc.ui or {}
 
-    local alphaLabel = viewContent:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    alphaLabel:SetPoint("TOPLEFT", wLabel, "BOTTOMLEFT", 0, -12)
-    alphaLabel:SetText("Alpha")
+      _inRefresh = true
+      do
+        local x = tonumber(mnc.ui.x) or 0
+        local y = tonumber(mnc.ui.y) or 0
+        xBox:SetText(tostring(math.floor(x + 0.5)))
+        yBox:SetText(tostring(math.floor(y + 0.5)))
+      end
+      do
+        local w = ClampValue(mnc.ui.w or 200, 40, 600)
+        local h = ClampValue(mnc.ui.h or 220, 40, 600)
+        wBox:SetText(tostring(math.floor(w + 0.5)))
+        hBox:SetText(tostring(math.floor(h + 0.5)))
+      end
+      _inRefresh = false
+    end
 
-    local alphaSlider = CreateFrame("Slider", "fr0z3nUI_LootIt_MailModelPickerAlpha", viewContent, "OptionsSliderTemplate")
-    alphaSlider:SetPoint("LEFT", alphaLabel, "RIGHT", 16, 0)
-    alphaSlider:SetWidth(170)
-    alphaSlider:SetMinMaxValues(0.10, 1.00)
-    alphaSlider:SetValueStep(0.05)
-    if alphaSlider.SetObeyStepOnDrag then alphaSlider:SetObeyStepOnDrag(true) end
-    _G[alphaSlider:GetName() .. "Low"]:SetText("0.1")
-    _G[alphaSlider:GetName() .. "High"]:SetText("1.0")
-    _G[alphaSlider:GetName() .. "Text"]:SetText(" ")
+    local function ApplyXYWHFromBoxes()
+      if _inRefresh then return end
+      EnsureDB()
+      local mnc = MailNotifyCfg()
+      if not mnc then return end
+      mnc.ui = mnc.ui or {}
+
+      local x = tonumber(xBox:GetText() or "")
+      local y = tonumber(yBox:GetText() or "")
+      if x ~= nil then mnc.ui.x = x end
+      if y ~= nil then mnc.ui.y = y end
+
+      local w = tonumber(wBox:GetText() or "")
+      local h = tonumber(hBox:GetText() or "")
+      if w ~= nil then mnc.ui.w = w end
+      if h ~= nil then mnc.ui.h = h end
+
+      ApplyNotifierSizingAndAlpha()
+      UpdateMailNotifier()
+      if RefreshViewControls then RefreshViewControls() end
+    end
+
+    local function DebounceApply(editBox)
+      if not editBox then return end
+      if editBox._fliDebounce and editBox._fliDebounce.Cancel then
+        editBox._fliDebounce:Cancel()
+      end
+      local ct = rawget(_G, "C_Timer")
+      if ct and type(ct.NewTimer) == "function" then
+        editBox._fliDebounce = ct.NewTimer(0.60, function()
+          ApplyXYWHFromBoxes()
+        end)
+      end
+    end
 
     local strataLabel = viewContent:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    strataLabel:SetPoint("TOPLEFT", alphaLabel, "BOTTOMLEFT", 0, -18)
+    strataLabel:SetPoint("TOPLEFT", wLabel, "BOTTOMLEFT", 0, -18)
+    strataLabel:SetWidth(90)
+    strataLabel:SetJustifyH("LEFT")
     strataLabel:SetText("Layer")
 
     local strataDD = CreateFrame("Frame", "fr0z3nUI_LootIt_MailModelPickerStrata", viewContent, "UIDropDownMenuTemplate")
-    strataDD:SetPoint("LEFT", strataLabel, "RIGHT", -10, -2)
-    UIDropDownMenu_SetWidth(strataDD, 145)
+    strataDD:SetPoint("LEFT", strataLabel, "RIGHT", -28, -2)
+    UIDropDownMenu_SetWidth(strataDD, 130)
 
     local STRATA = {
       { key = "BACKGROUND", text = "Background" },
@@ -801,6 +952,26 @@ function LI.Mail.BuildTab(mailPanel, mailUI, env)
       { key = "FULLSCREEN_DIALOG", text = "Fullscreen Dialog" },
       { key = "TOOLTIP", text = "Tooltip" },
     }
+
+    local function SetStrataDropdownText(strataKey)
+      local want = tostring(strataKey or "BACKGROUND")
+      local text = want
+      for _, s in ipairs(STRATA) do
+        if s.key == want then
+          text = s.text
+          break
+        end
+      end
+
+      if UIDropDownMenu_SetText then
+        UIDropDownMenu_SetText(strataDD, text)
+      else
+        local fs = _G and strataDD and strataDD.GetName and _G[strataDD:GetName() .. "Text"]
+        if fs and fs.SetText then
+          fs:SetText(text)
+        end
+      end
+    end
 
     do
       local mu = _G and rawget(_G, "MenuUtil")
@@ -823,7 +994,7 @@ function LI.Mail.BuildTab(mailPanel, mailUI, env)
                     if not mnc2 then return end
                     mnc2.ui = mnc2.ui or {}
                     mnc2.ui.strata = s.key
-                    if UIDropDownMenu_SetSelectedID then UIDropDownMenu_SetSelectedID(strataDD, i) end
+                    SetStrataDropdownText(s.key)
                     ApplyNotifierSizingAndAlpha()
                     UpdateMailNotifier()
                   end)
@@ -834,7 +1005,7 @@ function LI.Mail.BuildTab(mailPanel, mailUI, env)
                     if not mnc2 then return end
                     mnc2.ui = mnc2.ui or {}
                     mnc2.ui.strata = s.key
-                    if UIDropDownMenu_SetSelectedID then UIDropDownMenu_SetSelectedID(strataDD, i) end
+                    SetStrataDropdownText(s.key)
                     ApplyNotifierSizingAndAlpha()
                     UpdateMailNotifier()
                   end)
@@ -865,27 +1036,15 @@ function LI.Mail.BuildTab(mailPanel, mailUI, env)
       end
     end
 
-    local zoomLabel = viewContent:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    zoomLabel:SetPoint("TOPLEFT", strataLabel, "BOTTOMLEFT", 0, -18)
-    zoomLabel:SetText("Zoom")
-
-    local zoomSlider = CreateFrame("Slider", "fr0z3nUI_LootIt_MailModelPickerZoom", viewContent, "OptionsSliderTemplate")
-    zoomSlider:SetPoint("LEFT", zoomLabel, "RIGHT", 18, 0)
-    zoomSlider:SetWidth(170)
-    zoomSlider:SetMinMaxValues(0.20, 3.00)
-    zoomSlider:SetValueStep(0.05)
-    if zoomSlider.SetObeyStepOnDrag then zoomSlider:SetObeyStepOnDrag(true) end
-    _G[zoomSlider:GetName() .. "Low"]:SetText("0.2")
-    _G[zoomSlider:GetName() .. "High"]:SetText("3.0")
-    _G[zoomSlider:GetName() .. "Text"]:SetText(" ")
-
     local rotLabel = viewContent:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    rotLabel:SetPoint("TOPLEFT", zoomLabel, "BOTTOMLEFT", 0, -18)
+    rotLabel:SetPoint("TOPLEFT", strataLabel, "BOTTOMLEFT", 0, -20)
+    rotLabel:SetWidth(90)
+    rotLabel:SetJustifyH("LEFT")
     rotLabel:SetText("Rotate")
 
     local rotLeft = CreateFrame("Button", nil, viewContent, "UIPanelButtonTemplate")
     rotLeft:SetSize(30, 20)
-    rotLeft:SetPoint("LEFT", rotLabel, "RIGHT", 16, 0)
+    rotLeft:SetPoint("LEFT", rotLabel, "RIGHT", -28, 0)
     rotLeft:SetText("<")
 
     local rotReset = CreateFrame("Button", nil, viewContent, "UIPanelButtonTemplate")
@@ -899,12 +1058,14 @@ function LI.Mail.BuildTab(mailPanel, mailUI, env)
     rotRight:SetText(">")
 
     local actionLabel = viewContent:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    actionLabel:SetPoint("TOPLEFT", rotLabel, "BOTTOMLEFT", 0, -12)
+    actionLabel:SetPoint("TOPLEFT", rotLabel, "BOTTOMLEFT", 0, -16)
+    actionLabel:SetWidth(90)
+    actionLabel:SetJustifyH("LEFT")
     actionLabel:SetText("Action")
 
     local actionPrev = CreateFrame("Button", nil, viewContent, "UIPanelButtonTemplate")
     actionPrev:SetSize(30, 20)
-    actionPrev:SetPoint("LEFT", actionLabel, "RIGHT", 16, 0)
+    actionPrev:SetPoint("LEFT", actionLabel, "RIGHT", -28, 0)
     actionPrev:SetText("<")
 
     local actionBox = CreateFrame("EditBox", nil, viewContent, "InputBoxTemplate")
@@ -921,8 +1082,8 @@ function LI.Mail.BuildTab(mailPanel, mailUI, env)
     actionNext:SetText(">")
 
     local actionRandomBtn = CreateFrame("Button", nil, viewContent, "UIPanelButtonTemplate")
-    actionRandomBtn:SetSize(70, 20)
-    actionRandomBtn:SetPoint("LEFT", actionNext, "RIGHT", 10, 0)
+    actionRandomBtn:SetSize(60, 20)
+    actionRandomBtn:SetPoint("LEFT", actionNext, "RIGHT", 0, 0)
     actionRandomBtn:SetText("Random")
 
     local repeatCB = CreateFrame("CheckButton", nil, viewContent, "UICheckButtonTemplate")
@@ -933,7 +1094,7 @@ function LI.Mail.BuildTab(mailPanel, mailUI, env)
 
     local repeatSecBox = CreateFrame("EditBox", nil, viewContent, "InputBoxTemplate")
     repeatSecBox:SetSize(50, 20)
-    repeatSecBox:SetPoint("TOPLEFT", actionBox, "BOTTOMLEFT", 0, -10)
+    repeatSecBox:SetPoint("TOPLEFT", actionBox, "BOTTOMLEFT", 0, -8)
     repeatSecBox:SetAutoFocus(false)
     repeatSecBox:SetJustifyH("CENTER")
     repeatSecBox:SetNumeric(true)
@@ -942,12 +1103,18 @@ function LI.Mail.BuildTab(mailPanel, mailUI, env)
     repeatCB:SetPoint("RIGHT", repeatSecBox, "LEFT", -6, 0)
 
     local repeatLabel = viewContent:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-    repeatLabel:SetPoint("LEFT", repeatSecBox, "RIGHT", 6, 0)
-    repeatLabel:SetText("sec. Repeat")
+    repeatLabel:SetPoint("TOPLEFT", actionLabel, "BOTTOMLEFT", 0, -16)
+    repeatLabel:SetWidth(90)
+    repeatLabel:SetJustifyH("LEFT")
+    repeatLabel:SetText("Repeat")
+
+    local repeatSecLabel = viewContent:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    repeatSecLabel:SetPoint("LEFT", repeatSecBox, "RIGHT", 6, 0)
+    repeatSecLabel:SetText("sec.")
 
     local mailTest = CreateFrame("Button", nil, modelUI, "UIPanelButtonTemplate")
-    mailTest:SetSize(110, 18)
-    mailTest:SetPoint("TOPLEFT", presetPlagued, "BOTTOMLEFT", 0, -6)
+    mailTest:SetSize(60, 22)
+    mailTest:SetPoint("TOPLEFT", presetPlagued, "BOTTOMLEFT", 0, -8)
     mailTest:SetText("Test")
     mailTest:SetScript("OnClick", function()
       EnsureDB()
@@ -967,6 +1134,7 @@ function LI.Mail.BuildTab(mailPanel, mailUI, env)
       mf:Show()
       Print("Mail notifier: shown (test).")
     end)
+    modelUI.mailTestBtn = mailTest
 
     RefreshViewControls = function()
       EnsureDB()
@@ -974,6 +1142,8 @@ function LI.Mail.BuildTab(mailPanel, mailUI, env)
       if not mnc then return end
       mnc.ui = mnc.ui or {}
       mnc.model = mnc.model or {}
+
+      RefreshXYWHBoxesFromConfig()
 
       local w = ClampValue(mnc.ui.w or 200, 40, 600)
       local h = ClampValue(mnc.ui.h or 220, 40, 600)
@@ -990,7 +1160,7 @@ function LI.Mail.BuildTab(mailPanel, mailUI, env)
           break
         end
       end
-      UIDropDownMenu_SetSelectedID(strataDD, selected)
+      SetStrataDropdownText(want)
 
       local z = ClampValue(mnc.model.zoom or 0.9, 0.20, 3.00)
       zoomSlider:SetValue(z)
@@ -1002,7 +1172,15 @@ function LI.Mail.BuildTab(mailPanel, mailUI, env)
         local fs = actionRandomBtn and actionRandomBtn.GetFontString and actionRandomBtn:GetFontString() or nil
         if fs and fs.SetTextColor then
           if randomOn then
-            fs:SetTextColor(1.0, 0.82, 0.0, 1)
+            local c = rawget(_G, "GREEN_FONT_COLOR")
+            if c and type(c.GetRGB) == "function" then
+              local r, g, b = c:GetRGB()
+              fs:SetTextColor(r or 0.20, g or 1.00, b or 0.20, 1)
+            elseif type(c) == "table" and c.r and c.g and c.b then
+              fs:SetTextColor(c.r, c.g, c.b, c.a or 1)
+            else
+              fs:SetTextColor(0.20, 1.00, 0.20, 1)
+            end
           else
             fs:SetTextColor(0.55, 0.55, 0.55, 1)
           end
@@ -1023,26 +1201,50 @@ function LI.Mail.BuildTab(mailPanel, mailUI, env)
       actionNext:SetEnabled(allowManual)
     end
 
-    applyWH:SetScript("OnClick", function()
-      EnsureDB()
-      local mnc = MailNotifyCfg()
-      if not mnc then return end
-      mnc.ui = mnc.ui or {}
+    do
+      local mail = LI and LI.Mail
+      if mail then
+        mail._refreshEditorViewControls = RefreshViewControls
+      end
+    end
 
-      mnc.ui.w = tonumber(wBox:GetText() or "") or mnc.ui.w or 200
-      mnc.ui.h = tonumber(hBox:GetText() or "") or mnc.ui.h or 220
-      ApplyNotifierSizingAndAlpha()
-      UpdateMailNotifier()
-      RefreshViewControls()
+    xBox:SetScript("OnEnterPressed", function(self)
+      self:ClearFocus()
+      ApplyXYWHFromBoxes()
     end)
-
+    yBox:SetScript("OnEnterPressed", function(self)
+      self:ClearFocus()
+      ApplyXYWHFromBoxes()
+    end)
     wBox:SetScript("OnEnterPressed", function(self)
       self:ClearFocus()
-      applyWH:Click()
+      ApplyXYWHFromBoxes()
     end)
     hBox:SetScript("OnEnterPressed", function(self)
       self:ClearFocus()
-      applyWH:Click()
+      ApplyXYWHFromBoxes()
+    end)
+
+    xBox:SetScript("OnEditFocusLost", function() ApplyXYWHFromBoxes() end)
+    yBox:SetScript("OnEditFocusLost", function() ApplyXYWHFromBoxes() end)
+    wBox:SetScript("OnEditFocusLost", function() ApplyXYWHFromBoxes() end)
+    hBox:SetScript("OnEditFocusLost", function() ApplyXYWHFromBoxes() end)
+
+    xBox:SetScript("OnTextChanged", function(self, userInput)
+      if _inRefresh or (userInput ~= true) then return end
+      DebounceApply(self)
+    end)
+    yBox:SetScript("OnTextChanged", function(self, userInput)
+      if _inRefresh or (userInput ~= true) then return end
+      DebounceApply(self)
+    end)
+    wBox:SetScript("OnTextChanged", function(self, userInput)
+      if _inRefresh or (userInput ~= true) then return end
+      DebounceApply(self)
+    end)
+    hBox:SetScript("OnTextChanged", function(self, userInput)
+      if _inRefresh or (userInput ~= true) then return end
+      DebounceApply(self)
     end)
 
     alphaSlider:SetScript("OnValueChanged", function(_, v)
@@ -1188,14 +1390,36 @@ function LI.Mail.BuildTab(mailPanel, mailUI, env)
 
   BuildMailNotifierViewControls()
 
+  do
+    -- Bottom controls layout.
+    reset:SetParent(mailPanel)
+    reset:ClearAllPoints()
+    reset:SetPoint("BOTTOMLEFT", mailPanel, "BOTTOMLEFT", 10, 6)
+
+    local testBtn = modelUI and modelUI.mailTestBtn
+    if testBtn then
+      testBtn:SetParent(mailPanel)
+      testBtn:ClearAllPoints()
+      testBtn:SetPoint("LEFT", reset, "RIGHT", 10, 0)
+      testBtn:SetSize(reset:GetWidth(), reset:GetHeight())
+    end
+
+    mailUI.combatBtn:ClearAllPoints()
+    -- Center Combat+Apply in the right-side bottom row.
+    mailUI.combatBtn:SetPoint("LEFT", rightBottomRow, "CENTER", -95, 0)
+
+    apply:ClearAllPoints()
+    apply:SetPoint("LEFT", mailUI.combatBtn, "RIGHT", 10, 0)
+  end
+
   local hint = modelUI:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
   hint:SetParent(mailPanel)
   hint:ClearAllPoints()
-  hint:SetPoint("LEFT", mailPanel, "LEFT", 10, 0)
+  hint:SetPoint("BOTTOMLEFT", (modelUI and modelUI.mailTestBtn) or reset, "BOTTOMRIGHT", 10, -2)
   if reloadBtn then
-    hint:SetPoint("RIGHT", reloadBtn, "LEFT", -10, 0)
+    hint:SetPoint("BOTTOMRIGHT", reloadBtn, "BOTTOMLEFT", -10, -2)
   else
-    hint:SetPoint("RIGHT", mailPanel, "RIGHT", -10, 0)
+    hint:SetPoint("BOTTOMRIGHT", mailPanel, "BOTTOMRIGHT", -10, 6)
   end
   hint:SetJustifyH("CENTER")
   hint:SetText("Shift-click uses Katy's Stampwhistle.")

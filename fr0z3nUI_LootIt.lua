@@ -2,7 +2,7 @@ local ADDON = ...
 
 local PREFIX = "|cff00ccff[LI]|r "
 
-local SANITY_VERSION = "260305-018"
+local SANITY_VERSION = "260309-001"
 
 local LI = fr0z3nUI_LootIt or {}
 fr0z3nUI_LootIt = LI
@@ -298,10 +298,12 @@ local function EnsureDB()
   -- Migration: old versions used showSelfNameInGroup; new is showSelfNameAlways.
   if DB and DB.showSelfNameAlways == nil and fr0z3nUI_LootItDB.showSelfNameInGroup ~= nil then
     DB.showSelfNameAlways = (fr0z3nUI_LootItDB.showSelfNameInGroup == true)
+    ---@diagnostic disable-next-line: assign-type-mismatch
     fr0z3nUI_LootItDB.showSelfNameAlways = DB.showSelfNameAlways
   end
 
-  -- Mail notifier config is per-character (enabled remains account-wide + char override).
+  -- Mail notifier config scope is selectable (Account default; optional per-character).
+  -- Enabled remains account-wide + per-character override.
   do
     -- Migration (2026-02-12): reset per-character mail settings to defaults on next load.
     -- IMPORTANT: Older versions stored mail notifier config account-wide; we must ensure
@@ -365,6 +367,49 @@ local function EnsureDB()
     if mn.ui.h == nil then mn.ui.h = 220 end
     if mn.ui.alpha == nil then mn.ui.alpha = 0.5 end
     if mn.ui.strata == nil then mn.ui.strata = "BACKGROUND" end
+
+    -- Mail notifier config: optional account-wide scope.
+    -- Default is Account (CHARDB.mailNotifyScope ~= "char").
+    if DB then
+      DB.mailNotify = DB.mailNotify or {}
+
+      -- One-time seed: when switching to Account-default, copy the current
+      -- per-character settings into the account table if it doesn't yet have them.
+      if DB.mailNotify._m20260310_mailScope ~= true then
+        if DB.mailNotify.showInCombat == nil and mn.showInCombat ~= nil then
+          DB.mailNotify.showInCombat = (mn.showInCombat ~= false)
+        end
+        if type(DB.mailNotify.model) ~= "table" and type(mn.model) == "table" then
+          DB.mailNotify.model = CopyDefaults({}, mn.model)
+        end
+        if type(DB.mailNotify.ui) ~= "table" and type(mn.ui) == "table" then
+          DB.mailNotify.ui = CopyDefaults({}, mn.ui)
+        end
+        DB.mailNotify._m20260310_mailScope = true
+      end
+
+      local acc = DB.mailNotify
+      if acc.showInCombat == nil then acc.showInCombat = true end
+
+      if type(acc.model) ~= "table" then acc.model = {} end
+      if acc.model.kind == nil then acc.model.kind = "npc" end
+      if acc.model.id == nil then acc.model.id = 104230 end
+      if acc.model.rotation == nil then acc.model.rotation = 0.15 end
+      if acc.model.zoom == nil then acc.model.zoom = 0.9 end
+      if acc.model.anim == nil then acc.model.anim = 0 end
+      if acc.model.animRandom == nil then acc.model.animRandom = false end
+      if acc.model.animRepeat == nil then acc.model.animRepeat = false end
+      if acc.model.animRepeatSec == nil then acc.model.animRepeatSec = 10 end
+
+      if type(acc.ui) ~= "table" then acc.ui = {} end
+      if acc.ui.point == nil then acc.ui.point = "TOPRIGHT" end
+      if acc.ui.x == nil then acc.ui.x = -260 end
+      if acc.ui.y == nil then acc.ui.y = -220 end
+      if acc.ui.w == nil then acc.ui.w = 200 end
+      if acc.ui.h == nil then acc.ui.h = 220 end
+      if acc.ui.alpha == nil then acc.ui.alpha = 0.5 end
+      if acc.ui.strata == nil then acc.ui.strata = "BACKGROUND" end
+    end
   end
 end
 
@@ -611,6 +656,7 @@ end
 local _bankInteractionOpen = false
 local _warbankInteractionOpen = false
 local _guildbankInteractionOpen = false
+local _taxWarbankOpen = false
 
 local function IsGuildBankOpen()
   if _guildbankInteractionOpen == true then
@@ -4378,6 +4424,51 @@ end
 
 LI.UpdateDepositButtonVisibility = UpdateDepositButtonVisibility
 
+-- Bank UI can switch between Character/WarBank without firing BANKFRAME_OPENED/CLOSED.
+-- Use a short-lived ticker while BankFrame is open to keep related UI + Tax in sync.
+local _liBankTicker
+local function StopBankTicker()
+  if _liBankTicker and _liBankTicker.Cancel then
+    _liBankTicker:Cancel()
+  end
+  _liBankTicker = nil
+end
+
+local function StartBankTicker()
+  StopBankTicker()
+  if not (C_Timer and C_Timer.NewTicker) then return end
+
+  _liBankTicker = C_Timer.NewTicker(0.25, function()
+    local ok, err = pcall(function()
+      local bf = _G and rawget(_G, "BankFrame")
+      if not (bf and bf.IsShown and bf:IsShown()) then
+        StopBankTicker()
+        return
+      end
+
+      if UpdateDepositButtonVisibility then
+        UpdateDepositButtonVisibility()
+      end
+
+      local tax = LI and LI.Tax
+      if tax and tax.OnWarbankFrame then
+        local nowOpen = (IsWarbankOpen() == true)
+        if nowOpen ~= _taxWarbankOpen then
+          _taxWarbankOpen = nowOpen
+          tax.OnWarbankFrame(nowOpen)
+        end
+      end
+    end)
+
+    if not ok then
+      if Print and LI and LI.Trade and LI.Trade._debugOn == true then
+        Print("Bank ticker error: " .. tostring(err))
+      end
+      StopBankTicker()
+    end
+  end)
+end
+
 local function IsMailNotifierEnabled()
   -- Tri-state:
   --   CHAR override true  -> On
@@ -4391,7 +4482,20 @@ end
 
 local function MailNotifyCfg()
   EnsureDB()
-  return (CHARDB and type(CHARDB.mailNotify) == "table") and CHARDB.mailNotify or nil
+  if not (DB and CHARDB) then return nil end
+
+  -- Scope is per-character:
+  --   CHARDB.mailNotifyScope == "char" -> use per-character config
+  --   otherwise                         -> use account-wide config (default)
+  if CHARDB.mailNotifyScope == "char" then
+    if type(CHARDB.mailNotify) ~= "table" then
+      CHARDB.mailNotify = {}
+    end
+    return CHARDB.mailNotify
+  end
+
+  DB.mailNotify = DB.mailNotify or {}
+  return DB.mailNotify
 end
 
 Print = function(msg)
@@ -4752,6 +4856,7 @@ local f = CreateFrame("Frame")
 f:RegisterEvent("PLAYER_LOGIN")
 f:RegisterEvent("PLAYER_ENTERING_WORLD")
 f:RegisterEvent("PLAYER_GUILD_UPDATE")
+f:RegisterEvent("PLAYER_MONEY")
 f:RegisterEvent("CHAT_MSG_MONEY")
 f:RegisterEvent("CHAT_MSG_SYSTEM")
 f:RegisterEvent("MERCHANT_SHOW")
@@ -4794,6 +4899,11 @@ f:SetScript("OnEvent", function(_, event, arg1)
     end
   elseif event == "PLAYER_GUILD_UPDATE" then
     UpdateSeenGuilds()
+  elseif event == "PLAYER_MONEY" then
+    local tax = LI and LI.Tax
+    if tax and tax.OnPlayerMoney then
+      tax.OnPlayerMoney()
+    end
   elseif event == "CHAT_MSG_MONEY" or event == "CHAT_MSG_SYSTEM" then
     local tax = LI and LI.Tax
     if tax and tax.OnMoneyMessage then
@@ -4820,10 +4930,28 @@ f:SetScript("OnEvent", function(_, event, arg1)
     local isBanker = (it and it.Banker and arg1 == it.Banker) and true or false
     local isAccountBanker = (it and it.AccountBanker and arg1 == it.AccountBanker) and true or false
     local isGuildBanker = (it and it.GuildBanker and arg1 == it.GuildBanker) and true or false
+    local isMailbox = (it and it.MailInfo and arg1 == it.MailInfo) and true or false
     do
       local tax = LI and LI.Tax
       if tax and tax.OnInteraction then
         tax.OnInteraction(isShow, arg1)
+      end
+    end
+
+    -- Mail notifier: hide while mailbox is open; recheck when it closes.
+    if isMailbox then
+      local mail = LI and LI.Mail
+      if mail and mail.SetMailboxOpen then
+        pcall(mail.SetMailboxOpen, isShow)
+      end
+      if isShow then
+        SafeUpdateMailNotifier()
+      else
+        if C_Timer and C_Timer.After then
+          C_Timer.After(0.40, BootstrapMailNotifier)
+        else
+          BootstrapMailNotifier()
+        end
       end
     end
     if isBanker then
@@ -4846,8 +4974,41 @@ f:SetScript("OnEvent", function(_, event, arg1)
     if event == "GUILDBANKFRAME_CLOSED" and ResetGuildBankQuerySession then
       ResetGuildBankQuerySession()
     end
+
+    -- Tax module primarily tracks guild bank state via PlayerInteractionManager, but some
+    -- client/interaction paths only emit the classic GUILDBANKFRAME_* events.
+    -- Bridge those here so PayNow/min-balance borrow logic still runs.
+    if event == "GUILDBANKFRAME_OPENED" or event == "GUILDBANKFRAME_CLOSED" then
+      local tax = LI and LI.Tax
+      if tax and tax.OnGuildBankFrame then
+        -- Avoid double-triggering if PlayerInteractionManager already handled this.
+        if event == "GUILDBANKFRAME_OPENED" then
+          if not (_guildbankInteractionOpen == true) then
+            tax.OnGuildBankFrame(true)
+          end
+        else
+          tax.OnGuildBankFrame(false)
+        end
+      end
+    end
+
     if UpdateDepositButtonVisibility then
       UpdateDepositButtonVisibility()
+    end
+
+    if event == "BANKFRAME_OPENED" then
+      StartBankTicker()
+    elseif event == "BANKFRAME_CLOSED" then
+      StopBankTicker()
+
+      -- Ensure Tax warbank state closes when the unified BankFrame closes.
+      if _taxWarbankOpen == true then
+        _taxWarbankOpen = false
+        local tax = LI and LI.Tax
+        if tax and tax.OnWarbankFrame then
+          tax.OnWarbankFrame(false)
+        end
+      end
     end
   elseif event == "UPDATE_PENDING_MAIL" then
     BootstrapMailNotifier()

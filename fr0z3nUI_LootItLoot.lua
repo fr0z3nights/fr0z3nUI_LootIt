@@ -62,7 +62,15 @@ function LI.LootTab.BuildTab(lootPanel, env)
     local fs = hideLootBtn.GetFontString and hideLootBtn:GetFontString() or nil
     if fs and fs.SetTextColor then
       if hideOn then
-        fs:SetTextColor(1.0, 0.82, 0.0, 1) -- yellow
+          local c = rawget(_G, "GREEN_FONT_COLOR")
+          if c and type(c.GetRGB) == "function" then
+            local r, g, b = c:GetRGB()
+            fs:SetTextColor(r or 0.20, g or 1.00, b or 0.20, 1)
+          elseif type(c) == "table" and c.r and c.g and c.b then
+            fs:SetTextColor(c.r, c.g, c.b, c.a or 1)
+          else
+            fs:SetTextColor(0.20, 1.00, 0.20, 1)
+          end
       else
         fs:SetTextColor(0.55, 0.55, 0.55, 1) -- grey
       end

@@ -447,13 +447,13 @@ function LI.Trade.BuildTab(depositPanel)
     -- Prefer font objects: UIPanelButtonTemplate's OnEnter/OnLeave will otherwise
     -- overwrite text colors and make the button look permanently yellow.
     if restockBtn.SetNormalFontObject then
-      local gfNormal = rawget(_G, "GameFontNormal")
+      local gfNormal = rawget(_G, "GameFontGreen") or rawget(_G, "GameFontNormal")
       local gfDis = rawget(_G, "GameFontDisable")
       if gfDis and restockBtn.SetDisabledFontObject then
         restockBtn:SetDisabledFontObject(gfDis)
       end
       if on == true then
-        -- ON: yellow
+        -- ON: green
         if gfNormal then restockBtn:SetNormalFontObject(gfNormal) end
         if gfNormal and restockBtn.SetHighlightFontObject then restockBtn:SetHighlightFontObject(gfNormal) end
       else
@@ -475,7 +475,7 @@ function LI.Trade.BuildTab(depositPanel)
     if not enabled then
       r, g, b = _GetColorRGB(rawget(_G, "DISABLED_FONT_COLOR") or rawget(_G, "GRAY_FONT_COLOR"))
     else
-      local onColor = rawget(_G, "NORMAL_FONT_COLOR")
+      local onColor = rawget(_G, "GREEN_FONT_COLOR") or rawget(_G, "NORMAL_FONT_COLOR")
       local offColor = rawget(_G, "GRAY_FONT_COLOR") or rawget(_G, "DISABLED_FONT_COLOR")
       r, g, b = _GetColorRGB((on == true) and onColor or offColor)
     end
@@ -2154,7 +2154,9 @@ function LI.Trade.BuildTab(depositPanel)
     else
       local cfg = DepositCfgAcc()
       local on = not (cfg and cfg.showButton == false)
-      actionBtn:SetText(on and "|cffffd100Deposit|r" or "|cffd9d9d9Deposit|r")
+      local gcc = rawget(_G, "GREEN_FONT_COLOR_CODE") or "|cff20ff20"
+      local close = rawget(_G, "FONT_COLOR_CODE_CLOSE") or "|r"
+      actionBtn:SetText(on and (gcc .. "Deposit" .. close) or "|cffd9d9d9Deposit|r")
     end
 
     local id = GetCurrentID()
