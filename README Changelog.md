@@ -2,6 +2,19 @@
 
 Format: `YYMMDD-###` (sanity stamp) — short summary.
 
+## 260310-001
+- Tax UI: added WarBank “EB” (Everything But Min) toggle between WarBank and Min Gold (only shown when WarBank is enabled; default off).
+- Tax (WarBank): when EB is enabled, deposits owed first, then deposits any remaining gold above Min Gold into the WarBank.
+
+## 260311-001
+- Tax UI: renamed WarBank “EB” toggle to “XS” and updated tooltip text (“Pays Excess to WarBank”).
+
+## 260311-002
+- Tax UI: Min Gold input shortened (~33%) and XS moved closer to WarBank.
+
+## 260311-003
+- Tax UI: XS now uses the short button width (same as Debug) and sits flush against the left side of the Min Gold input.
+
 ## 260309-001
 - Tax UI: removed Pay Now/Auto Pay controls (auto-pay only); moved owed-scope text into the owed tooltip.
 - Tax: added optional WarBank tracking + auto-pay on account bank open; WarBank uses character-only owed with its own Clear Due.

@@ -295,6 +295,10 @@ do
     if g.warBankEnabled == nil then g.warBankEnabled = false end
     g.warBankEnabled = (g.warBankEnabled == true)
 
+    -- Warbank: Everything-But-Min toggle (scope-scoped).
+    if g.warBankEB == nil then g.warBankEB = false end
+    g.warBankEB = (g.warBankEB == true)
+
     -- Scope-scoped safety/borrowing controls.
     if g.minGold == nil then g.minGold = 0 end
     g.minGold = Clamp(g.minGold, 0, 9999999) or 0
@@ -343,6 +347,9 @@ do
 
     if cfg.warBankEnabled == nil then cfg.warBankEnabled = false end
     cfg.warBankEnabled = (cfg.warBankEnabled == true)
+
+    if cfg.warBankEB == nil then cfg.warBankEB = false end
+    cfg.warBankEB = (cfg.warBankEB == true)
 
     -- Scope-scoped safety/borrowing controls live on the active cfg.
     -- Migrate legacy per-character fields (ct.minGold/ct.allowWithdraw) into cfg if present.
@@ -860,12 +867,14 @@ do
     end
 
     local function DoDeposit()
+      local ebEnabled = (cfg.warBankEB == true)
+
       local dueTax = math.floor(tonumber(wb.dueTax) or 0)
       local dueBorrowed = math.floor(tonumber(wb.dueBorrowed) or 0)
       if dueTax < 0 then dueTax = 0 end
       if dueBorrowed < 0 then dueBorrowed = 0 end
       local due = dueTax + dueBorrowed
-      if due <= 0 then return end
+      if due <= 0 and not ebEnabled then return end
 
       if not CanDeposit() then
         RequestUIRefresh()
@@ -879,9 +888,14 @@ do
       end
       if available < 0 then available = 0 end
 
-      local toPay = due
-      if toPay > available then
+      local toPay
+      if ebEnabled then
         toPay = available
+      else
+        toPay = due
+        if toPay > available then
+          toPay = available
+        end
       end
       toPay = math.floor(tonumber(toPay) or 0)
       if toPay <= 0 then
@@ -893,9 +907,12 @@ do
         PushPendingDelta(state._pendingWarbankDeltas, -toPay)
         local ok = pcall(C_Bank.DepositMoney, bankType.Account, toPay)
         if ok then
-          local payTax = toPay
+          local payToDue = toPay
+          if payToDue > due then payToDue = due end
+
+          local payTax = payToDue
           if payTax > dueTax then payTax = dueTax end
-          local remain = toPay - payTax
+          local remain = payToDue - payTax
           local payBorrowed = remain
           if payBorrowed > dueBorrowed then payBorrowed = dueBorrowed end
 
@@ -1489,7 +1506,7 @@ do
 
     -- Scope-scoped Min Gold (borderless), matching Trade tab input size/position.
     local minEdit = CreateFrame("EditBox", nil, panel, "InputBoxTemplate")
-    minEdit:SetSize(210, 38)
+    minEdit:SetSize(140, 38)
     minEdit:SetPoint("TOP", rateEdit, "BOTTOM", 0, -GAP_Y)
     minEdit:SetAutoFocus(false)
     minEdit:SetMaxLetters(10)
@@ -1828,6 +1845,21 @@ do
     local warbankBtn = CreateTextToggleButton(panel)
     warbankBtn:SetPoint("BOTTOM", vendorBtn, "TOP", 0, 0)
 
+    -- Warbank Everything-But-Min toggle (between WarBank and Min Gold; only shown when WarBank enabled).
+    local warbankEBBtn = CreateTextToggleButton(panel)
+    warbankEBBtn:SetPoint("RIGHT", minEdit, "LEFT", 0, 0)
+    warbankEBBtn:Hide()
+
+    warbankEBBtn:SetScript("OnEnter", function(self)
+      if not (GameTooltip and GameTooltip.SetOwner and GameTooltip.SetText) then return end
+      GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+      GameTooltip:SetText("Pays Excess to WarBank")
+      GameTooltip:Show()
+    end)
+    warbankEBBtn:SetScript("OnLeave", function()
+      if GameTooltip and GameTooltip.Hide then GameTooltip:Hide() end
+    end)
+
     -- Clear Due buttons live below each owed amount.
     local clearWarBtn = CreateTextToggleButton(panel)
     local clearGuildBtn = CreateTextToggleButton(panel)
@@ -1874,6 +1906,11 @@ do
     local SHORT_BTN_W = math.floor((tonumber(BTN_W) or 110) * 0.62)
     if SHORT_BTN_W < 54 then SHORT_BTN_W = 54 end
     if SHORT_BTN_W > (tonumber(BTN_W) or 110) then SHORT_BTN_W = (tonumber(BTN_W) or 110) end
+
+    -- XS uses the same short-width sizing as Debug.
+    if warbankEBBtn and warbankEBBtn.SetSize then
+      warbankEBBtn:SetSize(SHORT_BTN_W, BTN_H)
+    end
 
     -- Debug toggle (gates all non-deposit Tax prints) - move next to Reload UI and make it a real button.
     local debugBtn = CreateFrame("Button", nil, panel, "UIPanelButtonTemplate")
@@ -2003,6 +2040,7 @@ do
           minGold = 0,
           allowWithdraw = false,
           warBankEnabled = false,
+          warBankEB = false,
         }
       end
       if type(viewBal) ~= "table" then
@@ -2018,6 +2056,7 @@ do
       if viewCfg.minGold == nil then viewCfg.minGold = 0 end
       if viewCfg.allowWithdraw == nil then viewCfg.allowWithdraw = false end
       if viewCfg.warBankEnabled == nil then viewCfg.warBankEnabled = false end
+      if viewCfg.warBankEB == nil then viewCfg.warBankEB = false end
 
       if viewCfg.bankPrintEnabled == nil then viewCfg.bankPrintEnabled = true end
       if viewCfg.manualBankMovesEnabled == nil then viewCfg.manualBankMovesEnabled = false end
@@ -2069,9 +2108,11 @@ do
       if showWarbank then
         if warOwedRow and warOwedRow.Show then warOwedRow:Show() end
         if clearWarBtn and clearWarBtn.Show then clearWarBtn:Show() end
+        if warbankEBBtn and warbankEBBtn.Show then warbankEBBtn:Show() end
       else
         if warOwedRow and warOwedRow.Hide then warOwedRow:Hide() end
         if clearWarBtn and clearWarBtn.Hide then clearWarBtn:Hide() end
+        if warbankEBBtn and warbankEBBtn.Hide then warbankEBBtn:Hide() end
       end
 
       if guildOwedRow and guildOwedRow.Show then guildOwedRow:Show() end
@@ -2132,6 +2173,7 @@ do
       SetToggleText(systemBtn, "System", viewCfg.sources.systemMoney == true)
       SetToggleText(withdrawBtn, "Withdraw", (type(viewCfg) == "table") and (viewCfg.allowWithdraw == true))
       SetToggleText(warbankBtn, "WarBank", (type(viewCfg) == "table") and (viewCfg.warBankEnabled == true))
+      SetToggleText(warbankEBBtn, "XS", (type(viewCfg) == "table") and (viewCfg.warBankEB == true))
       SetToggleText(debugBtn, "Debug", (ct and ct.debug == true))
       SetToggleText(bankPrintBtn, "Print", (type(viewCfg) == "table") and (viewCfg.bankPrintEnabled == true))
       SetToggleText(manualBtn, "Manual", (type(viewCfg) == "table") and (viewCfg.manualBankMovesEnabled == true))
@@ -2208,6 +2250,34 @@ do
         end
       end
 
+      -- Place XS between the WarBank button and the Min Gold input (only when WarBank is enabled).
+      do
+        if showWarbank then
+          warbankEBBtn:ClearAllPoints()
+          -- Flush XS against the left edge of Min Gold.
+          warbankEBBtn:SetPoint("RIGHT", minEdit, "LEFT", 0, 0)
+
+          -- Keep XS between WarBank and Min Gold by shrinking to the available gap.
+          if warbankEBBtn.SetWidth then
+            local mL = minEdit.GetLeft and minEdit:GetLeft() or nil
+            local wbR = warbankBtn.GetRight and warbankBtn:GetRight() or nil
+            if mL and wbR then
+              local maxW = tonumber(SHORT_BTN_W) or 54
+              local gap = (mL - wbR) - 2
+              if gap < 16 then gap = 16 end
+              if gap < maxW then
+                warbankEBBtn:SetWidth(gap)
+              else
+                warbankEBBtn:SetWidth(maxW)
+              end
+            else
+              local maxW = tonumber(SHORT_BTN_W) or 54
+              warbankEBBtn:SetWidth(maxW)
+            end
+          end
+        end
+      end
+
       -- Place owed rows below the source row (WarBank left / Guild right when enabled).
       do
         local srCX = sourcesRow.GetCenter and sourcesRow:GetCenter() or nil
@@ -2262,6 +2332,7 @@ do
       if systemBtn and systemBtn.SetEnabled then systemBtn:SetEnabled(cfgControlsEnabled) end
       if withdrawBtn and withdrawBtn.SetEnabled then withdrawBtn:SetEnabled(cfgControlsEnabled) end
       if warbankBtn and warbankBtn.SetEnabled then warbankBtn:SetEnabled(cfgControlsEnabled) end
+      if warbankEBBtn and warbankEBBtn.SetEnabled then warbankEBBtn:SetEnabled(cfgControlsEnabled and showWarbank) end
       if debugBtn and debugBtn.SetEnabled then debugBtn:SetEnabled(true) end
       if bankPrintBtn and bankPrintBtn.SetEnabled then bankPrintBtn:SetEnabled(cfgControlsEnabled) end
       if manualBtn and manualBtn.SetEnabled then manualBtn:SetEnabled(cfgControlsEnabled) end
@@ -2525,6 +2596,30 @@ do
         if not cfg then return end
       end
       cfg.warBankEnabled = not (cfg.warBankEnabled == true)
+      Refresh()
+    end)
+
+    warbankEBBtn:SetScript("OnClick", function()
+      EnsureDB()
+
+      local cdb = (env.GetCharDB and env.GetCharDB()) or (LI and type(LI.GetCharDB) == "function" and LI.GetCharDB()) or (_G and rawget(_G, "fr0z3nUI_LootItCharDB"))
+      if type(cdb) ~= "table" then cdb = nil end
+      cdb = cdb or {}
+      cdb.tax = (type(cdb.tax) == "table") and cdb.tax or {}
+      cdb.tax.cfg = (type(cdb.tax.cfg) == "table") and cdb.tax.cfg or {}
+      cdb.tax.scope = tostring(cdb.tax.scope or "guild"):lower()
+      if cdb.tax.scope ~= "guild" and cdb.tax.scope ~= "character" then cdb.tax.scope = "guild" end
+
+      local cfg
+      if cdb.tax.scope == "character" then
+        cfg = cdb.tax.cfg
+      else
+        local guildKey = select(1, GetCurrentGuildKeyAndName())
+        if not guildKey then return end
+        cfg = EnsureGuildTaxDB(guildKey)
+        if not cfg then return end
+      end
+      cfg.warBankEB = not (cfg.warBankEB == true)
       Refresh()
     end)
 
