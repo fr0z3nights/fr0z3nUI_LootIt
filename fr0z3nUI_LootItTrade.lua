@@ -1435,6 +1435,9 @@ function LI.Trade.BuildTab(depositPanel)
         ResetTradeEntry(true)
         return
       end
+      if LI and LI.Trade and type(LI.Trade.PrewarmItem) == "function" then
+        LI.Trade.PrewarmItem(id)
+      end
       Print("Added to Character " .. GetTradeMode() .. " list: " .. (GetItemNameSafe(id) or tostring(id)))
       ResetTradeEntry(false)
       SetStatus("Successfully added")
@@ -1482,6 +1485,9 @@ function LI.Trade.BuildTab(depositPanel)
       ClearPerID(st.accDisabledTbl)
       ClearPerID(st.accDisableRealmTbl)
       ClearPerID(st.disableAccTbl)
+      if LI and LI.Trade and type(LI.Trade.PrewarmItem) == "function" then
+        LI.Trade.PrewarmItem(id)
+      end
       Print("Added to Account " .. GetTradeMode() .. " list: " .. (GetItemNameSafe(id) or tostring(id)))
       ResetTradeEntry(false)
       SetStatus("Successfully added")
@@ -1539,6 +1545,9 @@ function LI.Trade.BuildTab(depositPanel)
 
       ClearPerID(st.realmDisabledTbl)
       ClearPerID(st.disableRealmTbl)
+      if LI and LI.Trade and type(LI.Trade.PrewarmItem) == "function" then
+        LI.Trade.PrewarmItem(id)
+      end
       Print("Added to Realm " .. GetTradeMode() .. " list: " .. (GetItemNameSafe(id) or tostring(id)))
       ResetTradeEntry(false)
       SetStatus("Successfully added")
@@ -1765,6 +1774,9 @@ function LI.Trade.BuildTab(depositPanel)
     local idx = 1
     for i = 1, #order do
       if order[i] == t then idx = i break end
+      if LI and LI.Trade and type(LI.Trade.ResetMerchantDebug) == "function" then
+        LI.Trade.ResetMerchantDebug()
+      end
     end
     idx = idx + 1
     if idx > #order then idx = 1 end
@@ -1952,7 +1964,7 @@ function LI.Trade.BuildTab(depositPanel)
     end)
   end
 
-  local function ApplyTargetToExistingRules()
+  local function ApplyTargetToExistingRules(silent)
     local id = GetCurrentID()
     if not id then return end
     local mode = GetTradeMode()
@@ -1961,11 +1973,15 @@ function LI.Trade.BuildTab(depositPanel)
     local n = tonumber(targetBox:GetText() or "")
     n = (n ~= nil) and math.floor(n) or nil
     if mode == "buy" and (not n or n <= 0) then
-      Print("Target must be > 0 for Buy.")
+      if not silent then
+        Print("Target must be > 0 for Buy.")
+      end
       return
     end
     if not n or n < 0 then
-      Print("Enter a target count first.")
+      if not silent then
+        Print("Enter a target count first.")
+      end
       return
     end
 
@@ -1990,7 +2006,12 @@ function LI.Trade.BuildTab(depositPanel)
 
   targetBox:SetScript("OnEnterPressed", function(self)
     self:ClearFocus()
-    ApplyTargetToExistingRules()
+    ApplyTargetToExistingRules(false)
+    UpdateTargetPlaceholder()
+  end)
+  targetBox:SetScript("OnEditFocusLost", function()
+    -- Commit Target on click-away too; otherwise Buy rules can sit at 0 and never purchase.
+    ApplyTargetToExistingRules(true)
     UpdateTargetPlaceholder()
   end)
   targetBox:SetScript("OnEscapePressed", function(self)
@@ -2249,7 +2270,11 @@ function LI.Trade.BuildTab(depositPanel)
       dbgBtn:SetPoint("RIGHT", reloadBtn, "LEFT", -6, 0)
 
       local function RefreshTradeDebugBtn()
-        local on = (LI and LI.Trade and LI.Trade._debugOn == true) and true or false
+        local cfg = DepositCfgAcc()
+        local on = (cfg and cfg.tradeDebug == true) and true or false
+        if LI and LI.Trade then
+          LI.Trade._debugOn = on
+        end
         dbgBtn._liDbgOn = (on == true)
         dbgBtn:SetText("Debug")
 
@@ -2283,8 +2308,13 @@ function LI.Trade.BuildTab(depositPanel)
 
       RefreshTradeDebugBtn()
       dbgBtn:SetScript("OnClick", function()
+        local cfg = DepositCfgAcc()
+        if cfg then
+          cfg.tradeDebug = (cfg.tradeDebug ~= true) and true or false
+        end
+        LI = LI or {}
         LI.Trade = LI.Trade or {}
-        LI.Trade._debugOn = (LI.Trade._debugOn ~= true) and true or false
+        LI.Trade._debugOn = (cfg and cfg.tradeDebug == true) and true or false
         RefreshTradeDebugBtn()
         Print("Trade debug: " .. (LI.Trade._debugOn and "On" or "Off"))
       end)
@@ -2302,7 +2332,7 @@ function LI.Trade.BuildTab(depositPanel)
       itemsBtn:SetText("Item")
 
       local itemPop = CreateFrame("Frame", nil, depositPanel, "BackdropTemplate")
-      local POP_W, POP_H = 320, 360
+      local POP_W_DEFAULT, POP_W_BUY, POP_H = 320, 520, 360
       local POP_TOP_PAD = -10
       local POP_BOTTOM_PAD = 10
       local POP_X_PAD = -6
@@ -2367,7 +2397,7 @@ function LI.Trade.BuildTab(depositPanel)
       local content = CreateFrame("Frame", nil, scroll)
       content:SetPoint("TOPLEFT", scroll, "TOPLEFT", 0, 0)
       content:SetSize(1, 1)
-      content:SetWidth(POP_W - 24)
+      content:SetWidth(POP_W_DEFAULT - 24)
       scroll:SetScrollChild(content)
 
       itemPop._rows = itemPop._rows or {}
@@ -2384,11 +2414,13 @@ function LI.Trade.BuildTab(depositPanel)
       local function SlideToW(targetW, onDone)
         targetW = tonumber(targetW) or 0
         if targetW < 0 then targetW = 0 end
-        if targetW > POP_W then targetW = POP_W end
+
+        local maxW = tonumber(itemPop._liPopW) or POP_W_DEFAULT
+        if targetW > maxW then targetW = maxW end
 
         local from = tonumber(itemPop._slideCurW)
         if from == nil then
-          from = itemPop:IsShown() and POP_W or 0
+          from = itemPop:IsShown() and maxW or 0
         end
         local to = targetW
         if from == to then
@@ -2424,22 +2456,50 @@ function LI.Trade.BuildTab(depositPanel)
 
       local function SlideShow()
         if itemPop._slideActive then StopSlide() end
+
+        local mode = GetTradeMode()
+        itemPop._liPopW = (mode == "buy") and POP_W_BUY or POP_W_DEFAULT
+
+        itemPop._liOpenWanted = true
+
         itemPop:Show()
         itemPop._slideCurW = 0
         itemPop:SetWidth(0)
         if content and content.SetWidth then
-          content:SetWidth(POP_W - 24)
+          content:SetWidth((itemPop._liPopW or POP_W_DEFAULT) - 24)
         end
         BuildItemsList()
-        SlideToW(POP_W)
+        SlideToW(itemPop._liPopW or POP_W_DEFAULT)
       end
 
       local function SlideHide()
         if not itemPop:IsShown() then return end
         if itemPop._slideActive then StopSlide() end
+
+        itemPop._liOpenWanted = false
         SlideToW(0, function()
-          itemPop:Hide()
+          -- Only hide if we're still meant to be closed; avoids stale onDone hiding
+          -- after a rapid re-open click mid-slide.
+          if itemPop._liOpenWanted ~= true then
+            itemPop:Hide()
+          end
         end)
+      end
+
+      local function ApplyPopoutWanted(open)
+        itemPop._liOpenWanted = (open == true)
+        if itemPop._liOpenWanted then
+          SlideShow()
+        else
+          if itemPop:IsShown() then
+            SlideHide()
+          else
+            StopSlide()
+            itemPop._slideCurW = 0
+            if itemPop.SetWidth then itemPop:SetWidth(0) end
+            if itemPop.Hide then itemPop:Hide() end
+          end
+        end
       end
 
       local function ClearInTable(t, id)
@@ -2494,6 +2554,28 @@ function LI.Trade.BuildTab(depositPanel)
 
       BuildItemsList = function()
         local mode = GetTradeMode()
+
+        itemPop._liPopW = (mode == "buy") and POP_W_BUY or POP_W_DEFAULT
+        if content and content.SetWidth then
+          content:SetWidth((itemPop._liPopW or POP_W_DEFAULT) - 24)
+        end
+        if itemPop:IsShown() and (not itemPop._slideActive) then
+          local curW = tonumber(itemPop._slideCurW) or tonumber(itemPop:GetWidth()) or 0
+          local wantW = tonumber(itemPop._liPopW) or POP_W_DEFAULT
+          if itemPop._liOpenWanted == true then
+            -- If we're meant to be open but ended up collapsed (0-width), recover by sliding open.
+            if curW <= 1 then
+              itemPop._slideCurW = curW
+              SlideToW(wantW)
+            elseif math.abs(curW - wantW) > 0.5 then
+              itemPop._slideCurW = curW
+              SlideToW(wantW)
+            end
+          else
+            -- If we're meant to be closed, do nothing here.
+          end
+        end
+
         local st = GetScopeStores(mode)
 
         local ids = {}
@@ -2549,6 +2631,9 @@ function LI.Trade.BuildTab(depositPanel)
         local rowH = 22
         local pad = 2
 
+        local isBuy = (mode == "buy")
+        local colW_lvl, colW_hp, colW_mp = 34, 42, 42
+
         for i = 1, #itemPop._rows do
           itemPop._rows[i]:Hide()
         end
@@ -2581,7 +2666,6 @@ function LI.Trade.BuildTab(depositPanel)
             row:SetHeight(rowH)
 
             row.txt = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-            row.txt:SetPoint("LEFT", row, "LEFT", 0, 0)
             row.txt:SetJustifyH("LEFT")
             row.txt:SetWordWrap(false)
 
@@ -2595,7 +2679,17 @@ function LI.Trade.BuildTab(depositPanel)
             row.edit:SetPoint("RIGHT", row.del, "LEFT", -2, 0)
             row.edit:SetText("Edit")
 
-            row.txt:SetPoint("RIGHT", row.edit, "LEFT", -6, 0)
+            row.lvl = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+            row.lvl:SetJustifyH("RIGHT")
+            row.lvl:SetWordWrap(false)
+
+            row.hp = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+            row.hp:SetJustifyH("RIGHT")
+            row.hp:SetWordWrap(false)
+
+            row.mp = row:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+            row.mp:SetJustifyH("RIGHT")
+            row.mp:SetWordWrap(false)
 
             itemPop._rows[i] = row
           end
@@ -2617,6 +2711,61 @@ function LI.Trade.BuildTab(depositPanel)
             local s = (cfg and type(cfg.keepScopeByItem) == "table" and cfg.keepScopeByItem[id] == "S") and "S" or "K"
             keepTxt = "  " .. s .. ":" .. tostring(k)
           end
+
+          row.txt:ClearAllPoints()
+          row.txt:SetPoint("LEFT", row, "LEFT", 0, 0)
+
+          if isBuy then
+            row.mp:ClearAllPoints()
+            row.mp:SetPoint("RIGHT", row.edit, "LEFT", -6, 0)
+            row.mp:SetWidth(colW_mp)
+
+            row.hp:ClearAllPoints()
+            row.hp:SetPoint("RIGHT", row.mp, "LEFT", -6, 0)
+            row.hp:SetWidth(colW_hp)
+
+            row.lvl:ClearAllPoints()
+            row.lvl:SetPoint("RIGHT", row.hp, "LEFT", -6, 0)
+            row.lvl:SetWidth(colW_lvl)
+
+            row.txt:SetPoint("RIGHT", row.lvl, "LEFT", -6, 0)
+
+            local cached = (LI and LI.Trade and type(LI.Trade.IsItemDataCachedByID) == "function") and (LI.Trade.IsItemDataCachedByID(id) == true) or false
+            if (not cached) and (LI and LI.Trade and type(LI.Trade.PrewarmItem) == "function") then
+              LI.Trade.PrewarmItem(id)
+            end
+
+            local reqLevel = (LI and LI.Trade and type(LI.Trade.GetItemRequiredPlayerLevel) == "function") and LI.Trade.GetItemRequiredPlayerLevel(id) or nil
+            local lvlTxt = nil
+            if reqLevel and reqLevel > 0 then
+              lvlTxt = tostring(reqLevel)
+            elseif cached then
+              lvlTxt = "-"
+            else
+              lvlTxt = "..."
+            end
+            row.lvl:SetText(lvlTxt)
+
+            local tuple = (LI and LI.Trade and type(LI.Trade.GetFoodDrinkTupleForItemID) == "function") and LI.Trade.GetFoodDrinkTupleForItemID(id) or nil
+            if type(tuple) == "table" and tonumber(tuple.pct) then
+              local pct = tonumber(tuple.pct)
+              row.hp:SetText(tostring(pct) .. "%")
+              row.mp:SetText((tuple.hasMana == true) and (tostring(pct) .. "%") or "-")
+            else
+              row.hp:SetText("-")
+              row.mp:SetText("-")
+            end
+
+            row.lvl:Show()
+            row.hp:Show()
+            row.mp:Show()
+          else
+            row.txt:SetPoint("RIGHT", row.edit, "LEFT", -6, 0)
+            row.lvl:Hide()
+            row.hp:Hide()
+            row.mp:Hide()
+          end
+
           row.txt:SetText(name .. " (" .. tostring(id) .. ")  [" .. scopeTxt .. "]" .. keepTxt)
 
           row.del:SetScript("OnClick", function()
@@ -2650,17 +2799,19 @@ function LI.Trade.BuildTab(depositPanel)
       end
 
       itemsBtn:SetScript("OnClick", function()
-        if itemPop:IsShown() then
-          SlideHide()
-        else
-          SlideShow()
+        local openWanted = (itemPop._liOpenWanted == true)
+        -- Use our explicit state when available; fall back to shown-state.
+        if itemPop._liOpenWanted == nil then
+          openWanted = itemPop:IsShown()
         end
+        ApplyPopoutWanted(not openWanted)
       end)
 
       depositPanel:HookScript("OnHide", function()
         if itemPop then
           StopSlide()
           itemPop._slideCurW = 0
+          itemPop._liOpenWanted = false
           if itemPop.SetWidth then itemPop:SetWidth(0) end
           if itemPop.Hide then itemPop:Hide() end
         end

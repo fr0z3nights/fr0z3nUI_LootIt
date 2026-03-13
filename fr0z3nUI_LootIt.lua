@@ -61,6 +61,8 @@ local DEFAULTS = {
   hideLootText = true, -- suppress the default "You receive loot:" chat line
   echoItem = true, -- re-print a simplified line with just the item link
   showItemLevel = true, -- append (ilvl N) for equippable items
+  lootQualityIconEnabled = true, -- show DF+ profession quality (rank) icon embedded in some gathered item links
+  lootQualityIconPosition = "before", -- before | after (relative to item name)
   ignoredItemIDs = {}, -- [itemID] = true hides the item from chat (suppresses both original + LootIt output)
   linkAliases = {}, -- [itemID] = "Short Name" (display only, keeps original link)
   linkAliasDisabledAddon = {}, -- [itemID] = true disables addon built-in alias
@@ -114,6 +116,9 @@ local DEFAULTS = {
   other = {
     outputChatFrame = 1,
     achievement = {
+      enabled = true,
+    },
+    experience = {
       enabled = true,
     },
   },
@@ -209,6 +214,9 @@ local function EnsureDB()
   if type(CHARDB.currencyAliases) ~= "table" then CHARDB.currencyAliases = {} end
   if type(CHARDB.currencyAliasDisabledChar) ~= "table" then CHARDB.currencyAliasDisabledChar = {} end
 
+  -- Other/Professions: persist last-known skill ranks per character (used to compute +Δ after /reload).
+  if type(CHARDB.otherProfessionRanks) ~= "table" then CHARDB.otherProfessionRanks = {} end
+
   -- Deposit config (account list + per-character list/overrides).
   if type(DB.deposit) ~= "table" then DB.deposit = {} end
   if DB.deposit.tradeMode == nil then DB.deposit.tradeMode = "deposit" end
@@ -280,6 +288,24 @@ local function EnsureDB()
   if DB and DB.other and DB.other.outputChatFrame == nil then
     DB.other.outputChatFrame = DB.outputChatFrame or 1
   end
+  if DB and DB.other and type(DB.other.achievement) ~= "table" then
+    DB.other.achievement = {}
+  end
+  if DB and DB.other and type(DB.other.experience) ~= "table" then
+    DB.other.experience = {}
+  end
+  if DB and DB.other and type(DB.other.experience) == "table" and DB.other.experience.showBonus == nil then
+    DB.other.experience.showBonus = true
+  end
+  if DB and DB.other and type(DB.other.experience) == "table" then
+    local pos = tostring(DB.other.experience.xpLabelPos or "after")
+    pos = pos:lower():gsub("%s+", "")
+    if pos ~= "before" and pos ~= "after" then pos = "after" end
+    DB.other.experience.xpLabelPos = pos
+  end
+  if DB and DB.other and type(DB.other.profession) ~= "table" then
+    DB.other.profession = {}
+  end
 
   if DB then
     if type(DB.delayPrint) ~= "table" then DB.delayPrint = {} end
@@ -287,6 +313,15 @@ local function EnsureDB()
     if DB.delayPrint.enabled == nil then DB.delayPrint.enabled = true end
     if DB.delayPrint.flushOnMerchantClose == nil then DB.delayPrint.flushOnMerchantClose = true end
   end
+
+    -- Loot: quality icon config normalization.
+    if DB then
+      if DB.lootQualityIconEnabled == nil then DB.lootQualityIconEnabled = true end
+      local pos = tostring(DB.lootQualityIconPosition or "before")
+      pos = pos:lower():gsub("%s+", "")
+      if pos ~= "before" and pos ~= "after" then pos = "before" end
+      DB.lootQualityIconPosition = pos
+    end
 
   if (not hadNewCurrency) and (not hadNewGold) and (fr0z3nUI_LootItDB.lootCombineIncludeMoneyCurrency == true) then
     fr0z3nUI_LootItDB.lootCombineIncludeCurrency = true
@@ -485,6 +520,7 @@ local function DepositCfgAcc()
   EnsureDB()
   DB.deposit = (type(DB.deposit) == "table") and DB.deposit or {}
   if DB.deposit.tradeMode == nil then DB.deposit.tradeMode = "deposit" end
+  if DB.deposit.tradeDebug == nil then DB.deposit.tradeDebug = false end
   if DB.deposit.keepAmount == nil then DB.deposit.keepAmount = 0 end
   if DB.deposit.stackPull == nil then DB.deposit.stackPull = false end -- legacy; replaced by stackPullByItem
   DB.deposit.stackPullByItem = (type(DB.deposit.stackPullByItem) == "table") and DB.deposit.stackPullByItem or {}
@@ -3308,10 +3344,50 @@ local function CountItemInBags(itemID)
   return total
 end
 
+local function IsItemDataCachedByID(itemID)
+  itemID = tonumber(itemID)
+  if not itemID or itemID <= 0 then return false end
+  if C_Item then
+    if type(C_Item.IsItemDataCachedByID) == "function" then
+      local ok, cached = pcall(C_Item.IsItemDataCachedByID, itemID)
+      if ok and cached == true then
+        return true
+      end
+    end
+    if type(C_Item.IsItemDataCached) == "function" then
+      local ok, cached = pcall(C_Item.IsItemDataCached, itemID)
+      if ok and cached == true then
+        return true
+      end
+    end
+
+    -- Some client paths can return item info before IsItemDataCachedByID flips.
+    -- Treat successful item info queries as "cached enough" for our tooltip parsing.
+    if type(C_Item.GetItemNameByID) == "function" then
+      local okN, name = pcall(C_Item.GetItemNameByID, itemID)
+      if okN and type(name) == "string" and name ~= "" then
+        return true
+      end
+    end
+  end
+
+  if type(GetItemInfo) == "function" then
+    local okI, name, link = pcall(GetItemInfo, itemID)
+    if okI and ((type(link) == "string" and link ~= "") or (type(name) == "string" and name ~= "")) then
+      return true
+    end
+  end
+
+  return false
+end
+
 -- Use-text parsing (used by restock to group items).
 -- NOTE: For food/drink we *must not* strip numbers, otherwise 5% and 7% become equivalent.
 local _useKeyCacheByID = {}
 local _foodUseCacheByID = {}
+
+-- Used by merchant ticker: when true, don't idle-stop while item info is caching.
+local _liMerchantWantsCache = false
 
 local function IsFoodDrinkItemID(itemID)
   itemID = tonumber(itemID)
@@ -3325,6 +3401,11 @@ end
 local function NormalizeUseText_Generic(s)
   if type(s) ~= "string" then return nil end
   local t = s:lower()
+  -- Tooltips can include color codes or leading spaces; strip anything before the first "use:".
+  local p = t:find("use:", 1, true)
+  if p then
+    t = t:sub(p)
+  end
   t = t:gsub("^use:%s*", "")
   -- Generic normalization intentionally strips digits so e.g. "Deals 500" and "Deals 600" can be grouped.
   -- Food/drink is handled separately.
@@ -3337,10 +3418,24 @@ local function NormalizeUseText_Generic(s)
   return t
 end
 
+local function CleanTooltipText(s)
+  if type(s) ~= "string" then return s end
+  -- Strip WoW color codes + texture tags; keep plain text.
+  s = s:gsub("|c%x%x%x%x%x%x%x%x", "")
+  s = s:gsub("|r", "")
+  s = s:gsub("|T.-|t", "")
+  s = s:gsub("^%s+", "")
+  s = s:gsub("%s+$", "")
+  return s
+end
+
 local function ParseFoodDrinkUseLine(s)
   if type(s) ~= "string" or s == "" then return nil end
+  s = CleanTooltipText(s)
   local low = s:lower()
-  if not low:find("^use:", 1) then return nil end
+  local p = low:find("use:", 1, true)
+  if not p then return nil end
+  low = low:sub(p)
   if not low:find("restores", 1, true) then return nil end
   -- Tooltip text varies; accept "health" with %.
   if not low:find("health", 1, true) then return nil end
@@ -3354,10 +3449,9 @@ local function ParseFoodDrinkUseLine(s)
   local dur = low:match("over%s+(%d+)%s*sec") or low:match("for%s+(%d+)%s*sec")
   dur = dur and tonumber(dur) or nil
 
-  -- Avoid false positives: %health food/drink typically has a duration.
-  if dur == nil and not low:find("every second", 1, true) then
-    return nil
-  end
+  -- Some foods/drinks are instant and don't include duration text.
+  -- Since we only call this for actual food/drink items (class/subclass check),
+  -- it's safe to accept missing duration.
 
   local hasMana = (low:find("mana", 1, true) ~= nil)
   return {
@@ -3374,6 +3468,14 @@ local function GetFoodDrinkTupleForItemID(itemID)
     return _foodUseCacheByID[itemID]
   end
 
+  if not IsItemDataCachedByID(itemID) then
+    _liMerchantWantsCache = true
+    if C_Item and type(C_Item.RequestLoadItemDataByID) == "function" then
+      pcall(C_Item.RequestLoadItemDataByID, itemID)
+    end
+    return nil
+  end
+
   -- Only treat actual food/drink items as "food restock" candidates.
   if not IsFoodDrinkItemID(itemID) then
     _foodUseCacheByID[itemID] = false
@@ -3386,7 +3488,7 @@ local function GetFoodDrinkTupleForItemID(itemID)
     if ok and type(tip) == "table" and type(tip.lines) == "table" then
       for _, line in ipairs(tip.lines) do
         local left = (type(line) == "table") and line.leftText or nil
-        if type(left) == "string" and left:find("^Use:", 1) then
+        if type(left) == "string" then
           tuple = ParseFoodDrinkUseLine(left)
           if tuple then break end
         end
@@ -3394,7 +3496,10 @@ local function GetFoodDrinkTupleForItemID(itemID)
     end
   end
 
-  _foodUseCacheByID[itemID] = tuple or false
+  -- Only cache a negative when we had tooltip access; otherwise treat as unknown.
+  if C_TooltipInfo and type(C_TooltipInfo.GetHyperlink) == "function" then
+    _foodUseCacheByID[itemID] = tuple or false
+  end
   return tuple
 end
 
@@ -3421,6 +3526,14 @@ local function GetUseKeyForItemID(itemID)
 
   if _useKeyCacheByID[itemID] ~= nil then
     return _useKeyCacheByID[itemID]
+  end
+
+  if not IsItemDataCachedByID(itemID) then
+    _liMerchantWantsCache = true
+    if C_Item and type(C_Item.RequestLoadItemDataByID) == "function" then
+      pcall(C_Item.RequestLoadItemDataByID, itemID)
+    end
+    return nil
   end
 
   -- Prefer specialized food/drink keys if the item matches that pattern.
@@ -3452,13 +3565,51 @@ local function GetUseKeyForItemID(itemID)
   end
 
   if #useLines == 0 then
-    _useKeyCacheByID[itemID] = false
+    -- Only cache a negative when we had tooltip access; otherwise treat as unknown.
+    if C_TooltipInfo and type(C_TooltipInfo.GetHyperlink) == "function" then
+      _useKeyCacheByID[itemID] = false
+    end
     return nil
   end
   local out = table.concat(useLines, " ") .. "|mana:" .. (hasMana and "1" or "0")
   _useKeyCacheByID[itemID] = out
   return out
 end
+
+local function PrewarmTradeItemCache(itemID)
+  itemID = tonumber(itemID)
+  if not itemID or itemID <= 0 then return end
+
+  if C_Item and type(C_Item.RequestLoadItemDataByID) == "function" then
+    pcall(C_Item.RequestLoadItemDataByID, itemID)
+  end
+
+  if type(GetItemInfo) == "function" then
+    pcall(GetItemInfo, itemID)
+  end
+
+  if C_TooltipInfo and type(C_TooltipInfo.GetHyperlink) == "function" then
+    pcall(C_TooltipInfo.GetHyperlink, "item:" .. tostring(itemID))
+  end
+
+  -- Prime caches when available; functions avoid negative-caching when uncached.
+  pcall(GetItemRequiredPlayerLevel, itemID)
+  pcall(GetFoodDrinkTupleForItemID, itemID)
+  pcall(GetUseKeyForItemID, itemID)
+end
+
+LI.Trade = LI.Trade or {}
+do
+  -- Persisted debug toggle (Trade UI button) across /reload.
+  local cfg = DepositCfgAcc and DepositCfgAcc() or nil
+  if cfg and cfg.tradeDebug ~= nil then
+    LI.Trade._debugOn = (cfg.tradeDebug == true)
+  end
+end
+LI.Trade.PrewarmItem = PrewarmTradeItemCache
+LI.Trade.IsItemDataCachedByID = IsItemDataCachedByID
+LI.Trade.GetFoodDrinkTupleForItemID = GetFoodDrinkTupleForItemID
+LI.Trade.GetUseKeyForItemID = GetUseKeyForItemID
 
 local function CountFoodDrinkAtOrAboveInBags(categoryKey, minScore)
   if type(categoryKey) ~= "string" or categoryKey == "" then return 0 end
@@ -3546,13 +3697,62 @@ local function GetItemRequiredPlayerLevel(itemID)
   if not itemID or itemID <= 0 then return nil end
   if type(GetItemInfo) ~= "function" then return nil end
   -- GetItemInfo returns: name, link, quality, itemLevel, requiredLevel, ...
-  local ok, _, _, _, reqLevel = pcall(GetItemInfo, itemID)
+  local ok, _, _, _, _, reqLevel = pcall(GetItemInfo, itemID)
+  -- Retail order is typically: name, link, quality, itemLevel, requiredLevel, ...
+  -- Some clients can differ; fall back to 5th return if 6th isn't numeric.
+  if ok and (tonumber(reqLevel) == nil) then
+    local ok2, _, _, _, req2 = pcall(GetItemInfo, itemID)
+    if ok2 then reqLevel = req2 end
+  end
   if not ok then return nil end
   reqLevel = tonumber(reqLevel)
   if reqLevel and reqLevel > 0 then
     return reqLevel
   end
   return nil
+end
+
+LI.Trade = LI.Trade or {}
+LI.Trade.GetItemRequiredPlayerLevel = GetItemRequiredPlayerLevel
+
+-- Merchant restock relies on item required-level to avoid buying items you can't use.
+-- Item info is often uncached on first vendor open; request it and retry on the next tick.
+
+local function IsItemUsableForPlayerLevel(itemID, playerLevel)
+  itemID = tonumber(itemID)
+  if not itemID or itemID <= 0 then return false end
+  playerLevel = tonumber(playerLevel)
+  if not playerLevel then
+    -- If we don't know player level, be permissive.
+    return true
+  end
+
+  local reqLevel = GetItemRequiredPlayerLevel(itemID)
+  -- Distinguish: "uncached" vs "no level requirement".
+  -- GetItemRequiredPlayerLevel() returns nil both when uncached and when reqLevel is 0,
+  -- so we must consult item-data cache state.
+  if reqLevel == nil then
+    if IsItemDataCachedByID(itemID) then
+      reqLevel = 0
+    else
+      _liMerchantWantsCache = true
+      if C_Item and type(C_Item.RequestLoadItemDataByID) == "function" then
+        pcall(C_Item.RequestLoadItemDataByID, itemID)
+      end
+      return false
+    end
+  end
+  if reqLevel > playerLevel then
+    return false
+  end
+
+  return true
+end
+
+LI.Trade = LI.Trade or {}
+LI.Trade.ResetMerchantDebug = function()
+  _liMerchantDebugSummaryPrinted = false
+  _liMerchantDebugRulePrinted = false
 end
 
 local function GetBestMerchantFoodDrinkForCategory(categoryKey, usesMana)
@@ -3563,30 +3763,6 @@ local function GetBestMerchantFoodDrinkForCategory(categoryKey, usesMana)
 
   local pl = (type(UnitLevel) == "function") and tonumber(UnitLevel("player")) or nil
 
-  local function isUsableForPlayer(id)
-    if not pl then return true end
-    local reqLevel = GetItemRequiredPlayerLevel(id)
-    -- If item info isn't cached yet, treat as not usable (avoid buying unusable items).
-    if reqLevel == nil then
-      return false
-    end
-    if reqLevel > pl then
-      return false
-    end
-    if C_Item and type(C_Item.IsUsableItem) == "function" then
-      local okU, usable = pcall(C_Item.IsUsableItem, id)
-      if okU and usable == false then
-        return false
-      end
-    elseif type(IsUsableItem) == "function" then
-      local okU, usable = pcall(IsUsableItem, id)
-      if okU and usable == false then
-        return false
-      end
-    end
-    return true
-  end
-
   local best = { idx = nil, itemID = nil, score = nil, pct = nil, unitPrice = nil }
 
   for i = 1, n do
@@ -3594,7 +3770,7 @@ local function GetBestMerchantFoodDrinkForCategory(categoryKey, usesMana)
     if type(link) == "string" then
       local id = link:match("Hitem:(%d+):")
       id = id and tonumber(id) or nil
-      if id and id > 0 and isUsableForPlayer(id) then
+      if id and id > 0 and IsItemUsableForPlayerLevel(id, pl) then
         local t = GetFoodDrinkTupleForItemID(id)
         if type(t) == "table" and GetFoodDrinkCategoryKey(t) == categoryKey then
           local sc = FoodDrinkScore(t) or nil
@@ -3649,29 +3825,6 @@ local function GetBestMerchantItemForUseKey(useKey, usesMana)
 
   local pl = (type(UnitLevel) == "function") and tonumber(UnitLevel("player")) or nil
 
-  local function isUsableForPlayer(id)
-    if not pl then return true end
-    local reqLevel = GetItemRequiredPlayerLevel(id)
-    if reqLevel == nil then
-      return false
-    end
-    if reqLevel > pl then
-      return false
-    end
-    if C_Item and type(C_Item.IsUsableItem) == "function" then
-      local okU, usable = pcall(C_Item.IsUsableItem, id)
-      if okU and usable == false then
-        return false
-      end
-    elseif type(IsUsableItem) == "function" then
-      local okU, usable = pcall(IsUsableItem, id)
-      if okU and usable == false then
-        return false
-      end
-    end
-    return true
-  end
-
   local best = { idx = nil, itemID = nil, unitPrice = nil }
 
   for i = 1, n do
@@ -3679,7 +3832,7 @@ local function GetBestMerchantItemForUseKey(useKey, usesMana)
     if type(link) == "string" then
       local id = link:match("Hitem:(%d+):")
       id = id and tonumber(id) or nil
-      if id and id > 0 and isUsableForPlayer(id) then
+      if id and id > 0 and IsItemUsableForPlayerLevel(id, pl) then
         local k = GetUseKeyForItemID(id)
         if k and k == useKey then
           if (usesMana == false) and (k:sub(-7) == "|mana:1") then
@@ -3912,6 +4065,9 @@ local _liMerchantNotSoldWarned
 local function RunMerchantTradeOnce(skipFoodSell)
   local mode = GetTradeMode()
 
+  -- Reset each merchant tick; set by IsItemUsableForPlayerLevel when data isn't cached.
+  _liMerchantWantsCache = false
+
   local foodEnabled = IsSellFoodEnabled()
   local foodDiff = (DB and DB.deposit and tonumber(DB.deposit.sellFoodLevelDiff)) or 10
   foodDiff = foodDiff and math.floor(foodDiff) or 10
@@ -3937,7 +4093,38 @@ local function RunMerchantTradeOnce(skipFoodSell)
     SellOldFoodAtMerchant(foodDiff, protected)
   end
 
-  if mode ~= "buy" and mode ~= "sell" then return 0 end
+  local dbg = (Print and LI and LI.Trade and LI.Trade._debugOn == true) and true or false
+
+  if dbg and _liMerchantDebugSummaryPrinted ~= true then
+    local function CountRules(t)
+      if type(t) ~= "table" then return 0, 0 end
+      local total, restock = 0, 0
+      for _, r in pairs(t) do
+        total = total + 1
+        if r and r.restock == true then restock = restock + 1 end
+      end
+      return total, restock
+    end
+
+    local buyRules = (type(GetEffectiveTradeRules) == "function") and GetEffectiveTradeRules("buy") or nil
+    local sellRules = (type(GetEffectiveTradeRules) == "function") and GetEffectiveTradeRules("sell") or nil
+    local bn, br = CountRules(buyRules)
+    local sn, sr = CountRules(sellRules)
+    Print(
+      "Merchant debug: mode=" .. tostring(mode) ..
+      ", buyRules=" .. tostring(bn) .. " (restock " .. tostring(br) .. ")" ..
+      ", sellRules=" .. tostring(sn) .. " (restock " .. tostring(sr) .. ")"
+    )
+    _liMerchantDebugSummaryPrinted = true
+  end
+
+  if mode ~= "buy" and mode ~= "sell" then
+    if dbg and _liMerchantDebugRulePrinted ~= true then
+      Print("Merchant debug: not in Buy/Sell mode; no vendor actions will run.")
+      _liMerchantDebugRulePrinted = true
+    end
+    return 0
+  end
 
   local rules = GetEffectiveTradeRules(mode)
   if type(rules) ~= "table" then return 0 end
@@ -3948,11 +4135,18 @@ local function RunMerchantTradeOnce(skipFoodSell)
     any = true
     if r and r.restock == true then anyRestock = true end
   end
-  if not any then return 0 end
+  if not any then
+    if dbg and _liMerchantDebugRulePrinted ~= true then
+      Print("Merchant debug: no effective rules in this mode (all disabled or missing Target count).")
+      _liMerchantDebugRulePrinted = true
+    end
+    return 0
+  end
 
 LI.RunDeposit = RunDeposit
 
   local usesMana = PlayerUsesMana()
+  local pl = (type(UnitLevel) == "function") and tonumber(UnitLevel("player")) or nil
   local ops = 0
   local maxOps = 200
 
@@ -4078,8 +4272,33 @@ LI.RunDeposit = RunDeposit
           if (cur == nil) or (target > cur) then
             restockGroupTarget[gk] = target
           end
-          if restockGroupSeed[gk] == nil then
+
+          -- Seed selection matters: only the seed rule executes for the group.
+          -- Prefer a seed the player can actually use (or the lowest required level) so
+          -- higher-level items don't block the whole restock group.
+          local prev = tonumber(restockGroupSeed[gk])
+          if prev == nil then
             restockGroupSeed[gk] = itemID
+          else
+            local prevUsable = IsItemUsableForPlayerLevel(prev, pl)
+            local thisUsable = IsItemUsableForPlayerLevel(itemID, pl)
+            local prevReq = GetItemRequiredPlayerLevel(prev) or 0
+            local thisReq = GetItemRequiredPlayerLevel(itemID) or 0
+
+            local better = false
+            if thisUsable and not prevUsable then
+              better = true
+            elseif thisUsable == prevUsable then
+              if thisReq < prevReq then
+                better = true
+              elseif thisReq == prevReq and itemID < prev then
+                better = true
+              end
+            end
+
+            if better then
+              restockGroupSeed[gk] = itemID
+            end
           end
         end
       end
@@ -4154,11 +4373,25 @@ LI.RunDeposit = RunDeposit
           end
 
           local need = target - current
+          local debugThisRule = dbg and (_liMerchantDebugRulePrinted ~= true)
+          if debugThisRule then
+            Print(
+              "Merchant debug rule: id=" .. tostring(itemID) ..
+              ", target=" .. tostring(target) ..
+              ", current=" .. tostring(current) ..
+              ", need=" .. tostring(need) ..
+              ", restock=" .. tostring(r.restock == true)
+            )
+          end
           if need > 0 then
             local freeSlots = GetFreeBackpackSlots()
             if freeSlots ~= nil and freeSlots <= 0 then
               if Print and LI and LI.Trade and LI.Trade._debugOn == true then
                 Print("Restock: no free bag slots; skipping buys.")
+              end
+              if debugThisRule then
+                Print("Merchant debug buy: blocked (no free bag slots)")
+                _liMerchantDebugRulePrinted = true
               end
               return ops
             end
@@ -4173,7 +4406,17 @@ LI.RunDeposit = RunDeposit
                 if best and best.idx and best.itemID then
                   buyID, idx = best.itemID, best.idx
                 else
-                  buyID, idx = nil, nil
+                  -- If we can't find an equivalent vendor food (often due to tooltip parsing),
+                  -- try the exact configured item if the merchant sells it.
+                  local exactIdx = GetMerchantIndexForItemID(itemID)
+                  if exactIdx and IsItemUsableForPlayerLevel(itemID, pl) then
+                    buyID, idx = itemID, exactIdx
+                  else
+                    buyID, idx = nil, nil
+                  end
+                  if debugThisRule then
+                    Print("Merchant debug buy: no vendor food match for cat=" .. tostring(cat))
+                  end
                 end
               else
                 local key = GetUseKeyForItemID(itemID)
@@ -4183,11 +4426,51 @@ LI.RunDeposit = RunDeposit
                     buyID, idx = best.itemID, best.idx
                   else
                     buyID, idx = nil, nil
+                    if debugThisRule then
+                      Print("Merchant debug buy: no vendor match for useKey=" .. tostring(key))
+                    end
                   end
                 else
                   buyID, idx = nil, nil
+                  if debugThisRule then
+                    Print("Merchant debug buy: no restock key/cat for rule item")
+                  end
                 end
               end
+
+              -- If we can't derive an equivalence key yet (item info/tooltip cache),
+              -- fall back to buying the exact configured item so restock still works.
+              if not buyID and IsItemUsableForPlayerLevel(itemID, pl) then
+                buyID, idx = itemID, nil
+                if debugThisRule then
+                  Print("Merchant debug buy: fallback to exact configured item")
+                end
+              elseif not buyID and debugThisRule then
+                local cached = IsItemDataCachedByID(itemID)
+                local req = GetItemRequiredPlayerLevel(itemID)
+                local isUsable = nil
+                if C_Item and type(C_Item.IsUsableItem) == "function" then
+                  local okU, u = pcall(C_Item.IsUsableItem, itemID)
+                  isUsable = okU and u or nil
+                elseif type(IsUsableItem) == "function" then
+                  local okU, u = pcall(IsUsableItem, itemID)
+                  isUsable = okU and u or nil
+                end
+                Print(
+                  "Merchant debug buy: fallback blocked" ..
+                  " (cached=" .. tostring(cached) ..
+                  ", reqLevel=" .. tostring(req) ..
+                  ", playerLevel=" .. tostring(pl) ..
+                  ", usable=" .. tostring(isUsable) .. ")"
+                )
+              end
+            end
+
+            if buyID and not IsItemUsableForPlayerLevel(buyID, pl) then
+              if Print and LI and LI.Trade and LI.Trade._debugOn == true then
+                Print("Restock: blocked unusable item for player level: " .. tostring(buyID))
+              end
+              buyID, idx = nil, nil
             end
 
             if buyID and Print and r.restock == true and LI and LI.Trade and LI.Trade._debugOn == true then
@@ -4204,6 +4487,15 @@ LI.RunDeposit = RunDeposit
 
             if buyID and (not idx) then
               idx = GetMerchantIndexForItemID(buyID)
+            end
+
+            if debugThisRule then
+              Print(
+                "Merchant debug buy: freeSlots=" .. tostring(freeSlots) ..
+                ", buyID=" .. tostring(buyID) ..
+                ", idx=" .. tostring(idx)
+              )
+              _liMerchantDebugRulePrinted = true
             end
             if buyID and idx and type(BuyMerchantItem) == "function" then
               local bi = GetMerchantItemBuyInfo(idx) or {}
@@ -4318,6 +4610,8 @@ end
 local _liMerchantTicker
 local _liMerchantDidFoodSell = false
 local _liMerchantIdleTicks = 0
+local _liMerchantDebugSummaryPrinted = false
+local _liMerchantDebugRulePrinted = false
 
 local function StopMerchantTradeTicker()
   if _liMerchantTicker and _liMerchantTicker.Cancel then
@@ -4329,6 +4623,8 @@ local function StopMerchantTradeTicker()
   _liMerchantBuyBaselineHave = nil
   _liMerchantBuySessionBought = nil
   _liMerchantNotSoldWarned = nil
+  _liMerchantDebugSummaryPrinted = false
+  _liMerchantDebugRulePrinted = false
 end
 
 local function StartMerchantTradeTicker()
@@ -4337,6 +4633,9 @@ local function StartMerchantTradeTicker()
   _liMerchantBuyBaselineHave = {}
   _liMerchantBuySessionBought = {}
   _liMerchantNotSoldWarned = {}
+
+  _liMerchantDebugSummaryPrinted = false
+  _liMerchantDebugRulePrinted = false
 
   if not (C_Timer and type(C_Timer.NewTicker) == "function") then
     RunMerchantTradeOnce(false)
@@ -4356,13 +4655,19 @@ local function StartMerchantTradeTicker()
       opsDone = tonumber(opsDone) or 0
 
       if opsDone <= 0 then
-        _liMerchantIdleTicks = (_liMerchantIdleTicks or 0) + 1
+        -- If we did nothing because item info isn't cached yet, keep the ticker alive.
+        if _liMerchantWantsCache == true then
+          _liMerchantIdleTicks = 0
+        else
+          _liMerchantIdleTicks = (_liMerchantIdleTicks or 0) + 1
+        end
       else
         _liMerchantIdleTicks = 0
       end
 
       -- Stop after a short idle streak so we don't keep scanning needlessly.
-      if (_liMerchantIdleTicks or 0) >= 6 then
+      -- Restock rules may require a moment for tooltip/item info to cache.
+      if (_liMerchantIdleTicks or 0) >= 25 then
         StopMerchantTradeTicker()
       end
     end)
@@ -4857,6 +5162,7 @@ f:RegisterEvent("PLAYER_LOGIN")
 f:RegisterEvent("PLAYER_ENTERING_WORLD")
 f:RegisterEvent("PLAYER_GUILD_UPDATE")
 f:RegisterEvent("PLAYER_MONEY")
+f:RegisterEvent("PLAYER_XP_UPDATE")
 f:RegisterEvent("CHAT_MSG_MONEY")
 f:RegisterEvent("CHAT_MSG_SYSTEM")
 f:RegisterEvent("MERCHANT_SHOW")
@@ -4903,6 +5209,11 @@ f:SetScript("OnEvent", function(_, event, arg1)
     local tax = LI and LI.Tax
     if tax and tax.OnPlayerMoney then
       tax.OnPlayerMoney()
+    end
+  elseif event == "PLAYER_XP_UPDATE" then
+    local lc = LI and LI.LootChat
+    if lc and lc.OnPlayerXPUpdate then
+      lc.OnPlayerXPUpdate()
     end
   elseif event == "CHAT_MSG_MONEY" or event == "CHAT_MSG_SYSTEM" then
     local tax = LI and LI.Tax

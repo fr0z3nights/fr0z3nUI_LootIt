@@ -360,7 +360,7 @@ do
     local tabOther = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
     tabOther:SetID(3)
     tabOther:SetText("Other")
-    tabOther:SetPoint("LEFT", tabAlias, "RIGHT", TAB_OVERLAP_X, 0)
+    tabOther:SetPoint("LEFT", tabLoot, "RIGHT", TAB_OVERLAP_X, 0)
     tabOther:SetHeight(22)
     SizeTabToText(tabOther, 18, 70)
     frame.tab3 = tabOther
@@ -403,9 +403,6 @@ do
     local mailPanel = CreateFrame("Frame", nil, frame)
     mailPanel:SetAllPoints(content)
 
-    local aliasPanel = CreateFrame("Frame", nil, frame)
-    aliasPanel:SetAllPoints(content)
-
     local otherPanel = CreateFrame("Frame", nil, frame)
     otherPanel:SetAllPoints(content)
 
@@ -415,36 +412,74 @@ do
     local depositPanel = CreateFrame("Frame", nil, frame)
     depositPanel:SetAllPoints(content)
 
+    -- Alias popout (Alias content moved off the tab bar)
+    local aliasPopout = CreateFrame("Frame", nil, frame, "BackdropTemplate")
+    aliasPopout:SetPoint("TOPLEFT", content, "TOPLEFT", 0, 0)
+    aliasPopout:SetPoint("BOTTOMRIGHT", content, "BOTTOMRIGHT", 0, 0)
+    aliasPopout:SetFrameLevel((frame.GetFrameLevel and frame:GetFrameLevel() or 0) + 80)
+    aliasPopout:SetBackdrop({
+      bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
+      edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+      tile = true,
+      tileSize = 16,
+      edgeSize = 16,
+      insets = { left = 4, right = 4, top = 4, bottom = 4 },
+    })
+    aliasPopout:SetBackdropColor(0, 0, 0, 0.92)
+    aliasPopout:Hide()
+
+    local aliasPanel = CreateFrame("Frame", nil, aliasPopout)
+    aliasPanel:SetAllPoints(aliasPopout)
+
+    local function ToggleAliasPopout(force)
+      local show = force
+      if show == nil then
+        show = not (aliasPopout.IsShown and aliasPopout:IsShown())
+      end
+      if show then
+        aliasPopout:Show()
+        if aliasPanel and aliasPanel.Refresh then
+          aliasPanel:Refresh()
+        end
+      else
+        aliasPopout:Hide()
+      end
+    end
+    frame.ToggleAliasPopout = ToggleAliasPopout
+
     local function SelectTab(which)
       which = tostring(which or "loot"):lower()
       local isLoot = (which == "loot")
-      local isAlias = (which == "alias")
+      local isAlias = false
       local isOther = (which == "other")
       local isMail = (which == "mail")
       local isTax = (which == "tax")
       local isDeposit = (which == "deposit")
 
       lootPanel:SetShown(isLoot)
-      aliasPanel:SetShown(isAlias)
       otherPanel:SetShown(isOther)
       mailPanel:SetShown(isMail)
       taxPanel:SetShown(isTax)
       depositPanel:SetShown(isDeposit)
+
+      if aliasPopout and aliasPopout.Hide then
+        aliasPopout:Hide()
+      end
 
       if enableModeBtn and enableModeBtn.SetShown then
         enableModeBtn:SetShown(isLoot)
       end
 
       StyleTab(tabLoot, isLoot)
-      StyleTab(tabAlias, isAlias)
+      StyleTab(tabAlias, false)
       StyleTab(tabOther, isOther)
       StyleTab(tabMail, isMail)
       StyleTab(tabTax, isTax)
       StyleTab(tabDeposit, isDeposit)
 
-      UpdateTabZOrder(isLoot and 1 or (isAlias and 2 or (isOther and 3 or (isMail and 4 or (isTax and 5 or 6)))) )
+      UpdateTabZOrder(isLoot and 1 or (isOther and 3 or (isMail and 4 or (isTax and 5 or 6))))
 
-      frame._activeTab = isLoot and "loot" or (isAlias and "alias" or (isOther and "other" or (isMail and "mail" or (isTax and "tax" or "deposit"))))
+      frame._activeTab = isLoot and "loot" or (isOther and "other" or (isMail and "mail" or (isTax and "tax" or "deposit")))
 
       ApplyMailNotifierInteractivity()
     end
@@ -452,7 +487,7 @@ do
     frame.SelectTab = SelectTab
 
     tabLoot:SetScript("OnClick", function() SelectTab("loot") end)
-    tabAlias:SetScript("OnClick", function() SelectTab("alias") end)
+    tabAlias:SetScript("OnClick", function() SelectTab("loot") end)
     tabOther:SetScript("OnClick", function() SelectTab("other") end)
     tabMail:SetScript("OnClick", function() SelectTab("mail") end)
     tabTax:SetScript("OnClick", function() SelectTab("tax") end)
@@ -517,6 +552,7 @@ do
           SetCheckBoxChecked = SetCheckBoxChecked,
           GetSupportedMessageLines = GetSupportedMessageLines,
           enableModeBtn = enableModeBtn,
+          ToggleAliasPopout = ToggleAliasPopout,
         })
       end
     end
@@ -525,6 +561,10 @@ do
       if LI and LI.Alias and type(LI.Alias.BuildTab) == "function" then
         LI.Alias.BuildTab(aliasPanel)
       end
+    end
+
+    if tabAlias and tabAlias.Hide then
+      tabAlias:Hide()
     end
 
     do

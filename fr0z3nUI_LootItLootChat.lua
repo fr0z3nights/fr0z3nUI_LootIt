@@ -661,6 +661,11 @@ end
 
 local function NormalizeItemLink(link)
   if type(link) ~= "string" or string.len(link) == 0 then return link end
+
+  -- Retail can prepend an item-quality marker like "|cnIQ1:" right before the hyperlink.
+  -- That prefix is not part of the actual |Hitem:... link and can break normalization.
+  link = link:gsub("^|cnIQ%d+:", "")
+
   if string.match(link, "^|c%x%x%x%x%x%x%x%x|Hitem:") then
     return link
   end
@@ -696,7 +701,88 @@ end
 
 local function StripDisplayedLinkBrackets(link)
   if type(link) ~= "string" or string.len(link) == 0 then return link end
-  return string.gsub(link, "|h%[([^%]]+)%]|h", "|h%1|h")
+
+  EnsureRefs()
+  local qualityEnabled = true
+  local qualityPos = "before"
+  if DB then
+    qualityEnabled = (DB.lootQualityIconEnabled ~= false)
+    qualityPos = tostring(DB.lootQualityIconPosition or "before")
+    qualityPos = qualityPos:lower():gsub("%s+", "")
+    if qualityPos ~= "before" and qualityPos ~= "after" then
+      qualityPos = "before"
+    end
+  end
+
+  -- Some gathered items embed a profession-quality (rank) icon in the item name/link text.
+  -- If that icon is taller than the chat font, WoW increases the line height and leaves extra top gap.
+  -- Also, the icon placement affects where the "xN" quantity suffix ends up.
+  --
+  -- Implementation: extract ANY matching quality icon markup (atlas or texture) found in the link,
+  -- normalize it to a small fixed size, and re-insert it before/after based on DB.
+  local ICON_W, ICON_H, ICON_Y = 10, 10, -1
+
+  local function IsQualityToken(s)
+    if type(s) ~= "string" or s == "" then return false end
+    local t = s:lower()
+    -- Be tolerant: Blizzard has used multiple naming variants across expansions/patches.
+    -- In the loot line context, any atlas/texture token mentioning quality/tier/rank is almost
+    -- certainly the profession-quality indicator.
+    if t:find("quality", 1, true) then
+      return true
+    end
+    if t:find("tier", 1, true) or t:find("rank", 1, true) then
+      if t:find("profession", 1, true) or t:find("professions", 1, true) or t:find("craft", 1, true) or t:find("chat", 1, true) then
+        return true
+      end
+    end
+    return false
+  end
+
+  local function ExtractQualityIcons(text)
+    if type(text) ~= "string" or text == "" then
+      return {}, text
+    end
+
+    local icons = {}
+
+    local function PullAtlas(full, atlas)
+      if IsQualityToken(atlas) then
+        icons[#icons + 1] = string.format("|A:%s:%d:%d:0:%d|a", atlas, ICON_W, ICON_H, ICON_Y)
+        return ""
+      end
+      return full
+    end
+
+    local function PullTexture(full, path)
+      if IsQualityToken(path) then
+        icons[#icons + 1] = string.format("|T%s:%d:%d:0:%d|t", path, ICON_W, ICON_H, ICON_Y)
+        return ""
+      end
+      return full
+    end
+
+    -- Atlas tags can have multiple parameter forms; match anything up to the terminator.
+    text = text:gsub("(|A:([^:|]+)[^|]-|a)", PullAtlas)
+    text = text:gsub("(|T([^:|]+)[^|]-|t)", PullTexture)
+
+    text = text:gsub("%s+", " ")
+    text = text:gsub("^%s+", ""):gsub("%s+$", "")
+    return icons, text
+  end
+
+  local out = string.gsub(link, "|h%[([^%]]+)%]|h", "|h%1|h")
+  local icons, cleaned = ExtractQualityIcons(out)
+
+  if (not qualityEnabled) or (not icons) or (#icons == 0) then
+    return cleaned
+  end
+
+  local iconText = table.concat(icons, "")
+  if qualityPos == "after" then
+    return cleaned .. " " .. iconText
+  end
+  return iconText .. " " .. cleaned
 end
 
 local function GetItemIDFromLink(link)
@@ -1801,6 +1887,16 @@ local function OnLootChat(_, _, msg, author, ...)
     end
   end
 
+  -- Some clients/patches format the quantity suffix as "|rx2" (no space) and/or patterns may
+  -- match the link but fail to capture the qty. Recover qty from the full message when needed.
+  if link and not qty then
+    local escaped = EscapeLuaPattern(link)
+    qty = msg:match(escaped .. "%s*[x×]%s*(%d+)")
+      or msg:match(escaped .. "[\r\n ]*[x×]%s*(%d+)")
+      or msg:match("|h|r%s*[x×]%s*(%d+)")
+      or msg:match("%s*[x×]%s*(%d+)%s*%.?$")
+  end
+
   -- Fallback: if patterns miss but the message starts with a known loot prefix and contains an item hyperlink,
   -- extract the first item link and optional quantity.
   if (not matchedByPattern) and (not link) and (LOOT_PREFIXES and #LOOT_PREFIXES > 0) then
@@ -2116,8 +2212,654 @@ local function OnAchievementChat(_, _, msg, author, ...)
   local displayLink = StripDisplayedLinkBrackets(link)
   local out = string.format("%s: earned %s!", name, displayLink)
 
-  local outFrame = (DB.other and DB.other.outputChatFrame) or (DB and DB.outputChatFrame) or 1
+  local outFrame = (DB.other and DB.other.achievement and DB.other.achievement.outputChatFrame)
+    or (DB.other and DB.other.outputChatFrame)
+    or (DB and DB.outputChatFrame)
+    or 1
   PrintToChatFrame(out, outFrame)
+
+  return true
+end
+
+local function ParseNumberFromChat(s)
+  if type(s) ~= "string" or s == "" then return nil end
+  -- Locale-safe: allow common thousands separators/spaces.
+  -- Keep only digits for parsing.
+  s = s:gsub("[^%d]", "")
+  local n = tonumber(s)
+  if not n then return nil end
+  if n < 0 then return nil end
+  return n
+end
+
+local XP_PATTERNS
+
+local function GlobalStringToPatternPositional(globalString)
+  if type(globalString) ~= "string" or globalString == "" then return nil end
+
+  -- Support both plain (%s/%d) and positional (%1$s/%2$d) placeholders.
+  -- Keep %% (literal percent) intact.
+  local s = globalString
+  s = s:gsub("%%%%", "\0P\0")
+  s = s:gsub("%%%d*%$?s", "\0S\0")
+  s = s:gsub("%%%d*%$?d", "\0D\0")
+
+  s = EscapeLuaPattern(s)
+
+  s = s:gsub("\0S\0", "(.-)")
+  -- Allow common thousands separators in numbers (locale dependent).
+  -- Examples: 1,234  |  1 234  |  1.234  |  1'234
+  s = s:gsub("\0D\0", "([%d,%.%s'%\194\160]+)")
+  s = s:gsub("\0P\0", "%%")
+
+  return "^" .. s .. "$"
+end
+
+local XP_PATTERN_KEYS = {
+  -- Kill XP, unrested.
+  "COMBATLOG_XPGAIN_FIRSTPERSON",
+  -- Kill XP, explicit rested message (some clients/patches).
+  "COMBATLOG_XPGAIN_FIRSTPERSON_RESTED",
+  -- Kill XP, rested bonus.
+  "COMBATLOG_XPGAIN_EXHAUSTION1",
+  -- Some clients/patches expose other exhaustion variants.
+  "COMBATLOG_XPGAIN_EXHAUSTION",
+  "COMBATLOG_XPGAIN_EXHAUSTION2",
+  -- Quest/objective XP (no mob name).
+  "COMBATLOG_XPGAIN_FIRSTPERSON_UNNAMED",
+}
+
+local function BuildXPGainPatterns()
+  local patterns = {}
+  for _, k in ipairs(XP_PATTERN_KEYS) do
+    local gs = _G and rawget(_G, k)
+    local pat = GlobalStringToPatternPositional(gs)
+    if pat then
+      patterns[#patterns + 1] = { key = k, pat = pat }
+    end
+  end
+  XP_PATTERNS = patterns
+end
+
+local function ParseRestedBonusFromParen(paren)
+  if type(paren) ~= "string" or paren == "" then return nil end
+  -- Examples:
+  --   "(+47 exp Rested Bonus)"
+  --   "(47 rested bonus)"
+  --   "(+47 rested bonus)"
+  -- Be tolerant of wording and capitalization.
+  local low = paren:lower()
+  local n = low:match("%+?%s*([%d,%.%s'%\194\160]+)%s*exp")
+    or low:match("%+?%s*([%d,%.%s'%\194\160]+)%s*experience")
+    or low:match("%+?%s*([%d,%.%s'%\194\160]+)")
+  return n and ParseNumberFromChat(n) or nil
+end
+
+local function ParseExperienceGainMessage(msg)
+  if type(msg) ~= "string" or msg == "" then return nil end
+
+  -- Normalize whitespace a bit, but keep original mob text.
+  local t = msg:gsub("\r", " "):gsub("\n", " ")
+  -- Strip common chat formatting that can appear in system/combat messages.
+  t = t:gsub("|c%x%x%x%x%x%x%x%x", ""):gsub("|r", "")
+  t = t:gsub("|T.-|t", "")
+
+  -- Normalize common Unicode spaces to ASCII spaces (NBSP, narrow NBSP, figure space).
+  t = t:gsub("\194\160", " ")
+  t = t:gsub("\226\128\175", " ")
+  t = t:gsub("\226\128\135", " ")
+
+  -- Normalize common lookalike punctuation.
+  -- Fullwidth parentheses: （ ）
+  t = t:gsub("\239\188\136", "(")
+  t = t:gsub("\239\188\137", ")")
+
+  t = t:gsub("%s+", " ")
+  t = t:gsub("^%s+", ""):gsub("%s+$", "")
+
+  -- Prefer Blizzard global-string patterns (localized + stable across punctuation changes).
+  if not XP_PATTERNS then BuildXPGainPatterns() end
+  for _, e in ipairs(XP_PATTERNS or {}) do
+    local a, b, c = t:match(e.pat)
+    if a then
+      -- Patterns vary:
+      --  - FIRSTPERSON:            mob, xp
+      --  - EXHAUSTION1:            mob, xp, rested
+      --  - FIRSTPERSON_UNNAMED:    xp
+      local xp, mob, rested
+      if ParseNumberFromChat(a) then
+        xp = ParseNumberFromChat(a)
+        rested = ParseNumberFromChat(b)
+      else
+        mob = a
+        xp = ParseNumberFromChat(b)
+        rested = ParseNumberFromChat(c)
+      end
+
+      if xp then
+        return { xp = xp, rested = rested, mob = mob }
+      end
+    end
+  end
+
+  -- Fallbacks for non-standard lines.
+  -- 1) Mob kill line: "X dies, you gain N experience. (...)"
+  do
+    local mob, n, paren = t:match("^(.-)%s+dies[^%w]+you gain%s+([%d,%.%s'%\194\160]+)%s+experience[^%w%(]*%s*(%b())?%s*$")
+    if mob and n then
+      local xp = ParseNumberFromChat(n)
+      if xp then
+        local rested = ParseRestedBonusFromParen(paren)
+        return { xp = xp, rested = rested, mob = mob }
+      end
+    end
+  end
+
+  -- 2) Generic/self line: "You gain N experience. (...)"
+  do
+    local n, paren = t:match("^You gain%s+([%d,%.%s'%\194\160]+)%s+experience[^%w%(]*%s*(%b())?%s*$")
+    if n then
+      local xp = ParseNumberFromChat(n)
+      if xp then
+        local rested = ParseRestedBonusFromParen(paren)
+        return { xp = xp, rested = rested }
+      end
+    end
+  end
+
+  -- 3) Discovery XP (system): "Discovered Place: N experience gained"
+  do
+    local place, n = t:match("^Discovered%s+(.-)%s*:%s*([%d,%.%s'%\194\160]+)%s+experience gained%.?%s*$")
+    if n then
+      local xp = ParseNumberFromChat(n)
+      if xp then
+        if IsNonEmptyPublicString(place) then
+          return { xp = xp, mob = place }
+        end
+        return { xp = xp }
+      end
+    end
+  end
+
+  -- 4) Very tolerant English fallback (and generally robust across punctuation/casing):
+  --    Look for "you gain <n> experience" and optionally extract "<mob> dies".
+  do
+    local low = t:lower()
+    if low:find("you gain", 1, true) and low:find("experience", 1, true) then
+      local n = low:match("you gain%s+([%d,%.%s'%\194\160]+)%s+experience")
+      if n then
+        local xp = ParseNumberFromChat(n)
+        if xp then
+          local paren = t:match("(%b())")
+          local rested = ParseRestedBonusFromParen(paren)
+
+          local mob
+          local diesAt = low:find(" dies", 1, true)
+          if diesAt and diesAt > 1 then
+            mob = t:sub(1, diesAt - 1)
+            mob = mob:gsub("^%s+", ""):gsub("%s+$", "")
+            if mob == "" then mob = nil end
+          end
+
+          return { xp = xp, rested = rested, mob = mob }
+        end
+      end
+    end
+  end
+
+  return nil
+end
+
+local function GetOtherSelfPrefix()
+  local me = StripRealmFromName((UnitName and UnitName("player")) or "")
+  if not IsNonEmptyPublicString(me) then
+    me = "Character"
+  end
+  local colored = GetClassColoredName(me)
+  if IsNonEmptyPublicString(colored) then
+    return "<" .. colored .. ">"
+  end
+  return "<" .. me .. ">"
+end
+
+local function SafeNow()
+  local now
+  if type(GetTime) == "function" then
+    local ok, v = pcall(GetTime)
+    now = ok and tonumber(v) or nil
+  end
+  return now or 0
+end
+
+local _xpDbgLastTS
+local function XPDebugEnabled()
+  return (DB and DB.debugCapture) == true
+end
+
+local _xpLastXP
+local _xpLastMaxXP
+local _xpRecentPrintedTS
+local _xpRecentPrintedDelta
+local _xpPendingNoMatchTS
+local _xpPendingNoMatchMsg
+local _xpPendingNoMatchEvent
+local _xpChatLastSig
+local _xpChatLastTS
+
+local function GetExperienceOutputFrame()
+  return (DB and DB.other and DB.other.experience and DB.other.experience.outputChatFrame)
+    or (DB and DB.other and DB.other.outputChatFrame)
+    or (DB and DB.outputChatFrame)
+    or 1
+end
+
+local function GetProfessionOutputFrame()
+  return (DB and DB.other and DB.other.profession and DB.other.profession.outputChatFrame)
+    or (DB and DB.other and DB.other.outputChatFrame)
+    or (DB and DB.outputChatFrame)
+    or 1
+end
+
+local function ColorCodes()
+  local close = rawget(_G, "FONT_COLOR_CODE_CLOSE") or "|r"
+  -- IMPORTANT: NORMAL/HIGHLIGHT can be effectively white depending on chat theme.
+  -- Prefer Blizzard's gold if present; otherwise use the canonical gold hex.
+  local gold = rawget(_G, "GOLD_FONT_COLOR_CODE") or "|cffffd100"
+  if type(gold) ~= "string" or gold == "" or gold:lower() == "|cffffffff" then
+    gold = "|cffffd100"
+  end
+
+  local green = rawget(_G, "GREEN_FONT_COLOR_CODE") or "|cff20ff20"
+  if type(green) ~= "string" or green == "" or green:lower() == "|cffffffff" then
+    green = "|cff20ff20"
+  end
+
+  return gold, green, close
+end
+
+local function MaybePrintXPDebug(line)
+  if not XPDebugEnabled() then return end
+  if not IsNonEmptyPublicString(line) then return end
+
+  -- Keep this low-noise: one line per second max.
+  local now = SafeNow()
+  if _xpDbgLastTS and (now - _xpDbgLastTS) < 1.0 then
+    return
+  end
+  _xpDbgLastTS = now
+
+  local dbgFrame = GetExperienceOutputFrame()
+  PrintToChatFrame("[LootIt XP] " .. line, dbgFrame)
+end
+
+local function GetXPLabelPos()
+  local pos = (DB and DB.other and DB.other.experience and DB.other.experience.xpLabelPos) or "after"
+  pos = tostring(pos or "after"):lower():gsub("%s+", "")
+  if pos ~= "before" and pos ~= "after" then pos = "after" end
+  return pos
+end
+
+local XP_NUM_WIDTH = 5
+
+local function FormatXPNumber(x)
+  x = tonumber(x) or 0
+  -- Use leading spaces (not zeros) so shorter values align without visual noise.
+  return string.format("%" .. tostring(XP_NUM_WIDTH) .. "d", x)
+end
+
+local function FormatXPMainChunk(xp, xpPos, hcc, gcc, close)
+  local xpStr = FormatXPNumber(xp)
+  if xpPos == "before" then
+    return string.format("%sXP%s %s%s%s", hcc, close, gcc, xpStr, close)
+  end
+  return string.format("%s%s%s %sXP%s", gcc, xpStr, close, hcc, close)
+end
+
+local function FormatXPBonusChunk(rested, xpPos, hcc, close)
+  local restedStr = FormatXPNumber(rested)
+  if xpPos == "before" then
+    return string.format(" (%s+XP %s%s)", hcc, restedStr, close)
+  end
+  return string.format(" (%s+%s XP%s)", hcc, restedStr, close)
+end
+
+local function ShortXPMsg(s)
+  if type(s) ~= "string" then return "" end
+  -- sanitize a bit (strip color/texture; collapse whitespace)
+  s = s:gsub("|c%x%x%x%x%x%x%x%x", ""):gsub("|r", "")
+  s = s:gsub("|T.-|t", "")
+  s = s:gsub("\194\160", " ")
+  s = s:gsub("\226\128\175", " ")
+  s = s:gsub("\226\128\135", " ")
+  s = s:gsub("\239\188\136", "(")
+  s = s:gsub("\239\188\137", ")")
+  s = s:gsub("%s+", " ")
+  s = s:gsub("^%s+", ""):gsub("%s+$", "")
+  if #s > 90 then
+    s = s:sub(1, 90) .. "…"
+  end
+  return s
+end
+
+local function OnExperienceChat(_, eventName, msg, ...)
+  EnsureRefs()
+  if not (DB and DB.other and DB.other.experience and DB.other.experience.enabled) then
+    return false
+  end
+  if not IsNonEmptyPublicString(msg) then
+    return false
+  end
+
+  local ev = (type(eventName) == "string" and eventName ~= "") and eventName or "CHAT_MSG_COMBAT_XP_GAIN"
+
+  -- CHAT_MSG_SYSTEM can contain lots of unrelated lines. Only attempt parse when the line
+  -- looks XP-related (keeps debug and capture usable).
+  if ev == "CHAT_MSG_SYSTEM" then
+    local low = msg:lower()
+    if not (low:find("experience", 1, true) or low:find(" exp", 1, true) or low:find("discovered", 1, true)) then
+      return false
+    end
+  end
+  LootChat.CaptureChatIn(ev, msg)
+
+  local parsed = ParseExperienceGainMessage(msg)
+  if not parsed then
+    local now = SafeNow()
+    _xpPendingNoMatchTS = now
+    _xpPendingNoMatchMsg = msg
+    _xpPendingNoMatchEvent = ev
+    LootChat.CaptureChatOut(ev, "(xp) no-match", { handled = false, xpNoMatch = true })
+    MaybePrintXPDebug(string.format("no-match (event=%s) msg='%s'", tostring(ev), ShortXPMsg(msg)))
+    return false
+  end
+  local xp = parsed.xp
+  local rested = parsed.rested
+  local mob = parsed.mob
+
+  local showBonus = true
+  if DB and DB.other and DB.other.experience and DB.other.experience.showBonus ~= nil then
+    showBonus = (DB.other.experience.showBonus == true)
+  end
+
+  local hcc, gcc, close = ColorCodes()
+  local xpPos = GetXPLabelPos()
+
+  -- Main XP number in green; literal "XP" (and bonus marker/chunk) in gold.
+  local outText = FormatXPMainChunk(xp, xpPos, hcc, gcc, close)
+  if rested and rested > 0 then
+    if showBonus then
+      outText = outText .. FormatXPBonusChunk(rested, xpPos, hcc, close)
+    else
+      outText = outText .. string.format("%s*%s", hcc, close)
+    end
+  end
+  if type(mob) == "string" and mob ~= "" then
+    mob = mob:gsub("^%s+", ""):gsub("%s+$", "")
+    if mob ~= "" then
+      outText = outText .. " " .. mob
+    end
+  end
+
+  -- De-dupe: some clients fire the same XP text on multiple events (e.g. COMBAT_XP_GAIN + COMBAT_MISC_INFO).
+  -- We swallow duplicates but only print once.
+  do
+    local now = SafeNow()
+    local sig = tostring(xp or 0) .. "|" .. tostring(rested or 0) .. "|" .. tostring(mob or "")
+    if _xpChatLastSig == sig and _xpChatLastTS and (now - _xpChatLastTS) < 0.35 then
+      MaybePrintXPDebug(string.format("dedup (event=%s) sig=%s", tostring(ev), sig))
+      return true
+    end
+    _xpChatLastSig = sig
+    _xpChatLastTS = now
+  end
+
+  local out = FormatSelfLine(outText)
+
+  local outFrame = (DB.other and DB.other.experience and DB.other.experience.outputChatFrame)
+    or (DB.other and DB.other.outputChatFrame)
+    or (DB and DB.outputChatFrame)
+    or 1
+  PrintToChatFrame(out, outFrame)
+
+  do
+    local now = SafeNow()
+    _xpRecentPrintedTS = now
+    _xpRecentPrintedDelta = xp
+  end
+
+  MaybePrintXPDebug(string.format("out->%s %s", tostring(outFrame), tostring(out)))
+
+  LootChat.CaptureChatOut(ev, out, {
+    handled = true,
+    xp = xp,
+    rested = rested,
+    mob = mob,
+    outFrame = outFrame,
+  })
+
+  return true
+end
+
+function LootChat.OnPlayerXPUpdate()
+  EnsureRefs()
+  if type(UnitXP) ~= "function" or type(UnitXPMax) ~= "function" then
+    return
+  end
+
+  local cur = tonumber(UnitXP("player") or 0)
+  local max = tonumber(UnitXPMax("player") or 0)
+
+  -- Always update caches so enabling XP later doesn't print a huge backlog.
+  if _xpLastXP == nil then
+    _xpLastXP = cur
+    _xpLastMaxXP = max
+    return
+  end
+
+  local delta = cur - (_xpLastXP or 0)
+  if delta < 0 and (_xpLastMaxXP or 0) > 0 then
+    -- Level-up rollover.
+    delta = (_xpLastMaxXP - (_xpLastXP or 0)) + cur
+  end
+
+  _xpLastXP = cur
+  _xpLastMaxXP = max
+
+  if not (DB and DB.other and DB.other.experience and DB.other.experience.enabled) then
+    return
+  end
+  if not delta or delta <= 0 then
+    return
+  end
+
+  local now = SafeNow()
+
+  -- Suppress duplicates when we already printed from the chat filter.
+  if _xpRecentPrintedTS and (now - _xpRecentPrintedTS) < 0.75 and _xpRecentPrintedDelta == delta then
+    return
+  end
+
+  -- Only use XP_UPDATE as a fallback when a recent XP chat line failed to parse.
+  if not (_xpPendingNoMatchTS and (now - _xpPendingNoMatchTS) < 1.0) then
+    return
+  end
+
+  local msg = _xpPendingNoMatchMsg
+  local ev = _xpPendingNoMatchEvent or "CHAT_MSG_COMBAT_XP_GAIN"
+  _xpPendingNoMatchTS = nil
+  _xpPendingNoMatchMsg = nil
+  _xpPendingNoMatchEvent = nil
+
+  local hcc, gcc, close = ColorCodes()
+  local xpPos = GetXPLabelPos()
+  local outText = FormatXPMainChunk(delta, xpPos, hcc, gcc, close)
+  local out = FormatSelfLine(outText)
+
+  local outFrame = GetExperienceOutputFrame()
+  PrintToChatFrame(out, outFrame)
+
+  MaybePrintXPDebug(string.format("fallback-xpupdate (event=%s) delta=%d msg='%s' out->%s %s", tostring(ev), delta, ShortXPMsg(msg), tostring(outFrame), tostring(out)))
+  LootChat.CaptureChatOut("PLAYER_XP_UPDATE", out, {
+    handled = true,
+    xp = delta,
+    xpUpdateFallback = true,
+    fromEvent = ev,
+    msg = ShortXPMsg(msg),
+    outFrame = outFrame,
+  })
+end
+
+local SKILL_PATTERN_KEYS = {
+  "SKILL_RANK_UP",
+  "SKILL_LEARNED",
+}
+
+local SKILL_PATTERNS
+local function BuildSkillPatterns()
+  local patterns = {}
+  for _, k in ipairs(SKILL_PATTERN_KEYS) do
+    local gs = _G and rawget(_G, k)
+    local pat = GlobalStringToPatternPositional(gs)
+    if pat then
+      patterns[#patterns + 1] = { key = k, pat = pat }
+    end
+  end
+  SKILL_PATTERNS = patterns
+end
+
+local function ParseSkillMessage(msg)
+  if type(msg) ~= "string" or msg == "" then return nil end
+
+  local t = msg:gsub("\r", " "):gsub("\n", " ")
+  t = t:gsub("|c%x%x%x%x%x%x%x%x", ""):gsub("|r", "")
+  t = t:gsub("|T.-|t", "")
+
+  t = t:gsub("\194\160", " ")
+  t = t:gsub("\226\128\175", " ")
+  t = t:gsub("\226\128\135", " ")
+  t = t:gsub("\239\188\136", "(")
+  t = t:gsub("\239\188\137", ")")
+
+  t = t:gsub("%s+", " ")
+  t = t:gsub("^%s+", ""):gsub("%s+$", "")
+
+  if not SKILL_PATTERNS then BuildSkillPatterns() end
+  for _, e in ipairs(SKILL_PATTERNS or {}) do
+    local a, b, c = t:match(e.pat)
+    if a then
+      if e.key == "SKILL_RANK_UP" then
+        local skill = a
+        local rank = ParseNumberFromChat(b)
+        if IsNonEmptyPublicString(skill) and rank then
+          return { skill = skill, rank = rank }
+        end
+      elseif e.key == "SKILL_LEARNED" then
+        local skill = a
+        if IsNonEmptyPublicString(skill) then
+          return { skill = skill, learned = true }
+        end
+      end
+    end
+  end
+
+  -- Fallbacks (English-like) for clients where the global string keys differ.
+  do
+    local skill, rank = t:match("^Your skill in%s+(.-)%s+has increased to%s+(%d+)%.%s*$")
+    if skill and rank then
+      local n = ParseNumberFromChat(rank)
+      if n and IsNonEmptyPublicString(skill) then
+        return { skill = skill, rank = n }
+      end
+    end
+  end
+  do
+    local skill = t:match("^You have gained the%s+(.-)%s+skill%.%s*$")
+    if skill and IsNonEmptyPublicString(skill) then
+      return { skill = skill, learned = true }
+    end
+  end
+
+  return nil
+end
+
+local _skillLastSig
+local _skillLastTS
+local _skillLastRankByName
+
+local function GetProfessionRankCache()
+  -- Persist per-character so the first rank-up after /reload can still show +Δ.
+  if CHARDB and type(CHARDB.otherProfessionRanks) ~= "table" then
+    CHARDB.otherProfessionRanks = {}
+  end
+  if CHARDB and type(CHARDB.otherProfessionRanks) == "table" then
+    _skillLastRankByName = CHARDB.otherProfessionRanks
+    return CHARDB.otherProfessionRanks
+  end
+  _skillLastRankByName = _skillLastRankByName or {}
+  return _skillLastRankByName
+end
+
+local function OnProfessionSkillChat(_, eventName, msg, ...)
+  EnsureRefs()
+  if not (DB and DB.other and DB.other.profession and DB.other.profession.enabled) then
+    return false
+  end
+  if not IsNonEmptyPublicString(msg) then
+    return false
+  end
+
+  local ev = (type(eventName) == "string" and eventName ~= "") and eventName or "CHAT_MSG_SKILL"
+  LootChat.CaptureChatIn(ev, msg)
+
+  local parsed = ParseSkillMessage(msg)
+  if not parsed then
+    LootChat.CaptureChatOut(ev, "(skill) no-match", { handled = false, skillNoMatch = true })
+    return false
+  end
+
+  -- De-dupe in case the same skill line fires more than once.
+  do
+    local now = SafeNow()
+    local sig = tostring(parsed.skill or "") .. "|" .. tostring(parsed.rank or 0) .. "|" .. tostring(parsed.learned or false)
+    if _skillLastSig == sig and _skillLastTS and (now - _skillLastTS) < 0.35 then
+      return true
+    end
+    _skillLastSig = sig
+    _skillLastTS = now
+  end
+
+  local outText
+  if parsed.rank then
+    local skillName = tostring(parsed.skill)
+    local rank = tonumber(parsed.rank) or 0
+    local cache = GetProfessionRankCache()
+    local prev = tonumber(cache[skillName])
+    cache[skillName] = rank
+
+    local delta = (prev and rank and rank > prev) and (rank - prev) or nil
+    local hcc, gcc, close = ColorCodes()
+    if delta and delta > 0 then
+      outText = string.format("%s%s %s+%d%s (%d)%s", hcc, skillName, gcc, delta, hcc, rank, close)
+    else
+      outText = string.format("%s%s %s+?%s (%d)%s", hcc, skillName, gcc, hcc, rank, close)
+    end
+  else
+    local skillName = tostring(parsed.skill)
+    local hcc, _, close = ColorCodes()
+    outText = string.format("%s%s learned%s", hcc, skillName, close)
+  end
+  local out = FormatSelfLine(outText)
+
+  local outFrame = GetProfessionOutputFrame()
+  PrintToChatFrame(out, outFrame)
+
+  LootChat.CaptureChatOut(ev, out, {
+    handled = true,
+    skill = parsed.skill,
+    rank = parsed.rank,
+    learned = parsed.learned and true or false,
+    outFrame = outFrame,
+  })
 
   return true
 end
@@ -2137,13 +2879,24 @@ function LootChat.ApplyFilters()
 
   if dbg then
     local outFrame = (DB and DB.outputChatFrame) or 1
-    local otherFrame = (DB and DB.other and DB.other.outputChatFrame) or nil
+    local otherFrameAch = (DB and DB.other and DB.other.achievement and DB.other.achievement.outputChatFrame)
+      or (DB and DB.other and DB.other.outputChatFrame)
+      or nil
+    local otherFrameXP = (DB and DB.other and DB.other.experience and DB.other.experience.outputChatFrame)
+      or (DB and DB.other and DB.other.outputChatFrame)
+      or nil
     local outName = GetChatWindowName(outFrame) or "?"
-    local otherName = otherFrame and (GetChatWindowName(otherFrame) or "?") or "(nil)"
+    local otherNameAch = otherFrameAch and (GetChatWindowName(otherFrameAch) or "?") or "(nil)"
+    local otherNameXP = otherFrameXP and (GetChatWindowName(otherFrameXP) or "?") or "(nil)"
     local ach = (DB and DB.other and DB.other.achievement and DB.other.achievement.enabled) and true or false
+    local xp = (DB and DB.other and DB.other.experience and DB.other.experience.enabled) and true or false
     D(string.format(
-      "ApplyFilters begin enabled=%s output=%s('%s') other=%s('%s') achievement=%s",
-      tostring(IsEnabled()), tostring(outFrame), tostring(outName), tostring(otherFrame), tostring(otherName), tostring(ach)
+      "ApplyFilters begin enabled=%s output=%s('%s') otherAch=%s('%s') otherXP=%s('%s') achievement=%s experience=%s",
+      tostring(IsEnabled()),
+      tostring(outFrame), tostring(outName),
+      tostring(otherFrameAch), tostring(otherNameAch),
+      tostring(otherFrameXP), tostring(otherNameXP),
+      tostring(ach), tostring(xp)
     ))
   end
 
@@ -2166,26 +2919,44 @@ function LootChat.ApplyFilters()
   ChatFrame_RemoveMessageEventFilter("CHAT_MSG_COMBAT_MISC_INFO", OnSystemChat)
   ChatFrame_RemoveMessageEventFilter("CHAT_MSG_SKILL", OnSystemChat)
   ChatFrame_RemoveMessageEventFilter("CHAT_MSG_TRADESKILLS", OnSystemChat)
+  ChatFrame_RemoveMessageEventFilter("CHAT_MSG_SKILL", OnProfessionSkillChat)
   ChatFrame_RemoveMessageEventFilter("CHAT_MSG_ACHIEVEMENT", OnAchievementChat)
   ChatFrame_RemoveMessageEventFilter("CHAT_MSG_GUILD_ACHIEVEMENT", OnAchievementChat)
+  ChatFrame_RemoveMessageEventFilter("CHAT_MSG_COMBAT_XP_GAIN", OnExperienceChat)
+  ChatFrame_RemoveMessageEventFilter("CHAT_MSG_COMBAT_MISC_INFO", OnExperienceChat)
+  ChatFrame_RemoveMessageEventFilter("CHAT_MSG_SYSTEM", OnExperienceChat)
+  ChatFrame_RemoveMessageEventFilter("CHAT_MSG_SYSTEM", OnProfessionSkillChat)
   if IsEnabled() then
     ChatFrame_AddMessageEventFilter("CHAT_MSG_LOOT", OnLootChat)
     ChatFrame_AddMessageEventFilter("CHAT_MSG_CURRENCY", OnCurrencyChat)
     ChatFrame_AddMessageEventFilter("CHAT_MSG_MONEY", OnMoneyChat)
     ChatFrame_AddMessageEventFilter("CHAT_MSG_SYSTEM", OnSystemChat)
     ChatFrame_AddMessageEventFilter("CHAT_MSG_COMBAT_MISC_INFO", OnSystemChat)
-    ChatFrame_AddMessageEventFilter("CHAT_MSG_SKILL", OnSystemChat)
+    if not (DB and DB.other and DB.other.profession and DB.other.profession.enabled) then
+      ChatFrame_AddMessageEventFilter("CHAT_MSG_SKILL", OnSystemChat)
+    end
     ChatFrame_AddMessageEventFilter("CHAT_MSG_TRADESKILLS", OnSystemChat)
   end
   if DB and DB.other and DB.other.achievement and DB.other.achievement.enabled then
     ChatFrame_AddMessageEventFilter("CHAT_MSG_ACHIEVEMENT", OnAchievementChat)
     ChatFrame_AddMessageEventFilter("CHAT_MSG_GUILD_ACHIEVEMENT", OnAchievementChat)
   end
+  if DB and DB.other and DB.other.experience and DB.other.experience.enabled then
+    ChatFrame_AddMessageEventFilter("CHAT_MSG_COMBAT_XP_GAIN", OnExperienceChat)
+    ChatFrame_AddMessageEventFilter("CHAT_MSG_COMBAT_MISC_INFO", OnExperienceChat)
+    ChatFrame_AddMessageEventFilter("CHAT_MSG_SYSTEM", OnExperienceChat)
+  end
+  if DB and DB.other and DB.other.profession and DB.other.profession.enabled then
+    ChatFrame_AddMessageEventFilter("CHAT_MSG_SKILL", OnProfessionSkillChat)
+    ChatFrame_AddMessageEventFilter("CHAT_MSG_SYSTEM", OnProfessionSkillChat)
+  end
 
   if dbg then
     local enabled = IsEnabled() and true or false
     local ach = (DB and DB.other and DB.other.achievement and DB.other.achievement.enabled) and true or false
-    D(string.format("ApplyFilters done (enabled=%s, achievement=%s)", tostring(enabled), tostring(ach)))
+    local xp = (DB and DB.other and DB.other.experience and DB.other.experience.enabled) and true or false
+    local prof = (DB and DB.other and DB.other.profession and DB.other.profession.enabled) and true or false
+    D(string.format("ApplyFilters done (enabled=%s, achievement=%s, experience=%s, profession=%s)", tostring(enabled), tostring(ach), tostring(xp), tostring(prof)))
   end
 end
 

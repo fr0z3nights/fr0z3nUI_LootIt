@@ -18,6 +18,23 @@ local function SafeCall(fn, ...)
   end
 end
 
+local function GetLootItVersion()
+  local addon = "fr0z3nUI_LootIt"
+  local v
+  do
+    local api = _G and rawget(_G, "C_AddOns")
+    if type(api) == "table" and type(api.GetAddOnMetadata) == "function" then
+      local ok, r = pcall(api.GetAddOnMetadata, addon, "Version")
+      if ok and type(r) == "string" and r ~= "" then v = r end
+    end
+  end
+  if not v and type(GetAddOnMetadata) == "function" then
+    local ok, r = pcall(GetAddOnMetadata, addon, "Version")
+    if ok and type(r) == "string" and r ~= "" then v = r end
+  end
+  return v
+end
+
 function UIV.Handle(msg)
   local e = env or {}
   SafeCall(e.EnsureDB)
@@ -40,6 +57,11 @@ function UIV.Handle(msg)
   cmd = (cmd and cmd:lower()) or ""
 
   local function Status()
+    local v = GetLootItVersion()
+    if v and v ~= "" then
+      SafeCall(Print, "version=" .. tostring(v))
+    end
+
     local sanity = e.SANITY_VERSION
     if sanity and sanity ~= "" then
       SafeCall(Print, "sanity=" .. tostring(sanity))
@@ -110,6 +132,11 @@ function UIV.Handle(msg)
       if maxN < 1 then maxN = 10 end
       if maxN > 20 then maxN = 20 end
 
+      local v = GetLootItVersion()
+      if v and v ~= "" then
+        SafeCall(Print, "LootIt version=" .. tostring(v))
+      end
+
       SafeCall(Print, "Chat windows (id -> name, shown):")
       for i = 1, maxN do
         local name = ""
@@ -129,6 +156,14 @@ function UIV.Handle(msg)
       end
       SafeCall(Print, string.format("LootIt outputChatFrame=%s", tostring(DB and DB.outputChatFrame)))
       SafeCall(Print, string.format("LootIt other.outputChatFrame=%s", tostring(DB and DB.other and DB.other.outputChatFrame)))
+      SafeCall(Print, string.format(
+        "LootIt other.achievement.outputChatFrame=%s",
+        tostring(DB and DB.other and DB.other.achievement and DB.other.achievement.outputChatFrame)
+      ))
+      SafeCall(Print, string.format(
+        "LootIt other.experience.outputChatFrame=%s",
+        tostring(DB and DB.other and DB.other.experience and DB.other.experience.outputChatFrame)
+      ))
     end
 
     if sub == "on" then
@@ -249,10 +284,34 @@ function UIV.Handle(msg)
       if not (DB and DB.debugCapture) then
         SafeCall(Print, "Capture is OFF. Run: /fli capture on")
       end
-      local n = tonumber(parts[2]) or 30
+
+      do
+        local v = GetLootItVersion()
+        if v and v ~= "" then
+          SafeCall(Print, "LootIt version=" .. tostring(v))
+        end
+      end
+
+      local function EscapeChatPipes(s)
+        if type(s) ~= "string" or s == "" then return s end
+        -- WoW chat uses '|' for escape codes; doubling shows a literal pipe.
+        return (s:gsub("|", "||"))
+      end
+
+      local dumpRaw = false
+      local idxN = 2
+      local p2 = parts[2] and parts[2]:lower() or nil
+      if p2 == "raw" or p2 == "pipes" or p2 == "escaped" then
+        dumpRaw = true
+        idxN = 3
+      end
+
+      local n = tonumber(parts[idxN]) or 30
       if n < 1 then n = 1 end
       if n > 200 then n = 200 end
-      local filter = table.concat(parts, " ", 3)
+
+      local idxFilter = idxN + 1
+      local filter = table.concat(parts, " ", idxFilter)
       filter = (type(filter) == "string") and filter:lower() or ""
 
       local log = (CHARDB and type(CHARDB.debugCaptureLog) == "table") and CHARDB.debugCaptureLog or {}
@@ -295,9 +354,17 @@ function UIV.Handle(msg)
             end
 
             if msg2 ~= "" then
-              SafeCall(Print, line .. " :: " .. msg2 .. extra)
+              local outLine = line .. " :: " .. msg2 .. extra
+              if dumpRaw then
+                outLine = EscapeChatPipes(outLine)
+              end
+              SafeCall(Print, outLine)
             else
-              SafeCall(Print, line .. extra)
+              local outLine = line .. extra
+              if dumpRaw then
+                outLine = EscapeChatPipes(outLine)
+              end
+              SafeCall(Print, outLine)
             end
           end
         end
@@ -308,8 +375,16 @@ function UIV.Handle(msg)
     local enabled = (DB and DB.debugCapture) and "on" or "off"
     local stacks = (DB and DB.debugCaptureStacks) and "on" or "off"
     local count = (CHARDB and type(CHARDB.debugCaptureLog) == "table") and #CHARDB.debugCaptureLog or 0
+
+    do
+      local v = GetLootItVersion()
+      if v and v ~= "" then
+        SafeCall(Print, "LootIt version=" .. tostring(v))
+      end
+    end
+
     SafeCall(Print, string.format("Capture: %s (stacks=%s, max=%s, entries=%d)", enabled, stacks, tostring(DB and DB.debugCaptureMax or 200), count))
-    SafeCall(Print, "Usage: /fli capture on|off|status|dump [n] [filter]|clear|max <n>|stacks")
+    SafeCall(Print, "Usage: /fli capture on|off|status|dump [raw] [n] [filter]|clear|max <n>|stacks")
     return
   end
 
