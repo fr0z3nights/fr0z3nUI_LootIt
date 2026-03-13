@@ -151,7 +151,7 @@ local DEFAULTS = {
   -- Deposit helper (bank open + command/button pressed).
   deposit = {
     tradeMode = "deposit", -- deposit | buy | sell
-    target = "bank", -- bank | guild | warbank
+    target = "bank", -- bank | personal | guild | warbank
     guildTab = 0, -- legacy fallback; 0=current tab; 1..8 specific tab
     guildTabByRealm = {}, -- [realm] = 0..8
     showButton = true,
@@ -266,7 +266,8 @@ local function EnsureDB()
     t = t:lower():gsub("%s+", "")
     if t == "either" then t = "bank" end
     if t == "warband" then t = "warbank" end
-    if t == "warbank" or t == "guild" or t == "bank" then
+    if t == "personalbank" or t == "personal" then t = "personal" end
+    if t == "warbank" or t == "guild" or t == "bank" or t == "personal" then
       DB.deposit.target = t
     else
       DB.deposit.target = "bank"
@@ -531,6 +532,50 @@ local function DepositCfgAcc()
   DB.deposit.itemsAccDisableRealm = (type(DB.deposit.itemsAccDisableRealm) == "table") and DB.deposit.itemsAccDisableRealm or {}
   DB.deposit.itemsRealm = (type(DB.deposit.itemsRealm) == "table") and DB.deposit.itemsRealm or {}
   DB.deposit.itemsRealmDisabled = (type(DB.deposit.itemsRealmDisabled) == "table") and DB.deposit.itemsRealmDisabled or {}
+
+  -- Per-target Deposit item lists.
+  -- Target keys: bank (auto), personal, guild, warbank.
+  -- Legacy fields (itemsAcc/itemsRealm/...) remain as aliases to the "bank" target.
+  DB.deposit.itemsAccByTarget = (type(DB.deposit.itemsAccByTarget) == "table") and DB.deposit.itemsAccByTarget or {}
+  DB.deposit.itemsAccDisabledByTarget = (type(DB.deposit.itemsAccDisabledByTarget) == "table") and DB.deposit.itemsAccDisabledByTarget or {}
+  DB.deposit.itemsAccDisableRealmByTarget = (type(DB.deposit.itemsAccDisableRealmByTarget) == "table") and DB.deposit.itemsAccDisableRealmByTarget or {}
+  DB.deposit.itemsRealmByTarget = (type(DB.deposit.itemsRealmByTarget) == "table") and DB.deposit.itemsRealmByTarget or {}
+  DB.deposit.itemsRealmDisabledByTarget = (type(DB.deposit.itemsRealmDisabledByTarget) == "table") and DB.deposit.itemsRealmDisabledByTarget or {}
+
+  local function EnsureTargetTable(parent, key)
+    parent[key] = (type(parent[key]) == "table") and parent[key] or {}
+    return parent[key]
+  end
+
+  -- Migrate/alias legacy single-list tables into the "bank" target.
+  DB.deposit.itemsAccByTarget.bank = (type(DB.deposit.itemsAccByTarget.bank) == "table") and DB.deposit.itemsAccByTarget.bank or DB.deposit.itemsAcc or {}
+  DB.deposit.itemsAccDisabledByTarget.bank = (type(DB.deposit.itemsAccDisabledByTarget.bank) == "table") and DB.deposit.itemsAccDisabledByTarget.bank or DB.deposit.itemsAccDisabled or {}
+  DB.deposit.itemsAccDisableRealmByTarget.bank = (type(DB.deposit.itemsAccDisableRealmByTarget.bank) == "table") and DB.deposit.itemsAccDisableRealmByTarget.bank or DB.deposit.itemsAccDisableRealm or {}
+  DB.deposit.itemsRealmByTarget.bank = (type(DB.deposit.itemsRealmByTarget.bank) == "table") and DB.deposit.itemsRealmByTarget.bank or DB.deposit.itemsRealm or {}
+  DB.deposit.itemsRealmDisabledByTarget.bank = (type(DB.deposit.itemsRealmDisabledByTarget.bank) == "table") and DB.deposit.itemsRealmDisabledByTarget.bank or DB.deposit.itemsRealmDisabled or {}
+
+  DB.deposit.itemsAcc = DB.deposit.itemsAccByTarget.bank
+  DB.deposit.itemsAccDisabled = DB.deposit.itemsAccDisabledByTarget.bank
+  DB.deposit.itemsAccDisableRealm = DB.deposit.itemsAccDisableRealmByTarget.bank
+  DB.deposit.itemsRealm = DB.deposit.itemsRealmByTarget.bank
+  DB.deposit.itemsRealmDisabled = DB.deposit.itemsRealmDisabledByTarget.bank
+
+  -- Ensure other targets exist so the UI can write to them.
+  EnsureTargetTable(DB.deposit.itemsAccByTarget, "personal")
+  EnsureTargetTable(DB.deposit.itemsAccByTarget, "guild")
+  EnsureTargetTable(DB.deposit.itemsAccByTarget, "warbank")
+  EnsureTargetTable(DB.deposit.itemsAccDisabledByTarget, "personal")
+  EnsureTargetTable(DB.deposit.itemsAccDisabledByTarget, "guild")
+  EnsureTargetTable(DB.deposit.itemsAccDisabledByTarget, "warbank")
+  EnsureTargetTable(DB.deposit.itemsAccDisableRealmByTarget, "personal")
+  EnsureTargetTable(DB.deposit.itemsAccDisableRealmByTarget, "guild")
+  EnsureTargetTable(DB.deposit.itemsAccDisableRealmByTarget, "warbank")
+  EnsureTargetTable(DB.deposit.itemsRealmByTarget, "personal")
+  EnsureTargetTable(DB.deposit.itemsRealmByTarget, "guild")
+  EnsureTargetTable(DB.deposit.itemsRealmByTarget, "warbank")
+  EnsureTargetTable(DB.deposit.itemsRealmDisabledByTarget, "personal")
+  EnsureTargetTable(DB.deposit.itemsRealmDisabledByTarget, "guild")
+  EnsureTargetTable(DB.deposit.itemsRealmDisabledByTarget, "warbank")
   DB.deposit.guildTabByRealm = (type(DB.deposit.guildTabByRealm) == "table") and DB.deposit.guildTabByRealm or {}
   DB.deposit.guildTabRandomByRealm = (type(DB.deposit.guildTabRandomByRealm) == "table") and DB.deposit.guildTabRandomByRealm or {}
   if DB.deposit.guildTabRandom == nil then DB.deposit.guildTabRandom = false end
@@ -616,6 +661,40 @@ local function DepositCfgChar()
   CHARDB.deposit.sellDisableAcc = (type(CHARDB.deposit.sellDisableAcc) == "table") and CHARDB.deposit.sellDisableAcc or {}
   CHARDB.deposit.sellDisableRealm = (type(CHARDB.deposit.sellDisableRealm) == "table") and CHARDB.deposit.sellDisableRealm or {}
 
+  -- Per-target Deposit item lists (legacy fields remain as aliases to the "bank" target).
+  CHARDB.deposit.itemsCharByTarget = (type(CHARDB.deposit.itemsCharByTarget) == "table") and CHARDB.deposit.itemsCharByTarget or {}
+  CHARDB.deposit.itemsCharDisabledByTarget = (type(CHARDB.deposit.itemsCharDisabledByTarget) == "table") and CHARDB.deposit.itemsCharDisabledByTarget or {}
+  CHARDB.deposit.disableAccByTarget = (type(CHARDB.deposit.disableAccByTarget) == "table") and CHARDB.deposit.disableAccByTarget or {}
+  CHARDB.deposit.disableRealmByTarget = (type(CHARDB.deposit.disableRealmByTarget) == "table") and CHARDB.deposit.disableRealmByTarget or {}
+
+  local function EnsureTargetTable(parent, key)
+    parent[key] = (type(parent[key]) == "table") and parent[key] or {}
+    return parent[key]
+  end
+
+  CHARDB.deposit.itemsCharByTarget.bank = (type(CHARDB.deposit.itemsCharByTarget.bank) == "table") and CHARDB.deposit.itemsCharByTarget.bank or CHARDB.deposit.itemsChar or {}
+  CHARDB.deposit.itemsCharDisabledByTarget.bank = (type(CHARDB.deposit.itemsCharDisabledByTarget.bank) == "table") and CHARDB.deposit.itemsCharDisabledByTarget.bank or CHARDB.deposit.itemsCharDisabled or {}
+  CHARDB.deposit.disableAccByTarget.bank = (type(CHARDB.deposit.disableAccByTarget.bank) == "table") and CHARDB.deposit.disableAccByTarget.bank or CHARDB.deposit.disableAcc or {}
+  CHARDB.deposit.disableRealmByTarget.bank = (type(CHARDB.deposit.disableRealmByTarget.bank) == "table") and CHARDB.deposit.disableRealmByTarget.bank or CHARDB.deposit.disableRealm or {}
+
+  CHARDB.deposit.itemsChar = CHARDB.deposit.itemsCharByTarget.bank
+  CHARDB.deposit.itemsCharDisabled = CHARDB.deposit.itemsCharDisabledByTarget.bank
+  CHARDB.deposit.disableAcc = CHARDB.deposit.disableAccByTarget.bank
+  CHARDB.deposit.disableRealm = CHARDB.deposit.disableRealmByTarget.bank
+
+  EnsureTargetTable(CHARDB.deposit.itemsCharByTarget, "personal")
+  EnsureTargetTable(CHARDB.deposit.itemsCharByTarget, "guild")
+  EnsureTargetTable(CHARDB.deposit.itemsCharByTarget, "warbank")
+  EnsureTargetTable(CHARDB.deposit.itemsCharDisabledByTarget, "personal")
+  EnsureTargetTable(CHARDB.deposit.itemsCharDisabledByTarget, "guild")
+  EnsureTargetTable(CHARDB.deposit.itemsCharDisabledByTarget, "warbank")
+  EnsureTargetTable(CHARDB.deposit.disableAccByTarget, "personal")
+  EnsureTargetTable(CHARDB.deposit.disableAccByTarget, "guild")
+  EnsureTargetTable(CHARDB.deposit.disableAccByTarget, "warbank")
+  EnsureTargetTable(CHARDB.deposit.disableRealmByTarget, "personal")
+  EnsureTargetTable(CHARDB.deposit.disableRealmByTarget, "guild")
+  EnsureTargetTable(CHARDB.deposit.disableRealmByTarget, "warbank")
+
   -- One-time migration (stage 2): apply legacy keepAmount to character-scoped Deposit items.
   do
     local acc = DepositCfgAcc()
@@ -648,38 +727,59 @@ end
 
 LI.DepositCfgChar = DepositCfgChar
 
-local function GetEffectiveDepositItemIDs()
+local function GetEffectiveDepositItemIDs(listTarget)
+  listTarget = tostring(listTarget or "")
+  listTarget = listTarget:lower():gsub("%s+", "")
+  if listTarget == "either" then listTarget = "bank" end
+  if listTarget == "warband" then listTarget = "warbank" end
+  if listTarget == "personalbank" then listTarget = "personal" end
+  if listTarget ~= "bank" and listTarget ~= "personal" and listTarget ~= "guild" and listTarget ~= "warbank" then
+    listTarget = "bank"
+  end
+
   local acc = DepositCfgAcc()
   local ch = DepositCfgChar()
   local out = {}
   local rk = GetCurrentRealmKey()
-  local accDisableRealm = (rk ~= "" and type(acc.itemsAccDisableRealm) == "table") and acc.itemsAccDisableRealm[rk] or nil
-  for id, on in pairs(acc.itemsAcc or {}) do
+
+  local accItems = (type(acc.itemsAccByTarget) == "table" and type(acc.itemsAccByTarget[listTarget]) == "table") and acc.itemsAccByTarget[listTarget] or {}
+  local accItemsDisabled = (type(acc.itemsAccDisabledByTarget) == "table" and type(acc.itemsAccDisabledByTarget[listTarget]) == "table") and acc.itemsAccDisabledByTarget[listTarget] or {}
+  local accAccDisableRealmAll = (type(acc.itemsAccDisableRealmByTarget) == "table" and type(acc.itemsAccDisableRealmByTarget[listTarget]) == "table") and acc.itemsAccDisableRealmByTarget[listTarget] or {}
+  local accDisableRealm = (rk ~= "" and type(accAccDisableRealmAll) == "table") and accAccDisableRealmAll[rk] or nil
+
+  local chItems = (type(ch.itemsCharByTarget) == "table" and type(ch.itemsCharByTarget[listTarget]) == "table") and ch.itemsCharByTarget[listTarget] or {}
+  local chItemsDisabled = (type(ch.itemsCharDisabledByTarget) == "table" and type(ch.itemsCharDisabledByTarget[listTarget]) == "table") and ch.itemsCharDisabledByTarget[listTarget] or {}
+  local chDisableAcc = (type(ch.disableAccByTarget) == "table" and type(ch.disableAccByTarget[listTarget]) == "table") and ch.disableAccByTarget[listTarget] or (ch.disableAcc or {})
+  local chDisableRealm = (type(ch.disableRealmByTarget) == "table" and type(ch.disableRealmByTarget[listTarget]) == "table") and ch.disableRealmByTarget[listTarget] or (ch.disableRealm or {})
+
+  for id, on in pairs(accItems or {}) do
     id = tonumber(id)
     if id and id > 0 and on == true
-      and not (acc.itemsAccDisabled and acc.itemsAccDisabled[id] == true)
+      and not (accItemsDisabled and accItemsDisabled[id] == true)
       and not (type(accDisableRealm) == "table" and accDisableRealm[id] == true)
-      and not (ch.disableAcc and ch.disableAcc[id] == true)
+      and not (chDisableAcc and chDisableAcc[id] == true)
     then
       out[id] = true
     end
   end
-  for id, on in pairs(ch.itemsChar or {}) do
+  for id, on in pairs(chItems or {}) do
     id = tonumber(id)
-    if id and id > 0 and on == true and not (ch.itemsCharDisabled and ch.itemsCharDisabled[id] == true) then
+    if id and id > 0 and on == true and not (chItemsDisabled and chItemsDisabled[id] == true) then
       out[id] = true
     end
   end
 
   do
-    local realmItems = (type(acc.itemsRealm) == "table") and acc.itemsRealm[rk] or nil
-    local realmDisabled = (type(acc.itemsRealmDisabled) == "table") and acc.itemsRealmDisabled[rk] or nil
+    local realmItemsAll = (type(acc.itemsRealmByTarget) == "table" and type(acc.itemsRealmByTarget[listTarget]) == "table") and acc.itemsRealmByTarget[listTarget] or nil
+    local realmItems = (type(realmItemsAll) == "table") and realmItemsAll[rk] or nil
+    local realmDisabledAll = (type(acc.itemsRealmDisabledByTarget) == "table" and type(acc.itemsRealmDisabledByTarget[listTarget]) == "table") and acc.itemsRealmDisabledByTarget[listTarget] or nil
+    local realmDisabled = (type(realmDisabledAll) == "table") and realmDisabledAll[rk] or nil
     if type(realmItems) == "table" then
       for id, on in pairs(realmItems) do
         id = tonumber(id)
         if id and id > 0 and on == true
           and not (type(realmDisabled) == "table" and realmDisabled[id] == true)
-          and not (ch.disableRealm and ch.disableRealm[id] == true)
+          and not (chDisableRealm and chDisableRealm[id] == true)
         then
           out[id] = true
         end
@@ -1476,7 +1576,7 @@ local function CountItemInContainerBags(sourceBags, itemID)
   return total
 end
 
-local function RunDepositGuild()
+local function RunDepositGuild(listTarget)
   if not IsGuildBankOpen() then
     return false
   end
@@ -1493,7 +1593,7 @@ local function RunDepositGuild()
     end
   end
 
-  local targets = GetEffectiveDepositItemIDs()
+  local targets = GetEffectiveDepositItemIDs(listTarget)
   local hasAny = false
   for _ in pairs(targets) do hasAny = true break end
   if not hasAny then
@@ -1784,12 +1884,12 @@ local function DepositToPersonalBankOnce(bag, slot, amount)
   return true
 end
 
-local function RunDepositPersonalBank()
+local function RunDepositPersonalBank(listTarget)
   if not IsPersonalBankOpen() then
     return false
   end
 
-  local targets = GetEffectiveDepositItemIDs()
+  local targets = GetEffectiveDepositItemIDs(listTarget)
   local hasAny = false
   for _ in pairs(targets) do hasAny = true break end
   if not hasAny then
@@ -2353,12 +2453,12 @@ local function WithdrawWarbankPartialStacksToBags(itemID, maxStack)
   return true
 end
 
-local function RunDepositWarband()
+local function RunDepositWarband(listTarget)
   if not IsWarbankOpen() then
     return false
   end
 
-  local targets = GetEffectiveDepositItemIDs()
+  local targets = GetEffectiveDepositItemIDs(listTarget)
   local hasAny = false
   for _ in pairs(targets) do hasAny = true break end
   if not hasAny then
@@ -2944,7 +3044,8 @@ local function RunKeepTopUpForTarget(target, targets)
     t = t:lower():gsub("%s+", "")
     if t == "either" then t = "bank" end
     if t == "warband" then t = "warbank" end
-    if t ~= "bank" and t ~= "guild" and t ~= "warbank" then t = "" end
+    if t == "personalbank" then t = "personal" end
+    if t ~= "bank" and t ~= "personal" and t ~= "guild" and t ~= "warbank" then t = "" end
     return t
   end
 
@@ -2959,6 +3060,8 @@ local function RunKeepTopUpForTarget(target, targets)
     elseif IsGuildBankOpen() then target = "guild"
     elseif IsPersonalBankOpen() then target = "bank"
     else return false end
+  elseif target == "personal" then
+    if not IsPersonalBankOpen() then return false end
   end
 
   local anyMoved = false
@@ -3043,7 +3146,8 @@ local function RunDeposit(target)
     t = t:lower():gsub("%s+", "")
     if t == "either" then t = "bank" end
     if t == "warband" then t = "warbank" end
-    if t ~= "bank" and t ~= "guild" and t ~= "warbank" then
+    if t == "personalbank" then t = "personal" end
+    if t ~= "bank" and t ~= "personal" and t ~= "guild" and t ~= "warbank" then
       t = ""
     end
     return t
@@ -3055,24 +3159,29 @@ local function RunDeposit(target)
     target = "bank"
   end
 
+  -- Target controls BOTH destination behavior and which Deposit list is used.
+  local listTarget = target
+
   local keepMoved = false
   do
-    local targets = GetEffectiveDepositItemIDs()
+    local targets = GetEffectiveDepositItemIDs(listTarget)
     keepMoved = RunKeepTopUpForTarget(target, targets) == true
   end
   local didDeposit = false
   if target == "guild" then
-    didDeposit = RunDepositGuild() == true
+    didDeposit = RunDepositGuild(listTarget) == true
   elseif target == "warbank" then
-    didDeposit = RunDepositWarband() == true
+    didDeposit = RunDepositWarband(listTarget) == true
+  elseif target == "personal" then
+    didDeposit = (IsPersonalBankOpen() and RunDepositPersonalBank(listTarget) == true) and true or false
   else
     -- Bank: whichever bank is currently open.
     if IsWarbankOpen() then
-      didDeposit = RunDepositWarband() == true
+      didDeposit = RunDepositWarband(listTarget) == true
     elseif IsGuildBankOpen() then
-      didDeposit = RunDepositGuild() == true
+      didDeposit = RunDepositGuild(listTarget) == true
     elseif IsPersonalBankOpen() then
-      didDeposit = RunDepositPersonalBank() == true
+      didDeposit = RunDepositPersonalBank(listTarget) == true
     else
       didDeposit = false
     end
@@ -4348,6 +4457,8 @@ LI.RunDeposit = RunDeposit
                 current = CountFoodDrinkAtOrAboveInBags(cat, desiredScore)
                 if best and best.itemID then
                   current = current + GetPendingBought(best.itemID)
+                else
+                  current = current + GetPendingBought(itemID)
                 end
               end
             else
@@ -4362,6 +4473,8 @@ LI.RunDeposit = RunDeposit
                   current = CountEquivalentByUseKeyInBags(key)
                   if best and best.itemID then
                     current = current + GetPendingBought(best.itemID)
+                  else
+                    current = current + GetPendingBought(itemID)
                   end
                 end
               else
@@ -4406,6 +4519,14 @@ LI.RunDeposit = RunDeposit
                 if best and best.idx and best.itemID then
                   buyID, idx = best.itemID, best.idx
                 else
+                  -- If tooltips/item data are still caching, do NOT buy the exact configured rule item.
+                  -- Wait for cache so restock grouping can select the correct best vendor item.
+                  if _liMerchantWantsCache == true then
+                    buyID, idx = nil, nil
+                    if debugThisRule then
+                      Print("Merchant debug buy: waiting for cache (food category unresolved)")
+                    end
+                  else
                   -- If we can't find an equivalent vendor food (often due to tooltip parsing),
                   -- try the exact configured item if the merchant sells it.
                   local exactIdx = GetMerchantIndexForItemID(itemID)
@@ -4417,6 +4538,7 @@ LI.RunDeposit = RunDeposit
                   if debugThisRule then
                     Print("Merchant debug buy: no vendor food match for cat=" .. tostring(cat))
                   end
+                  end
                 end
               else
                 local key = GetUseKeyForItemID(itemID)
@@ -4425,9 +4547,18 @@ LI.RunDeposit = RunDeposit
                   if best and best.idx and best.itemID then
                     buyID, idx = best.itemID, best.idx
                   else
-                    buyID, idx = nil, nil
-                    if debugThisRule then
-                      Print("Merchant debug buy: no vendor match for useKey=" .. tostring(key))
+                    -- If tooltips/item data are still caching, do NOT buy the exact configured rule item.
+                    -- Wait for cache so useKey (and mana tagging) can resolve correctly.
+                    if _liMerchantWantsCache == true then
+                      buyID, idx = nil, nil
+                      if debugThisRule then
+                        Print("Merchant debug buy: waiting for cache (useKey vendor scan)")
+                      end
+                    else
+                      buyID, idx = nil, nil
+                      if debugThisRule then
+                        Print("Merchant debug buy: no vendor match for useKey=" .. tostring(key))
+                      end
                     end
                   end
                 else
@@ -4441,9 +4572,16 @@ LI.RunDeposit = RunDeposit
               -- If we can't derive an equivalence key yet (item info/tooltip cache),
               -- fall back to buying the exact configured item so restock still works.
               if not buyID and IsItemUsableForPlayerLevel(itemID, pl) then
-                buyID, idx = itemID, nil
-                if debugThisRule then
-                  Print("Merchant debug buy: fallback to exact configured item")
+                if _liMerchantWantsCache == true then
+                  buyID, idx = nil, nil
+                  if debugThisRule then
+                    Print("Merchant debug buy: waiting for cache (skip exact fallback)")
+                  end
+                else
+                  buyID, idx = itemID, nil
+                  if debugThisRule then
+                    Print("Merchant debug buy: fallback to exact configured item")
+                  end
                 end
               elseif not buyID and debugThisRule then
                 local cached = IsItemDataCachedByID(itemID)

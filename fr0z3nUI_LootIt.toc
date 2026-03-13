@@ -2,7 +2,7 @@
 ## Title: |cff00ccfffr0z3nUI|r LootIt
 ## Notes: Loot Chat Cleaner /fli
 ## Author: fr0z3nights
-## Version: 2026.03.13.79
+## Version: 2026.03.13.84
 ## SavedVariables: fr0z3nUI_LootItDB
 ## SavedVariablesPerCharacter: fr0z3nUI_LootItCharDB
 
@@ -11,7 +11,6 @@ fr0z3nUI_LootItTrade.lua
 fr0z3nUI_LootItTax.lua
 fr0z3nUI_LootItAlias.lua
 fr0z3nUI_LootItMail.lua
-fr0z3nUI_LootItOther.lua
 fr0z3nUI_LootItLoot.lua
 fr0z3nUI_LootItLootChat.lua
 fr0z3nUI_LootItUIV.lua

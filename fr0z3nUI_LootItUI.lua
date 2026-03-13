@@ -299,7 +299,7 @@ do
     end)
     frame._reloadBtn = reloadBtn
 
-    local TAB_COUNT = 6
+    local TAB_COUNT = 5
     local TAB_OVERLAP_X = -6
 
     local function SizeTabToText(btn, pad, minW)
@@ -357,37 +357,29 @@ do
     SizeTabToText(tabAlias, 18, 70)
     frame.tab2 = tabAlias
 
-    local tabOther = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
-    tabOther:SetID(3)
-    tabOther:SetText("Other")
-    tabOther:SetPoint("LEFT", tabLoot, "RIGHT", TAB_OVERLAP_X, 0)
-    tabOther:SetHeight(22)
-    SizeTabToText(tabOther, 18, 70)
-    frame.tab3 = tabOther
-
     local tabMail = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
-    tabMail:SetID(4)
+    tabMail:SetID(3)
     tabMail:SetText("Mail")
-    tabMail:SetPoint("LEFT", tabOther, "RIGHT", TAB_OVERLAP_X, 0)
+    tabMail:SetPoint("LEFT", tabAlias, "RIGHT", TAB_OVERLAP_X, 0)
     tabMail:SetHeight(22)
     SizeTabToText(tabMail, 18, 70)
-    frame.tab4 = tabMail
+    frame.tab3 = tabMail
 
     local tabTax = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
-    tabTax:SetID(5)
+    tabTax:SetID(4)
     tabTax:SetText("Tax")
     tabTax:SetPoint("LEFT", tabMail, "RIGHT", TAB_OVERLAP_X, 0)
     tabTax:SetHeight(22)
     SizeTabToText(tabTax, 18, 70)
-    frame.tab5 = tabTax
+    frame.tab4 = tabTax
 
     local tabDeposit = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
-    tabDeposit:SetID(6)
+    tabDeposit:SetID(5)
     tabDeposit:SetText("Trade")
     tabDeposit:SetPoint("LEFT", tabTax, "RIGHT", TAB_OVERLAP_X, 0)
     tabDeposit:SetHeight(22)
     SizeTabToText(tabDeposit, 18, 70)
-    frame.tab6 = tabDeposit
+    frame.tab5 = tabDeposit
 
     local lootPanel = CreateFrame("Frame", nil, frame)
     lootPanel:SetAllPoints(content)
@@ -402,9 +394,6 @@ do
 
     local mailPanel = CreateFrame("Frame", nil, frame)
     mailPanel:SetAllPoints(content)
-
-    local otherPanel = CreateFrame("Frame", nil, frame)
-    otherPanel:SetAllPoints(content)
 
     local taxPanel = CreateFrame("Frame", nil, frame)
     taxPanel:SetAllPoints(content)
@@ -451,13 +440,11 @@ do
       which = tostring(which or "loot"):lower()
       local isLoot = (which == "loot")
       local isAlias = false
-      local isOther = (which == "other")
       local isMail = (which == "mail")
       local isTax = (which == "tax")
       local isDeposit = (which == "deposit")
 
       lootPanel:SetShown(isLoot)
-      otherPanel:SetShown(isOther)
       mailPanel:SetShown(isMail)
       taxPanel:SetShown(isTax)
       depositPanel:SetShown(isDeposit)
@@ -472,14 +459,13 @@ do
 
       StyleTab(tabLoot, isLoot)
       StyleTab(tabAlias, false)
-      StyleTab(tabOther, isOther)
       StyleTab(tabMail, isMail)
       StyleTab(tabTax, isTax)
       StyleTab(tabDeposit, isDeposit)
 
-      UpdateTabZOrder(isLoot and 1 or (isOther and 3 or (isMail and 4 or (isTax and 5 or 6))))
+      UpdateTabZOrder(isLoot and 1 or (isMail and 3 or (isTax and 4 or 5)))
 
-      frame._activeTab = isLoot and "loot" or (isOther and "other" or (isMail and "mail" or (isTax and "tax" or "deposit")))
+      frame._activeTab = isLoot and "loot" or (isMail and "mail" or (isTax and "tax" or "deposit"))
 
       ApplyMailNotifierInteractivity()
     end
@@ -488,7 +474,6 @@ do
 
     tabLoot:SetScript("OnClick", function() SelectTab("loot") end)
     tabAlias:SetScript("OnClick", function() SelectTab("loot") end)
-    tabOther:SetScript("OnClick", function() SelectTab("other") end)
     tabMail:SetScript("OnClick", function() SelectTab("mail") end)
     tabTax:SetScript("OnClick", function() SelectTab("tax") end)
     tabDeposit:SetScript("OnClick", function() SelectTab("deposit") end)
@@ -496,7 +481,6 @@ do
     -- Initialize first tab styling + z-order.
     StyleTab(tabLoot, true)
     StyleTab(tabAlias, false)
-    StyleTab(tabOther, false)
     StyleTab(tabMail, false)
     StyleTab(tabTax, false)
     StyleTab(tabDeposit, false)
@@ -518,19 +502,6 @@ do
           GetCharDB = function() return CHARDB end,
           Clamp = Clamp,
           SetCheckBoxText = SetCheckBoxText,
-        })
-      end
-    end
-
-    do
-      local mod = fr0z3nUI_LootIt
-      if mod and mod.Other and type(mod.Other.BuildTab) == "function" then
-        mod.Other.BuildTab(otherPanel, {
-          EnsureDB = EnsureDB,
-          GetDB = function() return DB end,
-          ApplyFilters = ApplyFilters,
-          SetCheckBoxText = SetCheckBoxText,
-          SetCheckBoxChecked = SetCheckBoxChecked,
         })
       end
     end

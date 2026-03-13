@@ -87,6 +87,27 @@ Format: `YYMMDD-###` (sanity stamp) — short summary.
 - Loot UI: fixed dropdowns toggling open+closed on a single click (double-toggle); dropdowns now toggle once per click.
 - Files: `fr0z3nUI_LootItLoot.lua`.
 
+## 260313-009
+- Trade Purchase/Restock: when restock equivalence keys are still caching (tooltip/item data), merchant ticker now waits instead of falling back to buying the exact configured item (prevents buying “everything usable” / mana-tagged items on non-mana classes).
+- Files: `fr0z3nUI_LootIt.lua`, `fr0z3nUI_LootIt.toc`.
+
+## 260313-010
+- Trade-Deposit: added `Personal` target option (personal bank only). `Bank` remains “auto” (whichever bank UI is open).
+- Files: `fr0z3nUI_LootIt.lua`, `fr0z3nUI_LootItTrade.lua`, `fr0z3nUI_LootIt.toc`.
+
+## 260313-011
+- Trade-Deposit: Deposit items are now stored per Target (Bank/Personal/Guild/Warbank). Target selection now controls which list you edit.
+- Migration: your existing Deposit list is preserved and becomes the `Bank` (auto) list.
+- Files: `fr0z3nUI_LootIt.lua`, `fr0z3nUI_LootItTrade.lua`, `fr0z3nUI_LootIt.toc`.
+
+## 260313-012
+- UI: removed the empty `Other` tab (content was previously relocated to the LootIt tab).
+- Files: `fr0z3nUI_LootItUI.lua`, `fr0z3nUI_LootIt.toc`.
+
+## 260313-013
+- Cleanup: removed the unused `LootItOther` husk module (it was no longer referenced after the Other tab was removed).
+- Files: `fr0z3nUI_LootItOther.lua`, `fr0z3nUI_LootIt.toc`.
+
 ## 260312-022
 - Other: Achievement/Experience are now text toggle buttons (Tax/Vendor style), and output routing is split into separate (shorter) dropdowns for Achievement vs Experience.
 

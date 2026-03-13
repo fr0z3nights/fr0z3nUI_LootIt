@@ -691,7 +691,7 @@ function LI.Trade.BuildTab(depositPanel)
     end)
   end
 
-  Tip(bankBtn, "List Target", "Affects where entries are added/managed; deposit uses the currently open bank.", "Cycles: Bank / Guild / Warbank")
+  Tip(bankBtn, "Deposit Target", "Bank=auto (whichever bank UI is open).", "Cycles: Bank / Personal / Guild / Warbank")
   Tip(guildTabBtn, "Guild Tab", "Left-click: cycle tabs (or pick random)", "Right-click: toggle Random; disabled on Warbank")
   Tip(keepBox, "Keep (Deposit)", "For this item: if bags have less than Keep, withdraw the difference", "Empty/0 disables")
   Tip(spBtn, "SP (Stack Pull)", "Per-item toggle: pull partial stacks before depositing", "Default: Off")
@@ -982,31 +982,33 @@ function LI.Trade.BuildTab(depositPanel)
   local function GetScopeStores(mode)
     local cfg = DepositCfgAcc()
     local ch = DepositCfgChar()
-    local realmTbl, realmKey = EnsureRealmRuleTable(cfg, mode)
-    local accDisableRealmTbl = nil
-    local realmDisabledTbl = nil
-    if realmKey and realmKey ~= "" then
-      accDisableRealmTbl = EnsureAccDisableRealmTable(cfg, mode)
-      realmDisabledTbl = EnsureRealmDisabledTable(cfg, mode)
-    end
 
-    if mode == "buy" then
-      return {
-        cfg = cfg,
-        ch = ch,
-        accTbl = cfg.buyItemsAcc,
-        accDisabledTbl = cfg.buyItemsAccDisabled,
-        accDisableRealmTbl = accDisableRealmTbl,
-        realmTbl = realmTbl,
-        realmKey = realmKey,
-        realmDisabledTbl = realmDisabledTbl,
-        charTbl = ch.buyItemsChar,
-        charDisabledTbl = ch.buyItemsCharDisabled,
-        disableAccTbl = ch.buyDisableAcc,
-        disableRealmTbl = ch.buyDisableRealm,
-      }
-    end
-    if mode == "sell" then
+    if mode == "buy" or mode == "sell" then
+      local realmTbl, realmKey = EnsureRealmRuleTable(cfg, mode)
+      local accDisableRealmTbl = nil
+      local realmDisabledTbl = nil
+      if realmKey and realmKey ~= "" then
+        accDisableRealmTbl = EnsureAccDisableRealmTable(cfg, mode)
+        realmDisabledTbl = EnsureRealmDisabledTable(cfg, mode)
+      end
+
+      if mode == "buy" then
+        return {
+          cfg = cfg,
+          ch = ch,
+          accTbl = cfg.buyItemsAcc,
+          accDisabledTbl = cfg.buyItemsAccDisabled,
+          accDisableRealmTbl = accDisableRealmTbl,
+          realmTbl = realmTbl,
+          realmKey = realmKey,
+          realmDisabledTbl = realmDisabledTbl,
+          charTbl = ch.buyItemsChar,
+          charDisabledTbl = ch.buyItemsCharDisabled,
+          disableAccTbl = ch.buyDisableAcc,
+          disableRealmTbl = ch.buyDisableRealm,
+        }
+      end
+
       return {
         cfg = cfg,
         ch = ch,
@@ -1023,19 +1025,79 @@ function LI.Trade.BuildTab(depositPanel)
       }
     end
 
+    -- Deposit: scope tables depend on selected Target (Bank/Personal/Guild/Warbank).
+    local function NormalizeDepositTarget(t)
+      t = tostring(t or "")
+      t = t:lower():gsub("%s+", "")
+      if t == "either" then t = "bank" end
+      if t == "warband" then t = "warbank" end
+      if t == "personalbank" then t = "personal" end
+      if t ~= "bank" and t ~= "personal" and t ~= "guild" and t ~= "warbank" then
+        t = "bank"
+      end
+      return t
+    end
+
+    local listTarget = NormalizeDepositTarget(cfg.target)
+    cfg.target = listTarget
+
+    local function EnsureTargetTable(parent, key)
+      parent[key] = (type(parent[key]) == "table") and parent[key] or {}
+      return parent[key]
+    end
+
+    cfg.itemsAccByTarget = (type(cfg.itemsAccByTarget) == "table") and cfg.itemsAccByTarget or {}
+    cfg.itemsAccDisabledByTarget = (type(cfg.itemsAccDisabledByTarget) == "table") and cfg.itemsAccDisabledByTarget or {}
+    cfg.itemsAccDisableRealmByTarget = (type(cfg.itemsAccDisableRealmByTarget) == "table") and cfg.itemsAccDisableRealmByTarget or {}
+    cfg.itemsRealmByTarget = (type(cfg.itemsRealmByTarget) == "table") and cfg.itemsRealmByTarget or {}
+    cfg.itemsRealmDisabledByTarget = (type(cfg.itemsRealmDisabledByTarget) == "table") and cfg.itemsRealmDisabledByTarget or {}
+
+    local accTbl = EnsureTargetTable(cfg.itemsAccByTarget, listTarget)
+    local accDisabledTbl = EnsureTargetTable(cfg.itemsAccDisabledByTarget, listTarget)
+
+    local realmKey = GetCurrentRealmKey()
+    local realmTbl = nil
+    local accDisableRealmTbl = nil
+    local realmDisabledTbl = nil
+    if realmKey and realmKey ~= "" then
+      local tAccDisableRealmAll = EnsureTargetTable(cfg.itemsAccDisableRealmByTarget, listTarget)
+      tAccDisableRealmAll[realmKey] = (type(tAccDisableRealmAll[realmKey]) == "table") and tAccDisableRealmAll[realmKey] or {}
+      accDisableRealmTbl = tAccDisableRealmAll[realmKey]
+
+      local tRealmAll = EnsureTargetTable(cfg.itemsRealmByTarget, listTarget)
+      tRealmAll[realmKey] = (type(tRealmAll[realmKey]) == "table") and tRealmAll[realmKey] or {}
+      realmTbl = tRealmAll[realmKey]
+
+      local tRealmDisabledAll = EnsureTargetTable(cfg.itemsRealmDisabledByTarget, listTarget)
+      tRealmDisabledAll[realmKey] = (type(tRealmDisabledAll[realmKey]) == "table") and tRealmDisabledAll[realmKey] or {}
+      realmDisabledTbl = tRealmDisabledAll[realmKey]
+    else
+      realmKey = ""
+    end
+
+    ch.itemsCharByTarget = (type(ch.itemsCharByTarget) == "table") and ch.itemsCharByTarget or {}
+    ch.itemsCharDisabledByTarget = (type(ch.itemsCharDisabledByTarget) == "table") and ch.itemsCharDisabledByTarget or {}
+    ch.disableAccByTarget = (type(ch.disableAccByTarget) == "table") and ch.disableAccByTarget or {}
+    ch.disableRealmByTarget = (type(ch.disableRealmByTarget) == "table") and ch.disableRealmByTarget or {}
+
+    local charTbl = EnsureTargetTable(ch.itemsCharByTarget, listTarget)
+    local charDisabledTbl = EnsureTargetTable(ch.itemsCharDisabledByTarget, listTarget)
+    local disableAccTbl = EnsureTargetTable(ch.disableAccByTarget, listTarget)
+    local disableRealmTbl = EnsureTargetTable(ch.disableRealmByTarget, listTarget)
+
     return {
       cfg = cfg,
       ch = ch,
-      accTbl = cfg.itemsAcc,
-      accDisabledTbl = cfg.itemsAccDisabled,
+      accTbl = accTbl,
+      accDisabledTbl = accDisabledTbl,
       accDisableRealmTbl = accDisableRealmTbl,
       realmTbl = realmTbl,
       realmKey = realmKey,
       realmDisabledTbl = realmDisabledTbl,
-      charTbl = ch.itemsChar,
-      charDisabledTbl = ch.itemsCharDisabled,
-      disableAccTbl = ch.disableAcc,
-      disableRealmTbl = ch.disableRealm,
+      charTbl = charTbl,
+      charDisabledTbl = charDisabledTbl,
+      disableAccTbl = disableAccTbl,
+      disableRealmTbl = disableRealmTbl,
     }
   end
 
@@ -1657,7 +1719,8 @@ function LI.Trade.BuildTab(depositPanel)
     t = t:lower():gsub("%s+", "")
     if t == "either" then t = "bank" end
     if t == "warband" then t = "warbank" end
-    if t ~= "bank" and t ~= "guild" and t ~= "warbank" then
+    if t == "personalbank" then t = "personal" end
+    if t ~= "bank" and t ~= "personal" and t ~= "guild" and t ~= "warbank" then
       t = "bank"
     end
     return t
@@ -1701,6 +1764,8 @@ function LI.Trade.BuildTab(depositPanel)
 
     if cfg.target == "guild" then
       bankBtn:SetText("Guild")
+    elseif cfg.target == "personal" then
+      bankBtn:SetText("Personal")
     elseif cfg.target == "warbank" then
       bankBtn:SetText("Warbank")
     else
@@ -1770,7 +1835,7 @@ function LI.Trade.BuildTab(depositPanel)
   bankBtn:SetScript("OnClick", function()
     local cfg = DepositCfgAcc()
     local t = NormalizeBankTarget(cfg.target)
-    local order = { "bank", "guild", "warbank" }
+    local order = { "bank", "personal", "guild", "warbank" }
     local idx = 1
     for i = 1, #order do
       if order[i] == t then idx = i break end
